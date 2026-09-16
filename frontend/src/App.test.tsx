@@ -1,7 +1,8 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Composer, EmptyThread, ResponseBlocks } from "./App";
+import { Composer, EmptyThread, MessageList, ResponseBlocks } from "./App";
+import type { ThreadDetail } from "./types";
 
 afterEach(cleanup);
 
@@ -69,5 +70,27 @@ describe("new conversation mode selection", () => {
     expect(screen.getByRole("heading", { name: "What are you working on?" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Translate/ })).not.toBeInTheDocument();
     expect(screen.getByText("Draft, revise, translate, or talk through a professional communication.")).toBeInTheDocument();
+  });
+});
+
+describe("conversation scrolling", () => {
+  it("scrolls the message history itself instead of moving the application viewport", () => {
+    const scrollHeight = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(900);
+    const detail = {
+      id: "thread-1",
+      owner_id: "user-1",
+      owner_username: "charles",
+      mode: "translate",
+      voice_key: null,
+      title: "Long conversation",
+      updated_at: "2026-09-16T00:00:00Z",
+      active_generation_id: null,
+      messages: [],
+    } satisfies ThreadDetail;
+
+    const { container } = render(<MessageList detail={detail} generation={null} />);
+    expect((container.firstElementChild as HTMLDivElement).scrollTop).toBe(900);
+
+    scrollHeight.mockRestore();
   });
 });

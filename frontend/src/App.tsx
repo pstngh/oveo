@@ -138,11 +138,14 @@ export function ResponseBlocks({ blocks, streaming = false }: { blocks: ContentB
   );
 }
 
-function MessageList({ detail, generation }: { detail: ThreadDetail; generation: GenerationSnapshot | null }) {
-  const endRef = useRef<HTMLDivElement>(null);
-  useEffect(() => endRef.current?.scrollIntoView({ block: "end" }), [detail.messages.length, generation?.seq]);
+export function MessageList({ detail, generation }: { detail: ThreadDetail; generation: GenerationSnapshot | null }) {
+  const messagesRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const messages = messagesRef.current;
+    if (messages) messages.scrollTop = messages.scrollHeight;
+  }, [detail.messages.length, generation?.seq]);
   return (
-    <div className="messages" aria-live="polite">
+    <div ref={messagesRef} className="messages" aria-live="polite">
       {detail.messages.map((message) => (
         <article className={`message ${message.role}`} key={message.id}>
           <div className="message-inner">
@@ -166,7 +169,6 @@ function MessageList({ detail, generation }: { detail: ThreadDetail; generation:
           <span>{generation.status === "stopped" ? "Generation stopped." : generation.error_message ?? "Oveo could not complete this response."}</span>
         </div>
       )}
-      <div ref={endRef} />
     </div>
   );
 }
