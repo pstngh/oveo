@@ -31,7 +31,6 @@ _PROMPT_FILES: Final[dict[Mode, str]] = {
     "revision": "revision.md",
     "internal_comms": "internal_communications.md",
 }
-_LEGACY_MODE_ALIASES: Final = {"alithyagpt": "internal_comms"}
 _VISIBLE_PURPOSES: Final = frozenset({"chat"})
 _MAX_PROMPT_BYTES: Final = 256 * 1024
 
@@ -286,10 +285,9 @@ def _user_instruction_envelope(
 
 
 def _validated_mode(raw: str) -> Mode:
-    normalized = _LEGACY_MODE_ALIASES.get(raw, raw)
-    if normalized not in _PROMPT_FILES:
+    if raw not in _PROMPT_FILES:
         raise ContextBuildError("unsupported context mode")
-    return normalized
+    return raw
 
 
 def _validated_purpose(raw: str) -> ContextPurpose:

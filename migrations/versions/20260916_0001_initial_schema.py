@@ -1,4 +1,4 @@
-"""Create the initial Oveo v2 schema.
+"""Create the initial Oveo schema.
 
 Revision ID: 20260916_0001
 Revises:
@@ -63,17 +63,14 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("mode", sa.String(20), nullable=False),
-        sa.Column("voice_key", sa.String(64)),
         sa.Column("title", sa.String(160)),
         sa.Column("context_summary", sa.Text()),
         sa.Column("summary_through_ordinal", sa.Integer()),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         *_timestamps(),
-        sa.CheckConstraint("mode IN ('translate', 'alithyagpt')", name="ck_threads_mode"),
         sa.CheckConstraint(
-            "(mode = 'translate' AND voice_key IS NULL) OR "
-            "(mode = 'alithyagpt' AND voice_key IS NOT NULL)",
-            name="ck_threads_mode_voice",
+            "mode IN ('translate', 'revision', 'internal_comms')",
+            name="ck_threads_mode",
         ),
     )
     op.create_index("ix_threads_owner_updated", "threads", ["owner_id", "updated_at"])
@@ -196,7 +193,10 @@ def upgrade() -> None:
         sa.Column("kind", sa.String(20), nullable=False),
         sa.Column("active", sa.Boolean(), nullable=False),
         *_timestamps(),
-        sa.CheckConstraint("kind IN ('translation', 'draft')", name="ck_work_items_kind"),
+        sa.CheckConstraint(
+            "kind IN ('translation', 'revision', 'draft')",
+            name="ck_work_items_kind",
+        ),
     )
     op.create_index(
         "uq_work_items_one_active_per_thread",

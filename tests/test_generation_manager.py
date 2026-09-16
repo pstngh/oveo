@@ -15,7 +15,6 @@ from oveo.config import Settings
 from oveo.db import Database
 from oveo.generation import (
     ActiveGenerationError,
-    GenerationError,
     GenerationManager,
     ProviderCompletion,
     ProviderError,
@@ -122,7 +121,7 @@ class FailThenSucceedProvider:
         self.calls += 1
         if self.calls == 1:
             error = ProviderError("provider_network")
-            # A provider adapter adding legacy retry state must not revive manager retries.
+            # Provider-specific retry state must not revive manager-level retries.
             error.__dict__["transient"] = True
             raise error
         await emit(_SUCCESS)  # type: ignore[operator]
@@ -375,50 +374,6 @@ async def test_unexpected_generation_failure_logs_only_safe_diagnostics(
     await manager.shutdown()
 
 
-async def test_legacy_mode_alias_and_voice_are_compatibility_only(
-    manager_database: tuple[Database, Settings, User],
-) -> None:
-    database, settings, user = manager_database
-    provider = BlockingProvider()
-    manager = GenerationManager(database, settings, provider)
-    submitted = await manager.submit_turn(
-        requester_id=user.id,
-        client_request_id="legacy-mode",
-        text="Draft an internal note from these facts.",
-        attachment=None,
-        owner_id=user.id,
-        mode="alithyagpt",
-        voice_key="comm_internes",
-    )
-    await provider.started.wait()
-
-    async with database.sessions() as db:
-        thread = await db.get(Thread, submitted.thread_id)
-        generation = await db.get(Generation, submitted.generation_id)
-        assert thread is not None and generation is not None
-        assert (thread.mode, thread.voice_key) == ("internal_comms", "comm_internes")
-        assert generation.request_snapshot["mode"] == "internal_comms"
-        assert "voice_key" not in generation.request_snapshot
-        system = generation.request_snapshot["provider_messages"][0]["content"]
-        assert "# Oveo Internal communications mode" in system
-        assert "voice_key=" not in system
-
-    with pytest.raises(GenerationError, match="does not use a writing voice"):
-        await manager.submit_turn(
-            requester_id=user.id,
-            client_request_id="revision-with-voice",
-            text="Revise this.",
-            attachment=None,
-            owner_id=user.id,
-            mode="revision",
-            voice_key="comm_internes",
-        )
-
-    await manager.stop(submitted.generation_id)
-    await _wait_status(manager, submitted.generation_id, {"stopped"})
-    await manager.shutdown()
-
-
 @pytest.mark.parametrize(
     ("mode", "expected_kind"),
     (("translate", "translation"), ("revision", "revision"), ("internal_comms", "draft")),
@@ -431,7 +386,7 @@ async def test_canonical_work_kind_follows_mode(
     database, settings, user = manager_database
     manager = GenerationManager(database, settings, BlockingProvider())
     async with database.sessions() as db:
-        thread = Thread(owner_id=user.id, mode=mode, voice_key=None)
+        thread = Thread(owner_id=user.id, mode=mode)
         db.add(thread)
         await db.flush()
         generation = Generation(
@@ -463,7 +418,7 @@ async def test_startup_marks_orphaned_generation_failed(
 ) -> None:
     database, settings, user = manager_database
     async with database.sessions() as db:
-        thread = Thread(owner_id=user.id, mode="translate", voice_key=None)
+        thread = Thread(owner_id=user.id, mode="translate")
         db.add(thread)
         await db.flush()
         orphan = Generation(
@@ -589,7 +544,7 @@ async def test_persisted_canonical_state_supports_every_mutation(
     database, settings, user = manager_database
     manager = GenerationManager(database, settings, BlockingProvider())
     async with database.sessions() as db:
-        thread = Thread(owner_id=user.id, mode="translate", voice_key=None)
+        thread = Thread(owner_id=user.id, mode="translate")
         db.add(thread)
         await db.flush()
         generation = Generation(
@@ -684,7 +639,7 @@ async def test_persisted_canonical_state_rejects_stale_and_oversized_mutations(
     settings = base_settings.model_copy(update={"max_source_words": 3})
     manager = GenerationManager(database, settings, BlockingProvider())
     async with database.sessions() as db:
-        thread = Thread(owner_id=user.id, mode="translate", voice_key=None)
+        thread = Thread(owner_id=user.id, mode="translate")
         db.add(thread)
         await db.flush()
         generation = Generation(
@@ -742,7 +697,6 @@ async def test_automatic_compaction_preserves_recent_transcript_and_accounts_cos
         thread = Thread(
             owner_id=user.id,
             mode="translate",
-            voice_key=None,
             title="Existing thread",
         )
         db.add(thread)
@@ -798,7 +752,6 @@ async def test_large_handoff_is_compacted_from_user_material_only(
         thread = Thread(
             owner_id=user.id,
             mode="translate",
-            voice_key=None,
             title="Existing thread",
             context_summary="Private internal summary.",
             summary_through_ordinal=2,
@@ -877,7 +830,6 @@ async def test_handoff_provider_request_contains_only_user_authored_material(
         thread = Thread(
             owner_id=user.id,
             mode="translate",
-            voice_key=None,
             title="Existing thread",
             context_summary="Private internal summary.",
             summary_through_ordinal=2,

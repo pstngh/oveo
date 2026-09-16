@@ -11,7 +11,7 @@ async def test_thread_scope_and_true_actor_are_distinct(db: AsyncSession) -> Non
     charles = await add_user(db, "charles", role="owner")
     yousra = await add_user(db, "yousra")
     outsider = await add_user(db, "outsider")
-    thread = Thread(owner_id=yousra.id, mode="translate", voice_key=None)
+    thread = Thread(owner_id=yousra.id, mode="translate")
     db.add(thread)
     await db.flush()
 

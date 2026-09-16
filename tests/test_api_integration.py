@@ -127,13 +127,6 @@ def _wait_title(client: TestClient, thread_id: str) -> dict[str, Any]:
     raise AssertionError("title was not generated")
 
 
-def test_legacy_login_path_redirects_to_root(api_client: TestClient) -> None:
-    response = api_client.get("/webpages/login.html", follow_redirects=False)
-
-    assert response.status_code == 308
-    assert response.headers["location"] == "/"
-
-
 def test_login_submit_idempotency_handoff_and_cost(api_client: TestClient) -> None:
     owner_id, csrf = _login(api_client, "charles", "charles password")
     headers = {"X-CSRF-Token": csrf, "Origin": "http://testserver"}
@@ -250,45 +243,35 @@ def test_unexpected_http_failure_returns_and_logs_an_opaque_error_id(
     assert "private request marker" not in diagnostics
 
 
-def test_three_current_modes_and_legacy_alias_are_normalized(api_client: TestClient) -> None:
+def test_only_the_three_current_modes_are_accepted(api_client: TestClient) -> None:
     owner_id, csrf = _login(api_client, "charles", "charles password")
     headers = {"X-CSRF-Token": csrf, "Origin": "http://testserver"}
-    cases = (
-        ("translate", None, "translate"),
-        ("revision", None, "revision"),
-        ("internal_comms", None, "internal_comms"),
-        ("alithyagpt", "comm_internes", "internal_comms"),
-    )
-    for index, (input_mode, voice_key, expected_mode) in enumerate(cases, start=1):
+    modes = ("translate", "revision", "internal_comms")
+    for index, mode in enumerate(modes, start=1):
         payload = {
             "owner_id": owner_id,
-            "mode": input_mode,
+            "mode": mode,
             "text": "Synthetic scoped request.",
             "client_request_id": f"mode-{index}",
         }
-        if voice_key is not None:
-            payload["voice_key"] = voice_key
         response = api_client.post("/api/threads", data=payload, headers=headers)
         assert response.status_code == 200
         ids = response.json()
         _wait_generation(api_client, ids["generation_id"])
         detail = api_client.get(f"/api/threads/{ids['thread_id']}").json()
-        assert detail["mode"] == expected_mode
-        assert detail["voice_key"] == voice_key
-
-    invalid = api_client.post(
+        assert detail["mode"] == mode
+    unsupported = api_client.post(
         "/api/threads",
         data={
             "owner_id": owner_id,
-            "mode": "revision",
-            "voice_key": "comm_internes",
-            "text": "Existing prose.",
-            "client_request_id": "mode-invalid-voice",
+            "mode": "unsupported",
+            "text": "Synthetic scoped request.",
+            "client_request_id": "unsupported-mode",
         },
         headers=headers,
     )
-    assert invalid.status_code == 422
-    assert invalid.json()["code"] == "invalid_voice"
+    assert unsupported.status_code == 422
+    assert unsupported.json()["code"] == "invalid_request"
 
 
 def test_csrf_authorization_security_headers_and_deletion(api_client: TestClient) -> None:

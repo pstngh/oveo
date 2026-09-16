@@ -26,7 +26,7 @@ async def test_one_active_generation_per_thread_and_request_idempotency(
     db: AsyncSession,
 ) -> None:
     user = await add_user(db, "charles", role="owner")
-    thread = Thread(owner_id=user.id, mode="translate", voice_key=None)
+    thread = Thread(owner_id=user.id, mode="translate")
     db.add(thread)
     await db.flush()
     thread_id = thread.id
@@ -87,7 +87,7 @@ async def test_one_active_generation_per_thread_and_request_idempotency(
 
 async def test_only_one_active_work_item_per_thread(db: AsyncSession) -> None:
     user = await add_user(db, "yousra")
-    thread = Thread(owner_id=user.id, mode="translate", voice_key=None)
+    thread = Thread(owner_id=user.id, mode="translate")
     db.add(thread)
     await db.flush()
     db.add(WorkItem(thread_id=thread.id, kind="translation", active=True))
@@ -99,7 +99,7 @@ async def test_only_one_active_work_item_per_thread(db: AsyncSession) -> None:
 
 async def test_thread_delete_cascades_content_but_preserves_usage(db: AsyncSession) -> None:
     user = await add_user(db, "charles", role="owner")
-    thread = Thread(owner_id=user.id, mode="translate", voice_key=None)
+    thread = Thread(owner_id=user.id, mode="translate")
     db.add(thread)
     await db.flush()
     message = Message(

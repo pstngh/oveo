@@ -83,10 +83,6 @@ class Thread(Base, TimestampMixin):
             "mode IN ('translate', 'revision', 'internal_comms')",
             name="ck_threads_mode",
         ),
-        CheckConstraint(
-            "voice_key IS NULL OR mode = 'internal_comms'",
-            name="ck_threads_mode_voice",
-        ),
         Index("ix_threads_owner_updated", "owner_id", "updated_at"),
     )
 
@@ -95,7 +91,6 @@ class Thread(Base, TimestampMixin):
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
     mode: Mapped[str] = mapped_column(String(20), nullable=False)
-    voice_key: Mapped[str | None] = mapped_column(String(64))
     title: Mapped[str | None] = mapped_column(String(160))
     context_summary: Mapped[str | None] = mapped_column(Text)
     summary_through_ordinal: Mapped[int | None] = mapped_column(Integer)

@@ -10,7 +10,7 @@ from argon2.exceptions import InvalidHashError
 from argon2.low_level import Type
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -207,10 +207,6 @@ def create_app(
     assets_dir = frontend_dir / "assets"
     if assets_dir.is_dir():
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
-
-    @app.get("/webpages/login.html", include_in_schema=False, response_model=None)
-    async def legacy_login() -> RedirectResponse:
-        return RedirectResponse(url="/", status_code=308)
 
     @app.get("/{path:path}", include_in_schema=False, response_model=None)
     async def spa(path: str) -> Response:

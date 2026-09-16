@@ -29,7 +29,7 @@ from oveo.models import Attachment, Generation, Message, Thread, User
 from oveo.usage import format_lifetime_cost, lifetime_total
 
 router = APIRouter()
-ThreadModeInput = Literal["translate", "revision", "internal_comms", "alithyagpt"]
+ThreadModeInput = Literal["translate", "revision", "internal_comms"]
 
 
 class ApiError(Exception):
@@ -243,7 +243,6 @@ async def _thread_summary(db: AsyncSession, thread: Thread) -> dict[str, Any]:
         "owner_id": thread.owner_id,
         "owner_username": owner_username,
         "mode": thread.mode,
-        "voice_key": thread.voice_key,
         "title": thread.title or "New conversation",
         "updated_at": thread.updated_at.isoformat(),
         "active_generation_id": active_generation,
@@ -374,7 +373,6 @@ async def create_thread(
     client_request_id: Annotated[str, Form()] = "",
     owner_id: Annotated[str, Form()] = "",
     mode: Annotated[ThreadModeInput | None, Form()] = None,
-    voice_key: Annotated[str | None, Form()] = None,
     attachment: Annotated[UploadFile | None, File()] = None,
 ) -> dict[str, str]:
     owner = await db.get(User, owner_id)
@@ -392,7 +390,6 @@ async def create_thread(
             attachment=validated,
             owner_id=owner.id,
             mode=mode,
-            voice_key=voice_key,
         )
     except GenerationError as exc:
         raise ApiError(exc.status_code, exc.code, exc.message) from exc

@@ -161,7 +161,7 @@ jobs:
           printf '%s\n' "$IMAGE" > IMAGE
           tar --create --gzip --file "oveo-host-${GITHUB_SHA}.tar.gz" \
             compose.yml OPERATIONS.md IMAGE REHEARSAL deploy/install-host.sh \
-            deploy/oveo-deploy.sh deploy/remove-v1.sh \
+            deploy/oveo-deploy.sh \
             deploy/oveo-backup.sh deploy/oveo-restore.sh deploy/backup_tool.py \
             deploy/validate_staging.py \
             deploy/runtime.env.example deploy/backup.env.example deploy/systemd
@@ -234,6 +234,6 @@ jobs:
             -o StrictHostKeyChecking=yes \
             -i "$HOME/.ssh/id_ed25519" \
             "$VPS_USER@$VPS_HOST" \
-            "read -r token; set -eu; stage=/var/tmp/oveo-host-${GITHUB_SHA}; archive=\$stage.tar.gz; checksum=\$archive.sha256; docker_config=; cleanup() { if [ -n \"\$docker_config\" ]; then DOCKER_CONFIG=\$docker_config docker logout ghcr.io >/dev/null 2>&1 || true; fi; rm -f -- \"\$archive\" \"\$checksum\"; rm -rf -- \"\$stage\"; }; trap cleanup EXIT HUP INT TERM; cd /var/tmp; sha256sum --check \"\$checksum\"; rm -rf -- \"\$stage\"; mkdir \"\$stage\"; tar --extract --gzip --file \"\$archive\" --directory \"\$stage\"; \"\$stage/deploy/install-host.sh\"; docker_config=\$stage/docker-config; install -d -m 0700 \"\$docker_config\"; export DOCKER_CONFIG=\$docker_config; if ! printf '%s' \"\$token\" | docker login ghcr.io --username '$GHCR_USER' --password-stdin >/dev/null; then unset token; exit 1; fi; unset token; if docker inspect translation-agent-staging-app-1 >/dev/null 2>&1; then /usr/local/sbin/oveo-remove-v1 '$IMAGE' --confirm REMOVE_V1; fi; set +e; /usr/local/sbin/oveo-deploy '$IMAGE'; status=\$?; exit \$status"
+            "read -r token; set -eu; stage=/var/tmp/oveo-host-${GITHUB_SHA}; archive=\$stage.tar.gz; checksum=\$archive.sha256; docker_config=; cleanup() { if [ -n \"\$docker_config\" ]; then DOCKER_CONFIG=\$docker_config docker logout ghcr.io >/dev/null 2>&1 || true; fi; rm -f -- \"\$archive\" \"\$checksum\"; rm -rf -- \"\$stage\"; }; trap cleanup EXIT HUP INT TERM; cd /var/tmp; sha256sum --check \"\$checksum\"; rm -rf -- \"\$stage\"; mkdir \"\$stage\"; tar --extract --gzip --file \"\$archive\" --directory \"\$stage\"; \"\$stage/deploy/install-host.sh\"; docker_config=\$stage/docker-config; install -d -m 0700 \"\$docker_config\"; export DOCKER_CONFIG=\$docker_config; if ! printf '%s' \"\$token\" | docker login ghcr.io --username '$GHCR_USER' --password-stdin >/dev/null; then unset token; exit 1; fi; unset token; set +e; /usr/local/sbin/oveo-deploy '$IMAGE'; status=\$?; exit \$status"
       - name: Verify public production readiness
         run: curl --fail --silent --show-error --max-time 20 "https://oveo.duckdns.org/health/ready"

@@ -16,7 +16,6 @@ for file in \
   "$root/deploy/oveo-deploy.sh" \
   "$root/deploy/oveo-backup.sh" \
   "$root/deploy/oveo-restore.sh" \
-  "$root/deploy/remove-v1.sh" \
   "$root/deploy/backup_tool.py" \
   "$root/deploy/validate_staging.py" \
   "$root/deploy/runtime.env.example" \
@@ -34,7 +33,6 @@ install -m 0644 "$root/compose.yml" /opt/oveo/compose.yml
 install -m 0755 "$root/deploy/oveo-deploy.sh" /usr/local/sbin/oveo-deploy
 install -m 0755 "$root/deploy/oveo-backup.sh" /usr/local/sbin/oveo-backup
 install -m 0755 "$root/deploy/oveo-restore.sh" /usr/local/sbin/oveo-restore
-install -m 0755 "$root/deploy/remove-v1.sh" /usr/local/sbin/oveo-remove-v1
 install -m 0755 "$root/deploy/backup_tool.py" /usr/local/lib/oveo/backup_tool.py
 install -m 0755 "$root/deploy/validate_staging.py" /usr/local/lib/oveo/validate_staging.py
 install -m 0644 "$root/deploy/runtime.env.example" /etc/oveo/runtime.env.example

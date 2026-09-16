@@ -28,9 +28,9 @@ Copy the deployment artifacts with root ownership:
 
 The checksummed `oveo-host-COMMIT.tar.gz` workflow artifact packages all of these files plus `deploy/install-host.sh`; after verifying its adjacent SHA-256 file, extract it and run that installer as root. It installs executable and configuration artifacts with the required modes, creates the host directories, and reloads systemd without enabling the timer or changing secrets. `/etc/oveo` and `/var/backups/oveo` are mode `0700`; `/var/lib/oveo` is mode `0700` owned by UID/GID 10001.
 
-Create `/etc/oveo/runtime.env` from `deploy/runtime.env.example`, root-owned mode `0600`. Keep `OVEO_PUBLIC_ORIGIN=https://oveo.duckdns.org` and include that hostname in `OVEO_TRUSTED_HOSTS`. Replace every secret example value: the OpenRouter key must be the working `sk-or-v1-...` credential and both password values must be complete Argon2id encodings, mapped OWNER to `charles` and USER to `yousra`. Stage only those three existing credentials; do not copy v1 sessions, encryption keys, or content. Single-quote Argon2 strings so their `$` characters remain literal. Validate the file without printing values with `python3 /usr/local/lib/oveo/validate_staging.py --runtime /etc/oveo/runtime.env`. Both deployment and v1 removal repeat this check. The OpenRouter request layer must retain model `openai/gpt-5.6-luna`, preferred provider `azure/eu`, same-model fallback, `data_collection=deny`, and `zdr=true`.
+Create `/etc/oveo/runtime.env` from `deploy/runtime.env.example`, root-owned mode `0600`. Keep `OVEO_PUBLIC_ORIGIN=https://oveo.duckdns.org` and include that hostname in `OVEO_TRUSTED_HOSTS`. Replace every secret example value: the OpenRouter key must be the working `sk-or-v1-...` credential and both password values must be complete Argon2id encodings, mapped OWNER to `charles` and USER to `yousra`. Single-quote Argon2 strings so their `$` characters remain literal. Validate the file without printing values with `python3 /usr/local/lib/oveo/validate_staging.py --runtime /etc/oveo/runtime.env`. Deployment repeats this check. The OpenRouter request layer must retain model `openai/gpt-5.6-luna`, preferred provider `azure/eu`, same-model fallback, `data_collection=deny`, and `zdr=true`.
 
-Create new backup encryption material; the v1 host has none to preserve:
+Create backup encryption material:
 
 ```bash
 install -d -m 0700 /etc/oveo /var/backups/oveo
@@ -43,20 +43,9 @@ Put only that last public recipient and `AGE_IDENTITY_FILE=/etc/oveo/backup.agek
 
 Configure these GitHub Actions secrets without printing them: `VPS_HOST=87.106.103.162`, `VPS_USER=root`, `VPS_SSH_PRIVATE_KEY`, and `VPS_KNOWN_HOSTS`. The pinned known-host value must come from the already verified local entry, not a fresh unauthenticated key scan.
 
-## Initial cutover
+## Deployment enablement
 
-Leave the repository variable `OVEO_DEPLOY_ENABLED` absent or set to `false` for the first push. That push must pass CI and always publishes the immutable image and checksummed host bundle, but the deploy job is skipped. Before creating that bundle, CI pulls the published digest, validates its revision label and Compose configuration, runs the exact image with a fresh empty data directory under the production limits, executes its migrations, seeds two synthetic Argon2 accounts, and waits for readiness. Only a successful rehearsal creates the bundled `REHEARSAL` attestation. Download the bundle, verify its SHA-256 file, confirm that `IMAGE` equals the `OVEO_REHEARSED_IMAGE` in `REHEARSAL`, run `deploy/install-host.sh`, and re-run the host inventory immediately before cutover. Stage `/etc/oveo/runtime.env`, the new age identity/configuration, and all other prerequisites first. Then, while authenticated to GHCR with an isolated temporary Docker configuration, run:
-
-```bash
-/usr/local/sbin/oveo-remove-v1 ghcr.io/pstngh/oveo@sha256:DIGEST --confirm REMOVE_V1
-/usr/local/sbin/oveo-deploy ghcr.io/pstngh/oveo@sha256:DIGEST
-```
-
-`remove-v1.sh` refuses to proceed unless the candidate digest exactly matches the installed successful-rehearsal attestation and the exact old Compose labels, mount, volume, network, images, paths, Caddy route, non-placeholder staged credentials, and backup encryption prerequisites match. Its authorized targets are only `translation-agent-staging-app-1`, `translation-agent-staging_translation-data`, `translation-agent-staging_default`, the `translation-agent:*` images carrying source-revision labels, `/opt/translation-agent-staging`, `/etc/translation-agent`, and `/run/translation-agent`. It never touches Caddy or unrelated services and never invokes Docker system, volume, image, or builder pruning.
-
-The old BuildKit cache cannot be safely selected by Compose project. Do not broad-prune it. The host's pre-existing seven-day unused-cache timer will eventually reclaim it; re-inventory before changing that global policy.
-
-After the manual cutover, public health, real-provider smoke test, account checks, deletion/cost check, and initial backup/restore all pass, set the repository variable with `gh variable set OVEO_DEPLOY_ENABLED --body true --repo pstngh/oveo`. Dispatch `ci-deploy.yml` on `main` once. This reruns the same commit, publishes an exact digest, installs its checksummed host bundle, and deploys it. From then on, every passing push to `main` follows the same automatic path. If the variable is unset or anything other than lowercase `true`, CI still tests and publishes but cannot deploy.
+Keep the repository variable `OVEO_DEPLOY_ENABLED=true` after the host prerequisites and protected runtime configuration are in place. Every push still runs all checks, publishes an immutable image, and rehearses that exact image against a fresh database before the deploy job can start. Setting the variable to anything other than lowercase `true` safely leaves testing and publication enabled while preventing production deployment.
 
 ## Deployment and rollback
 

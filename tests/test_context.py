@@ -21,7 +21,6 @@ def _thread(*, mode: str = "translate") -> Thread:
         id="thread-1",
         owner_id="yousra-id",
         mode=mode,
-        voice_key=None,
         title=None,
         context_summary=None,
         summary_through_ordinal=None,
@@ -134,19 +133,6 @@ def test_exactly_one_shared_rules_and_active_mode_prompt_are_loaded() -> None:
     assert summary[0].content.count("# Oveo Internal communications mode") == 1
     assert "purpose=summary" in summary[0].content
     assert "non-visible maintenance generation" in summary[0].content
-
-
-def test_legacy_mode_alias_uses_only_internal_communications_prompt() -> None:
-    messages = build_provider_messages(
-        _thread(mode="alithyagpt"),
-        purpose="chat",
-        recent_messages=[],
-        actor_labels={},
-    )
-    system = messages[0].content
-    assert "mode=internal_comms" in system
-    assert "# Oveo Internal communications mode" in system
-    assert "# Oveo Revision mode" not in system
 
 
 def test_canonical_summary_and_attachment_are_preserved_exactly_as_data() -> None:

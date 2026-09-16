@@ -58,20 +58,6 @@ or UI change. New prompt rules apply when a future generation is composed,
 including a future turn in an existing conversation. They never rewrite an
 already-saved canonical work version.
 
-## Compatibility
-
-Persisted current modes are `translate`, `revision`, and `internal_comms`. Legacy
-API input mode `alithyagpt` is accepted as an alias for `internal_comms`. The
-obsolete `voice_key` field remains only as dormant database/API compatibility data
-for older clients; it is not exposed as a choice and never selects prompt behavior.
-
-Migration `20260916_0002` maps existing `alithyagpt` conversations to
-`internal_comms` without changing IDs, messages, attachments, summaries, actors,
-or canonical work. Downgrading maps both `revision` and `internal_comms` to the
-legacy `alithyagpt`/`draft` representation because the old schema cannot represent
-Revision independently. Rows and content survive, but that semantic distinction
-cannot be recovered by a later re-upgrade.
-
 ## Quality gate
 
 ```bash
@@ -87,8 +73,8 @@ npm test
 npm run build
 ```
 
-Migration verification additionally performs a fresh upgrade, `current`,
-downgrade/re-upgrade preservation exercise, and an Alembic schema drift check.
+Migration verification additionally performs a fresh upgrade, validates all three
+current modes and work kinds, and runs an Alembic schema drift check.
 
 ## Configuration and runtime
 

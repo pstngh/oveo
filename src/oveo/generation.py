@@ -522,7 +522,6 @@ class GenerationManager:
         thread_id: str | None = None,
         owner_id: str | None = None,
         mode: str | None = None,
-        voice_key: str | None = None,
     ) -> Submission:
         staged_files: list[Path] = []
         try:
@@ -534,7 +533,6 @@ class GenerationManager:
                 thread_id=thread_id,
                 owner_id=owner_id,
                 mode=mode,
-                voice_key=voice_key,
                 staged_files=staged_files,
             )
         except BaseException:
@@ -552,7 +550,6 @@ class GenerationManager:
         thread_id: str | None,
         owner_id: str | None,
         mode: str | None,
-        voice_key: str | None,
         staged_files: list[Path],
     ) -> Submission:
         clean_text = text.strip()
@@ -575,29 +572,16 @@ class GenerationManager:
                 return Submission(existing.thread_id, existing.id)
 
             if thread_id is None:
-                normalized_mode = "internal_comms" if mode == "alithyagpt" else mode
-                if owner_id is None or normalized_mode not in {
+                if owner_id is None or mode not in {
                     "translate",
                     "revision",
                     "internal_comms",
                 }:
                     raise GenerationError("invalid_thread", "Choose a conversation mode.")
-                if normalized_mode != "internal_comms" and voice_key is not None:
-                    raise GenerationError(
-                        "invalid_voice", "This section does not use a writing voice."
-                    )
-                if normalized_mode == "internal_comms" and voice_key not in {
-                    None,
-                    "comm_internes",
-                }:
-                    raise GenerationError(
-                        "invalid_voice", "The legacy writing voice is not supported."
-                    )
                 thread = Thread(
                     id=new_id(),
                     owner_id=owner_id,
-                    mode=normalized_mode,
-                    voice_key=voice_key,
+                    mode=mode,
                     title="New conversation",
                 )
                 db.add(thread)

@@ -24,10 +24,6 @@ inference, preservation, or intentional same-language adaptation of the existing
 locale. Internal communications owns draft-locale selection and alone applies the
 `Comm internes` house style. No user-facing or model-active voice selector exists.
 
-Legacy API input `alithyagpt` normalizes to `internal_comms`. `voice_key` is retained
-only as dormant compatibility data for legacy records/clients; it is neither placed
-in the trusted model context nor used to select behavior.
-
 ## Prompt composition and trust
 
 For an ordinary visible chat generation, the system message contains exactly:
@@ -72,11 +68,6 @@ canonical versions.
 - `work_items` use kinds `translation`, `revision`, or `draft`; immutable
   `work_versions` hold complete canonical source/output/brief snapshots.
 - `usage_events` form an append-only micro-USD ledger and survive thread deletion.
-
-Migration `20260916_0002` maps legacy `alithyagpt` threads to `internal_comms`
-without rewriting related rows. Its downgrade preserves all rows and content but
-must collapse Revision and Internal communications into `alithyagpt` and revision
-work items into `draft`, because the old schema has no third representation.
 
 SQLite foreign keys, check/unique constraints, and partial unique indexes protect
 invariants. Connections enable WAL, foreign keys, normal synchronous mode, and a

@@ -154,7 +154,6 @@ describe("new conversation mode selection", () => {
     expect(screen.queryByText(/Translate faithfully/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Proofread, copyedit/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Draft a new employee-facing/)).not.toBeInTheDocument();
-    expect(screen.queryByText("AlithyaGPT")).not.toBeInTheDocument();
     expect(screen.queryByText("Writing voices")).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: /Translate/ }));
@@ -197,7 +196,6 @@ describe("conversation scrolling", () => {
       owner_id: "user-1",
       owner_username: "charles",
       mode: "translate",
-      voice_key: null,
       title: "Long conversation",
       updated_at: "2026-09-16T00:00:00Z",
       active_generation_id: null,
@@ -216,7 +214,6 @@ describe("conversation scrolling", () => {
       owner_id: "user-1",
       owner_username: "charles",
       mode: "translate",
-      voice_key: null,
       title: "Compact conversation",
       updated_at: "2026-09-16T00:00:00Z",
       active_generation_id: null,
@@ -237,7 +234,6 @@ describe("conversation scrolling", () => {
       owner_id: "user-2",
       owner_username: "yousra",
       mode: "revision",
-      voice_key: null,
       title: "Cross-account revision",
       updated_at: "2026-09-16T00:00:00Z",
       active_generation_id: null,
@@ -260,11 +256,9 @@ describe("conversation addresses", () => {
     expect(conversationIdFromPath("/new")).toBeNull();
   });
 
-  it("normalizes signed-out, signed-in, and legacy addresses", () => {
-    expect(canonicalPath("/webpages/login.html", false)).toBe("/");
+  it("normalizes signed-out and signed-in addresses", () => {
     expect(canonicalPath("/conversations/thread-1", false)).toBe("/");
     expect(canonicalPath("/", true)).toBe("/new");
-    expect(canonicalPath("/webpages/login.html", true)).toBe("/new");
     expect(canonicalPath("/new", true)).toBe("/new");
     expect(canonicalPath("/conversations/thread-1/", true)).toBe("/conversations/thread-1");
   });

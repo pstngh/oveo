@@ -21,7 +21,6 @@ export interface ThreadSummary {
   id: string;
   owner_id: string;
   mode: Mode;
-  voice_key: string | null;
   title: string;
   updated_at: string;
   active_generation_id: string | null;
