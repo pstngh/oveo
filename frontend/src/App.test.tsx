@@ -33,7 +33,7 @@ describe("authenticated bootstrap", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "Start a conversation" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "What would you like to do?" })).toBeInTheDocument();
     expect(screen.queryByRole("form", { name: "Sign in to Oveo" })).not.toBeInTheDocument();
   });
 });
@@ -146,11 +146,14 @@ describe("new conversation mode selection", () => {
     const onSelect = vi.fn();
     render(<EmptyThread mode={null} onSelect={onSelect} />);
 
-    expect(screen.getByRole("heading", { name: "Start a conversation" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "What would you like to do?" })).toBeInTheDocument();
     expect(screen.queryByRole("img", { name: "Oveo" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Translate/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Revision/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Internal communications/ })).toBeInTheDocument();
+    expect(screen.queryByText(/Translate faithfully/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Proofread, copyedit/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Draft a new employee-facing/)).not.toBeInTheDocument();
     expect(screen.queryByText("AlithyaGPT")).not.toBeInTheDocument();
     expect(screen.queryByText("Writing voices")).not.toBeInTheDocument();
 

@@ -33,23 +33,20 @@ import type {
 
 const uuid = () => crypto.randomUUID();
 
-const MODE_COPY: Record<Mode, { label: string; heading: string; description: string; guidance: string }> = {
+const MODE_COPY: Record<Mode, { label: string; heading: string; guidance: string }> = {
   translate: {
     label: "Translate",
     heading: "What would you like to translate?",
-    description: "Translate faithfully between French and the supported English or French locales.",
     guidance: "Share the French or English source text. If an English source has no French target yet, Oveo will ask only which French variety you want.",
   },
   revision: {
     label: "Revision",
     heading: "What would you like to revise?",
-    description: "Proofread, copyedit, revise, or rewrite text that already exists.",
     guidance: "Share the existing text and, when it matters, the depth you want: proofread, copyedit, revise, or rewrite.",
   },
   internal_comms: {
     label: "Internal communications",
     heading: "What internal communication do you need?",
-    description: "Draft a new employee-facing communication from a brief, notes, and facts.",
     guidance: "Share the brief, known facts, audience, desired locale, and any practical constraints. Oveo will not invent missing details.",
   },
 };
@@ -348,12 +345,12 @@ export function Composer({
 export function EmptyThread({ mode, onSelect }: { mode: Mode | null; onSelect: (mode: Mode) => void }) {
   return (
     <div className="empty-thread">
-      <h1>{mode ? MODE_COPY[mode].heading : "Start a conversation"}</h1>
+      <h1>{mode ? MODE_COPY[mode].heading : "What would you like to do?"}</h1>
       {mode === null ? (
         <div className="mode-choices" aria-label="Conversation type">
-          <button type="button" onClick={() => onSelect("translate")}><span className="choice-icon"><Languages /></span><strong>{MODE_COPY.translate.label}</strong><small>{MODE_COPY.translate.description}</small></button>
-          <button type="button" onClick={() => onSelect("revision")}><span className="choice-icon"><FilePenLine /></span><strong>{MODE_COPY.revision.label}</strong><small>{MODE_COPY.revision.description}</small></button>
-          <button type="button" onClick={() => onSelect("internal_comms")}><span className="choice-icon"><Megaphone /></span><strong>{MODE_COPY.internal_comms.label}</strong><small>{MODE_COPY.internal_comms.description}</small></button>
+          <button type="button" onClick={() => onSelect("translate")}><span className="choice-icon"><Languages /></span><strong>{MODE_COPY.translate.label}</strong></button>
+          <button type="button" onClick={() => onSelect("revision")}><span className="choice-icon"><FilePenLine /></span><strong>{MODE_COPY.revision.label}</strong></button>
+          <button type="button" onClick={() => onSelect("internal_comms")}><span className="choice-icon"><Megaphone /></span><strong>{MODE_COPY.internal_comms.label}</strong></button>
         </div>
       ) : (
         <p>{MODE_COPY[mode].guidance}</p>
