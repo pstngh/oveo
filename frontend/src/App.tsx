@@ -1,4 +1,5 @@
 import {
+  Check,
   Copy,
   FileText,
   LogOut,
@@ -139,8 +140,13 @@ export function ResponseBlocks({ blocks, streaming = false }: { blocks: ContentB
     <div className={`response-blocks${streaming ? " streaming" : ""}`}>
       {blocks.map((block, index) => block.type === "deliverable" ? (
         <section className="deliverable" key={index} aria-label="Deliverable">
-          <button className="copy-button" onClick={() => copy(block.text, index)} aria-label="Copy deliverable">
-            <Copy /> {copied === index ? "Copied" : "Copy"}
+          <button
+            className="copy-button"
+            onClick={() => copy(block.text, index)}
+            aria-label={copied === index ? "Copied" : "Copy deliverable"}
+            title={copied === index ? "Copied" : "Copy deliverable"}
+          >
+            {copied === index ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
           </button>
           <pre>{block.text}</pre>
         </section>

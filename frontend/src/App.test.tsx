@@ -14,8 +14,11 @@ describe("deliverable copy", () => {
       { type: "deliverable", text: "First line\n\nSecond **literal** line" },
       { type: "advice", text: "Do not copy this note." },
     ]} />);
-    await user.click(screen.getByRole("button", { name: "Copy deliverable" }));
+    const copyButton = screen.getByRole("button", { name: "Copy deliverable" });
+    expect(copyButton).toHaveTextContent("");
+    await user.click(copyButton);
     expect(writeText).toHaveBeenCalledWith("First line\n\nSecond **literal** line");
+    expect(screen.getByRole("button", { name: "Copied" })).toHaveTextContent("");
   });
 });
 
