@@ -17,8 +17,6 @@ EventType = Literal[
     "state",
     "response_end",
 ]
-StateOperationName = Literal["none", "establish", "append", "replace", "full"]
-
 _BLOCK_TYPES = frozenset({"conversation", "deliverable", "advice"})
 _BLOCK_ID = re.compile(r"b[1-9][0-9]*\Z")
 
@@ -331,10 +329,6 @@ class ProtocolDecoder:
         self._active_delta_count = 0
         self._blocks: list[ContentBlock] = []
         self._total_chars = 0
-
-    @property
-    def completed(self) -> bool:
-        return self._completed
 
     def feed(self, chunk: bytes) -> tuple[ProtocolEvent, ...]:
         if not isinstance(chunk, bytes):
@@ -662,7 +656,6 @@ __all__ = [
     "ReplaceState",
     "SourceOutputReplacement",
     "StateOperation",
-    "StateOperationName",
     "validate_content_blocks",
     "validate_stored_document",
 ]

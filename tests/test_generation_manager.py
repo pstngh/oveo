@@ -18,9 +18,18 @@ from oveo.generation import (
     ProviderError,
     ProviderRequest,
     _apply_base_replacements,
+    _snapshot_messages,
 )
 from oveo.models import Base, Generation, Message, Thread, UsageEvent, User, WorkItem, WorkVersion
-from oveo.protocol import ProtocolError
+from oveo.protocol import (
+    AppendState,
+    EstablishState,
+    FullState,
+    OutputReplacement,
+    ProtocolError,
+    ReplaceState,
+    SourceOutputReplacement,
+)
 
 _SUCCESS = (
     b'{"v":1,"event":"response_start"}\n'
@@ -324,6 +333,154 @@ async def test_canonical_state_and_pending_cost_reconcile_atomically(
     await manager.shutdown()
 
 
+async def test_persisted_canonical_state_supports_every_mutation(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, settings, user = manager_database
+    manager = GenerationManager(database, settings, BlockingProvider())
+    async with database.sessions() as db:
+        thread = Thread(owner_id=user.id, mode="translate", voice_key=None)
+        db.add(thread)
+        await db.flush()
+        generation = Generation(
+            thread_id=thread.id,
+            requester_id=user.id,
+            client_request_id="canonical-mutations",
+            purpose="chat",
+            status="running",
+        )
+
+        await manager._apply_state_operation(
+            db,
+            generation=generation,
+            thread=thread,
+            state=EstablishState(
+                source="Hello world.",
+                output="Bonjour le monde.",
+                brief={"direction": "en-US-fr-CA"},
+            ),
+        )
+        await manager._apply_state_operation(
+            db,
+            generation=generation,
+            thread=thread,
+            state=AppendState(
+                base_version=1,
+                source_addition="A new paragraph.",
+                output_addition="Un nouveau paragraphe.",
+            ),
+        )
+        await manager._apply_state_operation(
+            db,
+            generation=generation,
+            thread=thread,
+            state=ReplaceState(
+                base_version=2,
+                replacements=(
+                    SourceOutputReplacement(
+                        source_anchor="new paragraph",
+                        source_replacement="revised paragraph",
+                        output_anchor="nouveau paragraphe",
+                        output_replacement="paragraphe révisé",
+                    ),
+                    OutputReplacement(
+                        output_anchor="Bonjour",
+                        output_replacement="Salut",
+                    ),
+                ),
+            ),
+        )
+        await manager._apply_state_operation(
+            db,
+            generation=generation,
+            thread=thread,
+            state=FullState(
+                base_version=3,
+                output="Version complète révisée.",
+                source=None,
+                brief={"direction": "en-US-fr-CA", "tone": "formal"},
+            ),
+        )
+        await db.commit()
+        versions = list(
+            (await db.execute(select(WorkVersion).order_by(WorkVersion.version_no))).scalars()
+        )
+
+    assert [version.operation for version in versions] == [
+        "establish",
+        "append",
+        "replace",
+        "full",
+    ]
+    assert [version.parent_version_id for version in versions] == [
+        None,
+        versions[0].id,
+        versions[1].id,
+        versions[2].id,
+    ]
+    assert versions[2].source_text == "Hello world.\n\nA revised paragraph."
+    assert versions[2].output_text == "Salut le monde.\n\nUn paragraphe révisé."
+    assert versions[3].source_text == versions[2].source_text
+    assert versions[3].output_text == "Version complète révisée."
+    assert versions[3].source_word_count == 5
+    assert versions[3].brief == {"direction": "en-US-fr-CA", "tone": "formal"}
+    await manager.shutdown()
+
+
+async def test_persisted_canonical_state_rejects_stale_and_oversized_mutations(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, base_settings, user = manager_database
+    settings = base_settings.model_copy(update={"max_source_words": 3})
+    manager = GenerationManager(database, settings, BlockingProvider())
+    async with database.sessions() as db:
+        thread = Thread(owner_id=user.id, mode="translate", voice_key=None)
+        db.add(thread)
+        await db.flush()
+        generation = Generation(
+            thread_id=thread.id,
+            requester_id=user.id,
+            client_request_id="canonical-invalid-mutations",
+            purpose="chat",
+            status="running",
+        )
+        await manager._apply_state_operation(
+            db,
+            generation=generation,
+            thread=thread,
+            state=EstablishState(
+                source="one two",
+                output="un deux",
+                brief={"direction": "en-US-fr-CA"},
+            ),
+        )
+        with pytest.raises(ProtocolError, match="state_base_mismatch"):
+            await manager._apply_state_operation(
+                db,
+                generation=generation,
+                thread=thread,
+                state=AppendState(
+                    base_version=2,
+                    source_addition="three",
+                    output_addition="trois",
+                ),
+            )
+        with pytest.raises(ProtocolError, match="state_source_word_limit"):
+            await manager._apply_state_operation(
+                db,
+                generation=generation,
+                thread=thread,
+                state=AppendState(
+                    base_version=1,
+                    source_addition="three four",
+                    output_addition="trois quatre",
+                ),
+            )
+        assert await db.scalar(select(func.count()).select_from(WorkVersion)) == 1
+
+    await manager.shutdown()
+
+
 async def test_automatic_compaction_preserves_recent_transcript_and_accounts_cost(
     manager_database: tuple[Database, Settings, User],
 ) -> None:
@@ -525,3 +682,17 @@ def test_exact_replacements_use_one_immutable_base_and_reject_overlap() -> None:
     )
     with pytest.raises(ProtocolError, match="overlapping_output"):
         _apply_base_replacements("abcdef", [("abc", "X"), ("bc", "Y")], label="output")
+    with pytest.raises(ProtocolError, match="missing_output"):
+        _apply_base_replacements("abcdef", [("missing", "X")], label="output")
+    with pytest.raises(ProtocolError, match="ambiguous_output"):
+        _apply_base_replacements("same and same", [("same", "X")], label="output")
+
+
+def test_snapshot_message_validation_preserves_call_site_error_codes() -> None:
+    with pytest.raises(ProviderError) as compaction_error:
+        _snapshot_messages({})
+    assert compaction_error.value.code == "context_compaction_failed"
+
+    with pytest.raises(ProviderError) as request_error:
+        _snapshot_messages({}, error_code="invalid_request_snapshot")
+    assert request_error.value.code == "invalid_request_snapshot"

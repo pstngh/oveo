@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -9,16 +9,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from oveo.models import UsageEvent
 
 MICRO_USD = Decimal("1000000")
-
-
-def cost_to_microusd(value: str | int | float | Decimal) -> int:
-    try:
-        decimal = Decimal(str(value))
-    except (InvalidOperation, ValueError) as exc:
-        raise ValueError("invalid provider cost") from exc
-    if not decimal.is_finite() or decimal < 0:
-        raise ValueError("invalid provider cost")
-    return int((decimal * MICRO_USD).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def format_lifetime_cost(amount_microusd: int) -> str:

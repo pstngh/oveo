@@ -14,7 +14,6 @@ from oveo.auth import (
     create_session,
     get_session_principal,
     hash_password,
-    password_needs_rehash,
     validate_csrf,
     verify_password,
 )
@@ -28,7 +27,6 @@ def test_argon2id_password_helpers() -> None:
     assert verify_password(encoded, "a private password")
     assert not verify_password(encoded, "wrong")
     assert not verify_password("not-an-argon-hash", "anything")
-    assert not password_needs_rehash(encoded)
 
 
 async def test_session_is_absolute_csrf_bound_and_credential_versioned(

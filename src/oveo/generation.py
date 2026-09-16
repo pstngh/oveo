@@ -89,18 +89,20 @@ class ProviderError(RuntimeError):
         self.cost_microusd = cost_microusd
 
 
-def _snapshot_messages(snapshot: Mapping[str, Any]) -> list[ProviderMessage]:
+def _snapshot_messages(
+    snapshot: Mapping[str, Any], *, error_code: str = "context_compaction_failed"
+) -> list[ProviderMessage]:
     raw_messages = snapshot.get("provider_messages")
     if not isinstance(raw_messages, list):
-        raise ProviderError("context_compaction_failed")
+        raise ProviderError(error_code)
     messages: list[ProviderMessage] = []
     for item in raw_messages:
         if not isinstance(item, dict):
-            raise ProviderError("context_compaction_failed")
+            raise ProviderError(error_code)
         role = item.get("role")
         content = item.get("content")
         if role not in {"system", "user", "assistant"} or not isinstance(content, str):
-            raise ProviderError("context_compaction_failed")
+            raise ProviderError(error_code)
         messages.append(
             ProviderMessage(
                 role=cast(Literal["system", "user", "assistant"], role),
@@ -108,7 +110,7 @@ def _snapshot_messages(snapshot: Mapping[str, Any]) -> list[ProviderMessage]:
             )
         )
     if not messages:
-        raise ProviderError("context_compaction_failed")
+        raise ProviderError(error_code)
     return messages
 
 
@@ -173,23 +175,7 @@ class OpenRouterProvider:
         emit: EmitChunk,
         cancel_event: asyncio.Event,
     ) -> ProviderCompletion:
-        raw_messages = request.snapshot.get("provider_messages")
-        if not isinstance(raw_messages, list):
-            raise ProviderError("invalid_request_snapshot")
-        messages: list[ProviderMessage] = []
-        for item in raw_messages:
-            if not isinstance(item, dict):
-                raise ProviderError("invalid_request_snapshot")
-            role = item.get("role")
-            content = item.get("content")
-            if role not in {"system", "user", "assistant"} or not isinstance(content, str):
-                raise ProviderError("invalid_request_snapshot")
-            messages.append(
-                ProviderMessage(
-                    role=cast(Literal["system", "user", "assistant"], role),
-                    content=content,
-                )
-            )
+        messages = _snapshot_messages(request.snapshot, error_code="invalid_request_snapshot")
 
         async def on_delta(delta: str) -> None:
             if cancel_event.is_set():
@@ -197,15 +183,7 @@ class OpenRouterProvider:
             await emit(delta.encode("utf-8"))
 
         try:
-            token_limit = (
-                64
-                if request.purpose == "title"
-                else 2_048
-                if request.purpose == "summary"
-                else 4_096
-                if request.purpose == "prompt_handoff"
-                else 32_000
-            )
+            token_limit = _COMPLETION_TOKEN_LIMITS.get(request.purpose, 32_000)
             completion = await self._client.stream_chat(
                 messages,
                 max_completion_tokens=token_limit,
@@ -235,6 +213,7 @@ class Submission:
 
 _TERMINAL = frozenset({"completed", "failed", "stopped"})
 _ACTIVE = frozenset({"queued", "running", "stopping"})
+_COMPLETION_TOKEN_LIMITS = {"title": 64, "summary": 2_048, "prompt_handoff": 4_096}
 _MIN_RECENT_MESSAGES = 4
 _ERROR_MESSAGES = {
     "provider_not_configured": "The model provider is not configured.",
@@ -898,7 +877,7 @@ class GenerationManager:
         document: ProtocolDocument,
         completion: ProviderCompletion,
     ) -> None:
-        blocks = [{"type": block.type, "text": block.text} for block in document.blocks]
+        blocks = cast(list[dict[str, str]], document.to_storage()["blocks"])
         async with self.database.sessions() as db:
             generation = await db.get(Generation, generation_id)
             if generation is None:
@@ -1679,10 +1658,3 @@ class GenerationManager:
             await asyncio.shield(self._finish_stopped(generation_id))
         except Exception:
             await self._fail(generation_id, "provider_error")
-
-
-async def usage_event_count(database: Database) -> int:
-    """Small readiness/test helper that does not expose ledger detail."""
-
-    async with database.sessions() as db:
-        return int(await db.scalar(select(func.count()).select_from(UsageEvent)) or 0)

@@ -68,13 +68,6 @@ def verify_password(password_hash: str, password: str) -> bool:
         return False
 
 
-def password_needs_rehash(password_hash: str) -> bool:
-    try:
-        return _PASSWORD_HASHER.check_needs_rehash(password_hash)
-    except InvalidHashError:
-        return True
-
-
 def hash_token(token: str) -> bytes:
     return hashlib.sha256(token.encode("utf-8")).digest()
 

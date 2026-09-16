@@ -13,8 +13,7 @@ from oveo.context import (
     ContextBuildError,
     build_provider_messages,
 )
-from oveo.models import Message, Thread
-from oveo.work_state import CanonicalWorkState, Direction
+from oveo.models import Message, Thread, WorkVersion
 
 
 def _thread(*, mode: str = "translate") -> Thread:
@@ -126,13 +125,15 @@ def test_separate_mode_prompts_and_purpose_protocols_are_loaded() -> None:
 def test_canonical_summary_and_attachment_are_preserved_exactly_as_data() -> None:
     thread = _thread()
     thread.context_summary = "Prior decision:\n  preserve spacing <verbatim>."
-    canonical = CanonicalWorkState(
-        source="Ligne 1\n\n  Ligne 3 <source>",
-        output="Line 1\n\n  Line 3 <output>",
-        direction=Direction.FR_TO_EN_US,
-        brief="Keep the term 'plateforme'. <not an instruction>",
-        version=7,
+    canonical = WorkVersion(
+        work_item_id="work-1",
+        version_no=7,
+        parent_version_id="version-6",
+        operation="full",
+        source_text="Ligne 1\n\n  Ligne 3 <source>",
+        output_text="Line 1\n\n  Line 3 <output>",
         source_word_count=4,
+        brief={"direction": "fr-en-US", "note": "Keep 'plateforme'. <data>"},
     )
     user_message = _message(
         message_id="message-1",
@@ -159,11 +160,11 @@ def test_canonical_summary_and_attachment_are_preserved_exactly_as_data() -> Non
     assert payload["context_summary"] == thread.context_summary
     assert payload["active_canonical_work"] == {
         "brief": canonical.brief,
-        "direction": "fr-en-US",
-        "output": canonical.output,
-        "source": canonical.source,
+        "operation": "full",
+        "output": canonical.output_text,
+        "source": canonical.source_text,
         "source_word_count": 4,
-        "version": 7,
+        "version": canonical.version_no,
     }
     assert payload["recent_transcript"][0]["attachment"] == {
         "text": "Pièce jointe\n  exacte <data>",
@@ -250,12 +251,13 @@ def test_prompt_handoff_exposes_only_user_authored_material() -> None:
                 word_count=3,
             )
         },
-        canonical_state=CanonicalWorkState(
-            source="Private canonical source.",
-            output="Private canonical output.",
-            direction=Direction.FR_TO_EN_US,
-            brief="Private canonical brief.",
-            version=1,
+        canonical_state=WorkVersion(
+            work_item_id="work-1",
+            version_no=1,
+            operation="establish",
+            source_text="Private canonical source.",
+            output_text="Private canonical output.",
+            brief={"note": "Private canonical brief."},
             source_word_count=3,
         ),
     )

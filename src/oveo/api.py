@@ -197,8 +197,7 @@ async def login(request: Request, response: Response, body: LoginBody, db: Db) -
 
 
 @router.post("/api/auth/logout", status_code=204)
-async def logout(request: Request, response: Response, principal: CsrfPrincipal, db: Db) -> None:
-    del principal
+async def logout(request: Request, response: Response, _: CsrfPrincipal, db: Db) -> None:
     settings = _settings(request)
     await revoke_session(db, request.cookies.get(settings.session_cookie_name))
     await db.commit()
@@ -209,7 +208,10 @@ async def logout(request: Request, response: Response, principal: CsrfPrincipal,
 @router.get("/api/auth/me")
 async def me(request: Request, principal: Principal) -> dict[str, str]:
     csrf_token = request.cookies.get(_settings(request).csrf_cookie_name)
-    return {**_account(principal.user), **({"csrf_token": csrf_token} if csrf_token else {})}
+    result = _account(principal.user)
+    if csrf_token:
+        result["csrf_token"] = csrf_token
+    return result
 
 
 @router.get("/api/accounts")

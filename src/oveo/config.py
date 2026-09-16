@@ -41,7 +41,6 @@ class Settings(BaseSettings):
     csrf_cookie_name: str = "oveo_csrf"
     charles_password_hash: SecretStr | None = None
     yousra_password_hash: SecretStr | None = None
-    log_level: str = "INFO"
 
     @field_validator("public_origin")
     @classmethod

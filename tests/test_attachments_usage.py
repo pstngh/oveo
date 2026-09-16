@@ -6,7 +6,8 @@ import pytest
 from fastapi import UploadFile
 
 from oveo.attachments import AttachmentError, count_words, validate_text_upload
-from oveo.usage import cost_to_microusd, format_lifetime_cost
+from oveo.provider import parse_usage
+from oveo.usage import format_lifetime_cost
 
 
 @pytest.mark.asyncio
@@ -30,8 +31,10 @@ async def test_text_upload_rejects_invalid_utf8_and_byte_overflow() -> None:
 
 def test_word_count_and_precise_cost_formatting() -> None:
     assert count_words(" one\n\tdeux  trois ") == 3
-    assert cost_to_microusd("0.0000014") == 1
-    assert cost_to_microusd("0.0000015") == 2
+    rounded_down = parse_usage({"cost": "0.0000014"})
+    rounded_up = parse_usage({"cost": "0.0000015"})
+    assert rounded_down is not None and rounded_down.cost_microusd == 1
+    assert rounded_up is not None and rounded_up.cost_microusd == 2
     assert format_lifetime_cost(0) == "$0.00"
     assert format_lifetime_cost(1) == "$0.000001"
     assert format_lifetime_cost(12_340_000) == "$12.34"

@@ -17,7 +17,6 @@ from oveo.config import get_settings
 from oveo.models import Message, Thread, WorkVersion
 from oveo.protocol import ContentBlock, ProtocolError, validate_content_blocks
 from oveo.provider import ProviderMessage
-from oveo.work_state import CanonicalWorkState
 
 Mode = Literal["translate", "alithyagpt"]
 ContextPurpose = Literal["chat", "title", "prompt_handoff", "summary"]
@@ -184,7 +183,7 @@ def build_provider_messages(
     recent_messages: Sequence[Message],
     actor_labels: Mapping[str, str],
     attachments: Mapping[str, AttachmentText] | None = None,
-    canonical_state: CanonicalWorkState | WorkVersion | None = None,
+    canonical_state: WorkVersion | None = None,
     prompt_loader: PromptLoader | None = None,
 ) -> list[ProviderMessage]:
     """Build provider messages without persisting, mutating, or logging content.
@@ -340,7 +339,7 @@ def _untrusted_envelope(
     recent_messages: Sequence[Message],
     actor_labels: Mapping[str, str],
     attachments: Mapping[str, AttachmentText],
-    canonical_state: CanonicalWorkState | WorkVersion | None,
+    canonical_state: WorkVersion | None,
 ) -> str:
     seen_ordinals: set[int] = set()
     transcript: list[dict[str, Any]] = []
@@ -416,20 +415,9 @@ def _transcript_entry(
     return entry
 
 
-def _canonical_payload(
-    state: CanonicalWorkState | WorkVersion | None,
-) -> dict[str, Any] | None:
+def _canonical_payload(state: WorkVersion | None) -> dict[str, Any] | None:
     if state is None:
         return None
-    if isinstance(state, CanonicalWorkState):
-        return {
-            "version": state.version,
-            "source": state.source,
-            "output": state.output,
-            "direction": state.direction.value,
-            "brief": state.brief,
-            "source_word_count": state.source_word_count,
-        }
     if isinstance(state, WorkVersion):
         return {
             "version": state.version_no,
