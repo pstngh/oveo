@@ -4,9 +4,7 @@ import {
   LogOut,
   Menu,
   MessageSquareText,
-  MoreHorizontal,
   Paperclip,
-  PenLine,
   Plus,
   RotateCcw,
   Send,
@@ -194,11 +192,13 @@ export function Composer({
   onSend,
   onStop,
   onRetry,
+  onCreateHandoff,
 }: {
   activeGeneration: GenerationSnapshot | null;
   onSend: (text: string, attachment?: File) => Promise<void>;
   onStop: () => Promise<void>;
   onRetry: () => Promise<void>;
+  onCreateHandoff?: () => void;
 }) {
   const [text, setText] = useState("");
   const [attachment, setAttachment] = useState<File>();
@@ -259,6 +259,7 @@ export function Composer({
           disabled={Boolean(generating)}
         />
         <div className="composer-actions">
+          {onCreateHandoff && <button className="icon-button handoff-button" onClick={onCreateHandoff} disabled={Boolean(generating)} aria-label="Create prompt handoff" title="Create prompt handoff"><Sparkles /></button>}
           <button className="icon-button attach" onClick={() => fileRef.current?.click()} disabled={Boolean(generating)} aria-label="Attach a text file"><Paperclip /></button>
           <input ref={fileRef} className="file-input" type="file" accept=".txt,text/plain" onChange={(e) => acceptFile(e.target.files?.[0])} />
           {generating ? (
@@ -300,7 +301,7 @@ export default function App() {
   const [draftMode, setDraftMode] = useState<Mode | null>(null);
   const [generation, setGeneration] = useState<GenerationSnapshot | null>(null);
   const [usage, setUsage] = useState("$0.00");
-  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<ThreadSummary | null>(null);
   const [handoff, setHandoff] = useState<ContentBlock[] | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [globalError, setGlobalError] = useState("");
@@ -461,21 +462,16 @@ export default function App() {
     const result = await api.retry(generation.id, uuid());
     setGeneration(await api.generation(result.generation_id));
   }
-  async function rename() {
-    if (!detail) return;
-    const title = window.prompt("Conversation title", detail.title)?.trim();
-    if (!title) return;
-    await api.rename(detail.id, title);
-    setDetail({ ...detail, title });
-    await refreshThreads();
-  }
   async function removeThread() {
-    if (!detail) return;
-    await api.deleteThread(detail.id);
-    setDeleteOpen(false);
-    setDetail(undefined);
-    setGeneration(null);
-    updateAddress("/new", true);
+    if (!deleteTarget) return;
+    await api.deleteThread(deleteTarget.id);
+    const deletedActiveThread = detail?.id === deleteTarget.id;
+    setDeleteTarget(null);
+    if (deletedActiveThread) {
+      setDetail(undefined);
+      setGeneration(null);
+      updateAddress("/new", true);
+    }
     await refreshThreads();
   }
   async function createHandoff() {
@@ -522,32 +518,24 @@ export default function App() {
         )}
         <nav className="thread-list" aria-label="Conversations">
           {threads.map((thread) => (
-            <button className={detail?.id === thread.id ? "thread-item selected" : "thread-item"} onClick={() => void openThread(thread.id)} key={thread.id}>
-              <div><span className="thread-title">{thread.title}</span>{thread.active_generation_id && <span className="activity-dot" aria-label="Generating" />}</div>
-              <ModeBadge mode={thread.mode} />
-            </button>
+            <div className={detail?.id === thread.id ? "thread-row selected" : "thread-row"} key={thread.id}>
+              <button className="thread-item" onClick={() => void openThread(thread.id)}>
+                <div><span className="thread-title">{thread.title}</span>{thread.active_generation_id && <span className="activity-dot" aria-label="Generating" />}</div>
+                <ModeBadge mode={thread.mode} />
+              </button>
+              <button className="thread-delete" onClick={() => setDeleteTarget(thread)} aria-label={`Delete ${thread.title}`} title="Delete conversation"><Trash2 /></button>
+            </div>
           ))}
         </nav>
         <footer className="sidebar-footer"><span className="cost">{usage}</span><button className="icon-button" onClick={logout} aria-label="Sign out"><LogOut /></button></footer>
       </aside>
       <main className="workspace">
-        {detail && (
-          <header className="thread-header">
-            <div><h1>{detail.title}</h1><ModeBadge mode={detail.mode} /></div>
-            <div className="header-actions">
-              <button onClick={createHandoff}><Sparkles /> Create prompt handoff</button>
-              <button className="icon-button" onClick={rename} aria-label="Rename conversation"><PenLine /></button>
-              <button className="icon-button danger" onClick={() => setDeleteOpen(true)} aria-label="Delete conversation"><Trash2 /></button>
-              <button className="icon-button compact-menu" aria-label="Conversation actions"><MoreHorizontal /></button>
-            </div>
-          </header>
-        )}
         <section className="conversation-area">
           {detail ? <MessageList detail={detail} generation={active} /> : <EmptyThread mode={draftMode} onSelect={setDraftMode} />}
         </section>
-        {(detail || draftMode) && <Composer activeGeneration={active} onSend={send} onStop={() => active ? api.stop(active.id) : Promise.resolve()} onRetry={retry} />}
+        {(detail || draftMode) && <Composer activeGeneration={active} onSend={send} onStop={() => active ? api.stop(active.id) : Promise.resolve()} onRetry={retry} onCreateHandoff={detail ? () => void createHandoff() : undefined} />}
       </main>
-      {deleteOpen && detail && <Modal title="Delete conversation?" onClose={() => setDeleteOpen(false)}><p className="modal-copy">This permanently deletes the conversation and its attachments. This cannot be undone.</p><div className="modal-actions"><button onClick={() => setDeleteOpen(false)}>Cancel</button><button className="danger-button" onClick={removeThread}>Delete permanently</button></div></Modal>}
+      {deleteTarget && <Modal title="Delete conversation?" onClose={() => setDeleteTarget(null)}><p className="modal-copy">Delete “{deleteTarget.title}”? This permanently deletes the conversation and its attachments. This cannot be undone.</p><div className="modal-actions"><button onClick={() => setDeleteTarget(null)}>Cancel</button><button className="danger-button" onClick={removeThread}>Delete permanently</button></div></Modal>}
       {handoff !== null && <Modal title="Prompt handoff" onClose={() => setHandoff(null)}><div className="handoff-body">{handoff.length ? <ResponseBlocks blocks={handoff.map((block) => ({ ...block, type: "deliverable" }))} /> : <div className="handoff-loading">Creating maintenance brief…</div>}</div></Modal>}
       {globalError && <div className="toast" role="alert">{globalError}<button onClick={() => setGlobalError("")} aria-label="Dismiss"><X /></button></div>}
     </div>

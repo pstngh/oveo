@@ -20,6 +20,17 @@ describe("deliverable copy", () => {
 });
 
 describe("composer attachments", () => {
+  it("shows prompt handoff as a compact composer icon", async () => {
+    const user = userEvent.setup();
+    const onCreateHandoff = vi.fn();
+    render(<Composer activeGeneration={null} onSend={vi.fn()} onStop={vi.fn()} onRetry={vi.fn()} onCreateHandoff={onCreateHandoff} />);
+
+    const handoff = screen.getByRole("button", { name: "Create prompt handoff" });
+    expect(handoff).not.toHaveTextContent("Create prompt handoff");
+    await user.click(handoff);
+    expect(onCreateHandoff).toHaveBeenCalledOnce();
+  });
+
   it("turns a 4,000-character paste into a synthetic attachment and preserves typed instruction text", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn().mockResolvedValue(undefined);
