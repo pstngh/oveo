@@ -192,6 +192,7 @@ function Markdown({ text }: { text: string }) {
 
 export function ResponseBlocks({ blocks, streaming = false }: { blocks: ContentBlock[]; streaming?: boolean }) {
   const [copied, setCopied] = useState<number | null>(null);
+  const visibleBlocks = streaming ? blocks.filter((block) => block.text.trim().length > 0) : blocks;
   async function copy(text: string, index: number) {
     await navigator.clipboard.writeText(text);
     setCopied(index);
@@ -199,7 +200,7 @@ export function ResponseBlocks({ blocks, streaming = false }: { blocks: ContentB
   }
   return (
     <div className={`response-blocks${streaming ? " streaming" : ""}`}>
-      {blocks.map((block, index) => block.type === "deliverable" ? (
+      {visibleBlocks.map((block, index) => block.type === "deliverable" ? (
         <section className="deliverable" key={index} aria-label="Deliverable">
           <button
             className="copy-button"

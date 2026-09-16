@@ -89,6 +89,17 @@ describe("deliverable copy", () => {
     expect(writeText).toHaveBeenCalledWith("First line\n\nSecond **literal** line");
     expect(screen.getByRole("button", { name: "Copied" })).toHaveTextContent("");
   });
+
+  it("does not show an empty deliverable shell before streamed text arrives", () => {
+    const { rerender } = render(<ResponseBlocks blocks={[{ type: "deliverable", text: "" }]} streaming />);
+
+    expect(screen.queryByRole("region", { name: "Deliverable" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Generating")).toBeInTheDocument();
+
+    rerender(<ResponseBlocks blocks={[{ type: "deliverable", text: "Translation begins." }]} streaming />);
+
+    expect(screen.getByRole("region", { name: "Deliverable" })).toHaveTextContent("Translation begins.");
+  });
 });
 
 describe("composer attachments", () => {
