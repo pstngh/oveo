@@ -133,7 +133,7 @@ def create_app(
 
     app = FastAPI(
         title="Oveo",
-        version="2.0.0",
+        version="2.1.0",
         docs_url=None if app_settings.production else "/api/docs",
         redoc_url=None,
         openapi_url=None if app_settings.production else "/api/openapi.json",

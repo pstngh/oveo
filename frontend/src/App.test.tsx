@@ -82,14 +82,17 @@ describe("composer attachments", () => {
 });
 
 describe("new conversation mode selection", () => {
-  it("shows mode choices inline without the old subheader or writing voices", async () => {
+  it("shows three distinct section choices without a voice selector", async () => {
     const user = userEvent.setup();
     const onSelect = vi.fn();
     render(<EmptyThread mode={null} onSelect={onSelect} />);
 
     expect(screen.getByRole("heading", { name: "Start a conversation" })).toBeInTheDocument();
     expect(screen.queryByRole("img", { name: "Oveo" })).not.toBeInTheDocument();
-    expect(screen.queryByText("Choose Translate or AlithyaGPT to begin.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Translate/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Revision/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Internal communications/ })).toBeInTheDocument();
+    expect(screen.queryByText("AlithyaGPT")).not.toBeInTheDocument();
     expect(screen.queryByText("Writing voices")).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: /Translate/ }));
@@ -97,11 +100,18 @@ describe("new conversation mode selection", () => {
   });
 
   it("replaces the choices with mode-specific guidance after selection", () => {
-    render(<EmptyThread mode="alithyagpt" onSelect={vi.fn()} />);
+    render(<EmptyThread mode="internal_comms" onSelect={vi.fn()} />);
 
-    expect(screen.getByRole("heading", { name: "What are you working on?" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "What internal communication do you need?" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Translate/ })).not.toBeInTheDocument();
-    expect(screen.getByText("Draft, revise, translate, or talk through a professional communication.")).toBeInTheDocument();
+    expect(screen.getByText(/Share the brief, known facts, audience/)).toBeInTheDocument();
+  });
+
+  it("keeps revision guidance focused on existing prose", () => {
+    render(<EmptyThread mode="revision" onSelect={vi.fn()} />);
+
+    expect(screen.getByRole("heading", { name: "What would you like to revise?" })).toBeInTheDocument();
+    expect(screen.getByText(/proofread, copyedit, revise, or rewrite/)).toBeInTheDocument();
   });
 });
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, File, Form, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
@@ -29,6 +29,7 @@ from oveo.models import Attachment, Generation, Message, Thread, User
 from oveo.usage import format_lifetime_cost, lifetime_total
 
 router = APIRouter()
+ThreadModeInput = Literal["translate", "revision", "internal_comms", "alithyagpt"]
 
 
 class ApiError(Exception):
@@ -372,7 +373,7 @@ async def create_thread(
     text: Annotated[str, Form()] = "",
     client_request_id: Annotated[str, Form()] = "",
     owner_id: Annotated[str, Form()] = "",
-    mode: Annotated[str, Form()] = "",
+    mode: Annotated[ThreadModeInput | None, Form()] = None,
     voice_key: Annotated[str | None, Form()] = None,
     attachment: Annotated[UploadFile | None, File()] = None,
 ) -> dict[str, str]:

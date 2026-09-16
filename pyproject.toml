@@ -1,7 +1,7 @@
 [project]
 name = "oveo"
-version = "2.0.0"
-description = "Private two-account AI translation and professional writing adviser"
+version = "2.1.0"
+description = "Private three-section AI translation, revision, and internal communications adviser"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

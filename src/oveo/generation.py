@@ -123,7 +123,6 @@ class ProviderRequest:
     generation_id: str
     purpose: str
     mode: str
-    voice_key: str | None
     snapshot: Mapping[str, Any]
 
 
@@ -454,7 +453,6 @@ class GenerationManager:
         return {
             "schema_version": 1,
             "mode": thread.mode,
-            "voice_key": thread.voice_key,
             "provider_messages": [
                 {"role": message.role, "content": message.content} for message in provider_messages
             ],
@@ -523,20 +521,28 @@ class GenerationManager:
                 return Submission(existing.thread_id, existing.id)
 
             if thread_id is None:
-                if owner_id is None or mode not in {"translate", "alithyagpt"}:
+                normalized_mode = "internal_comms" if mode == "alithyagpt" else mode
+                if owner_id is None or normalized_mode not in {
+                    "translate",
+                    "revision",
+                    "internal_comms",
+                }:
                     raise GenerationError("invalid_thread", "Choose a conversation mode.")
-                if mode == "translate" and voice_key is not None:
+                if normalized_mode != "internal_comms" and voice_key is not None:
                     raise GenerationError(
-                        "invalid_voice", "Translate does not use a writing voice."
+                        "invalid_voice", "This section does not use a writing voice."
                     )
-                if mode == "alithyagpt" and voice_key != "comm_internes":
+                if normalized_mode == "internal_comms" and voice_key not in {
+                    None,
+                    "comm_internes",
+                }:
                     raise GenerationError(
-                        "invalid_voice", "Only Comm internes is configured.", status_code=422
+                        "invalid_voice", "The legacy writing voice is not supported."
                     )
                 thread = Thread(
                     id=new_id(),
                     owner_id=owner_id,
-                    mode=mode,
+                    mode=normalized_mode,
                     voice_key=voice_key,
                     title="New conversation",
                 )
@@ -567,7 +573,7 @@ class GenerationManager:
                 .limit(1)
             )
             added_words = attachment.word_count if attachment is not None else 0
-            if thread.mode == "translate" and attachment is None:
+            if attachment is None:
                 added_words = count_words(clean_text)
             measured_words = int(latest_words or 0) + added_words
             if measured_words > self.settings.max_source_words:
@@ -969,7 +975,11 @@ class GenerationManager:
                 item.active = False
             item = WorkItem(
                 thread_id=thread.id,
-                kind="translation" if thread.mode == "translate" else "draft",
+                kind={
+                    "translate": "translation",
+                    "revision": "revision",
+                    "internal_comms": "draft",
+                }[thread.mode],
                 active=True,
             )
             db.add(item)
@@ -1179,7 +1189,6 @@ class GenerationManager:
             generation_id=f"{generation_id}:title",
             purpose="title",
             mode=str(snapshot.get("mode", "translate")),
-            voice_key=cast(str | None, snapshot.get("voice_key")),
             snapshot=snapshot,
         )
         try:
@@ -1343,7 +1352,6 @@ class GenerationManager:
             generation_id=f"{generation.id}:summary:{cutoff}",
             purpose="summary",
             mode=str(summary_snapshot.get("mode", "translate")),
-            voice_key=cast(str | None, summary_snapshot.get("voice_key")),
             snapshot=summary_snapshot,
         )
         try:
@@ -1512,7 +1520,6 @@ class GenerationManager:
         return {
             "schema_version": 1,
             "mode": str(base_snapshot.get("mode", "translate")),
-            "voice_key": cast(str | None, base_snapshot.get("voice_key")),
             "provider_messages": [
                 {"role": message.role, "content": message.content} for message in messages
             ],
@@ -1548,7 +1555,6 @@ class GenerationManager:
             generation_id=f"{generation.id}:prompt_handoff_compaction:{request_suffix}",
             purpose="prompt_handoff",
             mode=str(snapshot.get("mode", "translate")),
-            voice_key=cast(str | None, snapshot.get("voice_key")),
             snapshot=snapshot,
         )
         try:
@@ -1565,9 +1571,7 @@ class GenerationManager:
                 completion,
                 purpose="prompt_handoff_compaction",
                 record_ids=False,
-                dedupe_scope=(
-                    f"{generation.id}:prompt_handoff_compaction:{request_suffix}"
-                ),
+                dedupe_scope=(f"{generation.id}:prompt_handoff_compaction:{request_suffix}"),
             )
             await self.reconcile_pending_costs()
             return document.blocks[0].text
@@ -1608,7 +1612,6 @@ class GenerationManager:
                 generation_id=generation.id,
                 purpose=generation.purpose,
                 mode=str(request_snapshot.get("mode", "translate")),
-                voice_key=cast(str | None, request_snapshot.get("voice_key")),
                 snapshot=request_snapshot,
             )
             last_error = "provider_error"

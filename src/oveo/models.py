@@ -79,10 +79,12 @@ class Session(Base, TimestampMixin):
 class Thread(Base, TimestampMixin):
     __tablename__ = "threads"
     __table_args__ = (
-        CheckConstraint("mode IN ('translate', 'alithyagpt')", name="ck_threads_mode"),
         CheckConstraint(
-            "(mode = 'translate' AND voice_key IS NULL) OR "
-            "(mode = 'alithyagpt' AND voice_key IS NOT NULL)",
+            "mode IN ('translate', 'revision', 'internal_comms')",
+            name="ck_threads_mode",
+        ),
+        CheckConstraint(
+            "voice_key IS NULL OR mode = 'internal_comms'",
             name="ck_threads_mode_voice",
         ),
         Index("ix_threads_owner_updated", "owner_id", "updated_at"),
@@ -201,7 +203,10 @@ class Generation(Base, TimestampMixin):
 class WorkItem(Base, TimestampMixin):
     __tablename__ = "work_items"
     __table_args__ = (
-        CheckConstraint("kind IN ('translation', 'draft')", name="ck_work_items_kind"),
+        CheckConstraint(
+            "kind IN ('translation', 'revision', 'draft')",
+            name="ck_work_items_kind",
+        ),
         Index(
             "uq_work_items_one_active_per_thread",
             "thread_id",

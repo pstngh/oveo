@@ -1,4 +1,4 @@
-export type Mode = "translate" | "alithyagpt";
+export type Mode = "translate" | "revision" | "internal_comms";
 export type BlockType = "conversation" | "deliverable" | "advice";
 
 export interface ContentBlock {

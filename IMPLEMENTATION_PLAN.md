@@ -1,12 +1,24 @@
-# Oveo v2 implementation plan
+# Oveo v2.1 three-section implementation plan
 
-1. Recover only the approved v1 inputs: role-mapped Argon2 hashes, OpenRouter routing policy/key, Oveo brand assets, prompt/rule history, Caddy endpoint, deployment facts, and backup encryption material.
-2. Build one FastAPI/SQLAlchemy/SQLite application with a React/Vite frontend, immutable messages, durable background generations, canonical work versions, append-only usage accounting, and strict two-account authorization.
-3. Implement reconnectable typed-block streaming, exact retry, cancellation, bounded provider retries, canonical-state validation, title/summary/handoff calls, and privacy-safe logging.
-4. Add the dark desktop-first conversation UI, owner account switcher, mode/voice creation flow, long-paste attachment conversion, exact deliverable copying, and generation activity controls.
-5. Consolidate separate Translate and AlithyaGPT prompts from the verified v1 rule baseline, keeping source content explicitly untrusted.
-6. Add migrations, focused backend/frontend/browser tests, encrypted backup/restore tooling, a slim multi-stage image, Compose, CI, and exact-image deployment automation.
-7. Pass local quality gates and fresh-database/restore rehearsals before the first commit and push.
-8. Publish a private `pstngh/oveo` repository and immutable GHCR image, inventory and precisely remove only the authorized v1 deployment, install v2 behind the preserved Caddy endpoint, and verify login, streaming, cost retention, backups, health, security headers, and automatic deployment.
-
-Production deletion is gated on all of: verified exact targets, staged credentials and Caddy/backup material, a successful clean test suite, a built immutable image, a disposable migration/restore rehearsal, and an available fix-forward deployment path.
+1. Start from verified clean commit `433d39f3ee3d495c330e0ef5141639aedfcc55d1`
+   without importing discarded implementation history.
+2. Replace the two-section prompt composition with one compact shared Alithya rule
+   file, three independent mode prompts, the existing technical protocol, and an
+   explicit machine-owned trust/conflict policy.
+3. Persist `translate`, `revision`, and `internal_comms`; alias legacy API input
+   `alithyagpt`; keep `voice_key` only as dormant compatibility data; map canonical
+   work to `translation`, `revision`, and `draft`.
+4. Add a reversible Alembic migration that preserves thread IDs, messages,
+   attachments, summaries, actors, and canonical work, with documented downgrade
+   collapse where the legacy schema cannot represent Revision.
+5. Present three even desktop section cards and a clean narrow single-column stack;
+   update badges, types, API calls, and the visible WebMCP schema consistently.
+6. Add focused tests for prompt composition, non-converging mode boundaries, locale
+   isolation, inert delimiter-looking data, stale canonical versions, compatibility,
+   dormant voice data, and migration upgrade/downgrade preservation.
+7. Run backend formatting/lint/type/full-test gates, frontend install/typecheck/
+   lint/test/build gates, disposable Alembic fresh/current/downgrade/re-upgrade/
+   drift gates, and local desktop/mobile browser QA with disposable credentials.
+8. Stop local servers, inspect the final diff for unrelated changes, and commit the
+   verified implementation locally. Do not push, deploy, touch production, or
+   trigger external workflows.

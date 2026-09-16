@@ -13,6 +13,7 @@ from oveo.config import Settings
 from oveo.db import Database
 from oveo.generation import (
     ActiveGenerationError,
+    GenerationError,
     GenerationManager,
     ProviderCompletion,
     ProviderError,
@@ -265,6 +266,89 @@ async def test_retry_reuses_user_message_without_duplication(
             ).scalars()
         )
         assert [message.role for message in messages] == ["user", "assistant"]
+    await manager.shutdown()
+
+
+async def test_legacy_mode_alias_and_voice_are_compatibility_only(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, settings, user = manager_database
+    provider = BlockingProvider()
+    manager = GenerationManager(database, settings, provider)
+    submitted = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="legacy-mode",
+        text="Draft an internal note from these facts.",
+        attachment=None,
+        owner_id=user.id,
+        mode="alithyagpt",
+        voice_key="comm_internes",
+    )
+    await provider.started.wait()
+
+    async with database.sessions() as db:
+        thread = await db.get(Thread, submitted.thread_id)
+        generation = await db.get(Generation, submitted.generation_id)
+        assert thread is not None and generation is not None
+        assert (thread.mode, thread.voice_key) == ("internal_comms", "comm_internes")
+        assert generation.request_snapshot["mode"] == "internal_comms"
+        assert "voice_key" not in generation.request_snapshot
+        system = generation.request_snapshot["provider_messages"][0]["content"]
+        assert "# Oveo Internal communications mode" in system
+        assert "voice_key=" not in system
+
+    with pytest.raises(GenerationError, match="does not use a writing voice"):
+        await manager.submit_turn(
+            requester_id=user.id,
+            client_request_id="revision-with-voice",
+            text="Revise this.",
+            attachment=None,
+            owner_id=user.id,
+            mode="revision",
+            voice_key="comm_internes",
+        )
+
+    await manager.stop(submitted.generation_id)
+    await _wait_status(manager, submitted.generation_id, {"stopped"})
+    await manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_kind"),
+    (("translate", "translation"), ("revision", "revision"), ("internal_comms", "draft")),
+)
+async def test_canonical_work_kind_follows_mode(
+    manager_database: tuple[Database, Settings, User],
+    mode: str,
+    expected_kind: str,
+) -> None:
+    database, settings, user = manager_database
+    manager = GenerationManager(database, settings, BlockingProvider())
+    async with database.sessions() as db:
+        thread = Thread(owner_id=user.id, mode=mode, voice_key=None)
+        db.add(thread)
+        await db.flush()
+        generation = Generation(
+            thread_id=thread.id,
+            requester_id=user.id,
+            client_request_id=f"kind-{mode}",
+            purpose="chat",
+            status="running",
+        )
+        await manager._apply_state_operation(
+            db,
+            generation=generation,
+            thread=thread,
+            state=EstablishState(
+                source="Source or brief",
+                output="Completed output",
+                brief={"mode": mode},
+            ),
+        )
+        await db.commit()
+        item = await db.scalar(select(WorkItem).where(WorkItem.thread_id == thread.id))
+        assert item is not None
+        assert item.kind == expected_kind
     await manager.shutdown()
 
 

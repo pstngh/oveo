@@ -53,7 +53,6 @@ export const api = {
     threadId?: string;
     ownerId?: string;
     mode?: string;
-    voiceKey?: string;
     text: string;
     attachment?: File;
     clientRequestId: string;
@@ -63,7 +62,6 @@ export const api = {
     form.set("client_request_id", args.clientRequestId);
     if (args.ownerId) form.set("owner_id", args.ownerId);
     if (args.mode) form.set("mode", args.mode);
-    if (args.voiceKey) form.set("voice_key", args.voiceKey);
     if (args.attachment) form.set("attachment", args.attachment);
     const path = args.threadId ? `/api/threads/${args.threadId}/messages` : "/api/threads";
     return request<{ thread_id: string; generation_id: string }>(path, { method: "POST", body: form });

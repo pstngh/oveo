@@ -165,6 +165,47 @@ def test_login_submit_idempotency_handoff_and_cost(api_client: TestClient) -> No
     assert api_client.get("/api/usage/lifetime").json() == {"formatted": "$0.000369"}
 
 
+def test_three_current_modes_and_legacy_alias_are_normalized(api_client: TestClient) -> None:
+    owner_id, csrf = _login(api_client, "charles", "charles password")
+    headers = {"X-CSRF-Token": csrf, "Origin": "http://testserver"}
+    cases = (
+        ("translate", None, "translate"),
+        ("revision", None, "revision"),
+        ("internal_comms", None, "internal_comms"),
+        ("alithyagpt", "comm_internes", "internal_comms"),
+    )
+    for index, (input_mode, voice_key, expected_mode) in enumerate(cases, start=1):
+        payload = {
+            "owner_id": owner_id,
+            "mode": input_mode,
+            "text": "Synthetic scoped request.",
+            "client_request_id": f"mode-{index}",
+        }
+        if voice_key is not None:
+            payload["voice_key"] = voice_key
+        response = api_client.post("/api/threads", data=payload, headers=headers)
+        assert response.status_code == 200
+        ids = response.json()
+        _wait_generation(api_client, ids["generation_id"])
+        detail = api_client.get(f"/api/threads/{ids['thread_id']}").json()
+        assert detail["mode"] == expected_mode
+        assert detail["voice_key"] == voice_key
+
+    invalid = api_client.post(
+        "/api/threads",
+        data={
+            "owner_id": owner_id,
+            "mode": "revision",
+            "voice_key": "comm_internes",
+            "text": "Existing prose.",
+            "client_request_id": "mode-invalid-voice",
+        },
+        headers=headers,
+    )
+    assert invalid.status_code == 422
+    assert invalid.json()["code"] == "invalid_voice"
+
+
 def test_csrf_authorization_security_headers_and_deletion(api_client: TestClient) -> None:
     owner_id, csrf = _login(api_client, "charles", "charles password")
     headers = {"X-CSRF-Token": csrf, "Origin": "http://testserver"}

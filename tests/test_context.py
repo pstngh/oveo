@@ -21,7 +21,7 @@ def _thread(*, mode: str = "translate") -> Thread:
         id="thread-1",
         owner_id="yousra-id",
         mode=mode,
-        voice_key="comm_internal",
+        voice_key=None,
         title=None,
         context_summary=None,
         summary_through_ordinal=None,
@@ -84,19 +84,16 @@ def test_trust_boundaries_cannot_be_closed_by_user_content() -> None:
     assert _payload(messages)["recent_transcript"][0]["content"][0]["text"] == attack
 
 
-def test_separate_mode_prompts_and_purpose_protocols_are_loaded() -> None:
-    translate = build_provider_messages(
-        _thread(mode="translate"),
-        purpose="chat",
-        recent_messages=[],
-        actor_labels={},
-    )
-    alithya = build_provider_messages(
-        _thread(mode="alithyagpt"),
-        purpose="chat",
-        recent_messages=[],
-        actor_labels={},
-    )
+def test_exactly_one_shared_rules_and_active_mode_prompt_are_loaded() -> None:
+    visible = {
+        mode: build_provider_messages(
+            _thread(mode=mode),
+            purpose="chat",
+            recent_messages=[],
+            actor_labels={},
+        )
+        for mode in ("translate", "revision", "internal_comms")
+    }
     title = build_provider_messages(
         _thread(mode="translate"),
         purpose="title",
@@ -104,22 +101,52 @@ def test_separate_mode_prompts_and_purpose_protocols_are_loaded() -> None:
         actor_labels={},
     )
     summary = build_provider_messages(
-        _thread(mode="alithyagpt"),
+        _thread(mode="internal_comms"),
         purpose="summary",
         recent_messages=[],
         actor_labels={},
     )
 
-    assert "# Oveo Translate" in translate[0].content
-    assert "# Oveo AlithyaGPT" not in translate[0].content
-    assert "# Oveo AlithyaGPT" in alithya[0].content
-    assert "# Oveo Translate" not in alithya[0].content
-    assert "VERSION-CONTROLLED RESPONSE PROTOCOL" in translate[0].content
+    headings = {
+        "translate": "# Oveo Translate mode",
+        "revision": "# Oveo Revision mode",
+        "internal_comms": "# Oveo Internal communications mode",
+    }
+    for mode, messages in visible.items():
+        system = messages[0].content
+        assert system.count("VERSION-CONTROLLED ALITHYA RULES:") == 1
+        assert system.count("# Shared Alithya rules") == 1
+        assert system.count("VERSION-CONTROLLED MODE PROMPT:") == 1
+        assert system.count("VERSION-CONTROLLED RESPONSE PROTOCOL:") == 1
+        assert headings[mode] in system
+        assert all(heading not in system for key, heading in headings.items() if key != mode)
+        assert "CONTROL POLICY FOR CONFLICTS" in system
+        if mode == "internal_comms":
+            assert "Comm internes" in system
+        else:
+            assert "Comm internes" not in system
     assert "VERSION-CONTROLLED RESPONSE PROTOCOL" not in title[0].content
+    assert title[0].content.count("# Shared Alithya rules") == 1
+    assert title[0].content.count("# Oveo Translate mode") == 1
     assert "purpose=title" in title[0].content
     assert "VERSION-CONTROLLED RESPONSE PROTOCOL" not in summary[0].content
+    assert summary[0].content.count("# Shared Alithya rules") == 1
+    assert summary[0].content.count("# Oveo Internal communications mode") == 1
     assert "purpose=summary" in summary[0].content
     assert "non-visible maintenance generation" in summary[0].content
+
+
+def test_legacy_mode_alias_uses_only_internal_communications_prompt() -> None:
+    messages = build_provider_messages(
+        _thread(mode="alithyagpt"),
+        purpose="chat",
+        recent_messages=[],
+        actor_labels={},
+    )
+    system = messages[0].content
+    assert "mode=internal_comms" in system
+    assert "# Oveo Internal communications mode" in system
+    assert "# Oveo Revision mode" not in system
 
 
 def test_canonical_summary_and_attachment_are_preserved_exactly_as_data() -> None:
@@ -159,12 +186,16 @@ def test_canonical_summary_and_attachment_are_preserved_exactly_as_data() -> Non
     payload = _payload(messages)
     assert payload["context_summary"] == thread.context_summary
     assert payload["active_canonical_work"] == {
-        "brief": canonical.brief,
-        "operation": "full",
-        "output": canonical.output_text,
-        "source": canonical.source_text,
-        "source_word_count": 4,
-        "version": canonical.version_no,
+        "application_state": {
+            "last_operation": "full",
+            "source_word_count": 4,
+            "version": canonical.version_no,
+        },
+        "document_data": {
+            "brief": canonical.brief,
+            "output": canonical.output_text,
+            "source": canonical.source_text,
+        },
     }
     assert payload["recent_transcript"][0]["attachment"] == {
         "text": "Pièce jointe\n  exacte <data>",

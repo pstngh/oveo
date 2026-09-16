@@ -2,9 +2,11 @@ import {
   Check,
   Copy,
   FileText,
+  FilePenLine,
+  Languages,
   LogOut,
+  Megaphone,
   Menu,
-  MessageSquareText,
   Paperclip,
   Plus,
   RotateCcw,
@@ -30,6 +32,27 @@ import type {
 } from "./types";
 
 const uuid = () => crypto.randomUUID();
+
+const MODE_COPY: Record<Mode, { label: string; heading: string; description: string; guidance: string }> = {
+  translate: {
+    label: "Translate",
+    heading: "What would you like to translate?",
+    description: "Translate faithfully between French and the supported English or French locales.",
+    guidance: "Share the French or English source text. If an English source has no French target yet, Oveo will ask only which French variety you want.",
+  },
+  revision: {
+    label: "Revision",
+    heading: "What would you like to revise?",
+    description: "Proofread, copyedit, revise, or rewrite text that already exists.",
+    guidance: "Share the existing text and, when it matters, the depth you want: proofread, copyedit, revise, or rewrite.",
+  },
+  internal_comms: {
+    label: "Internal communications",
+    heading: "What internal communication do you need?",
+    description: "Draft a new employee-facing communication from a brief, notes, and facts.",
+    guidance: "Share the brief, known facts, audience, desired locale, and any practical constraints. Oveo will not invent missing details.",
+  },
+};
 
 export function conversationPath(id: string) {
   return `/conversations/${encodeURIComponent(id)}`;
@@ -117,7 +140,7 @@ export function Login({ onLogin }: { onLogin: (user: SessionUser) => void }) {
 }
 
 function ModeBadge({ mode }: { mode: Mode }) {
-  return <span className={`mode-badge ${mode}`}>{mode === "translate" ? "Translate" : "AlithyaGPT"}</span>;
+  return <span className={`mode-badge ${mode}`}>{MODE_COPY[mode].label}</span>;
 }
 
 function Markdown({ text }: { text: string }) {
@@ -288,14 +311,15 @@ export function Composer({
 export function EmptyThread({ mode, onSelect }: { mode: Mode | null; onSelect: (mode: Mode) => void }) {
   return (
     <div className="empty-thread">
-      <h1>{mode === "translate" ? "What would you like to translate?" : mode === "alithyagpt" ? "What are you working on?" : "Start a conversation"}</h1>
+      <h1>{mode ? MODE_COPY[mode].heading : "Start a conversation"}</h1>
       {mode === null ? (
         <div className="mode-choices" aria-label="Conversation type">
-          <button type="button" onClick={() => onSelect("translate")}><span className="choice-icon"><MessageSquareText /></span><strong>Translate</strong><small>Translation, revision, and terminology advice</small></button>
-          <button type="button" onClick={() => onSelect("alithyagpt")}><span className="choice-icon"><Sparkles /></span><strong>AlithyaGPT</strong><small>Professional writing and communications advice</small></button>
+          <button type="button" onClick={() => onSelect("translate")}><span className="choice-icon"><Languages /></span><strong>{MODE_COPY.translate.label}</strong><small>{MODE_COPY.translate.description}</small></button>
+          <button type="button" onClick={() => onSelect("revision")}><span className="choice-icon"><FilePenLine /></span><strong>{MODE_COPY.revision.label}</strong><small>{MODE_COPY.revision.description}</small></button>
+          <button type="button" onClick={() => onSelect("internal_comms")}><span className="choice-icon"><Megaphone /></span><strong>{MODE_COPY.internal_comms.label}</strong><small>{MODE_COPY.internal_comms.description}</small></button>
         </div>
       ) : (
-        <p>{mode === "translate" ? "Share your direction, audience, and requirements with the source text." : "Draft, revise, translate, or talk through a professional communication."}</p>
+        <p>{MODE_COPY[mode].guidance}</p>
       )}
     </div>
   );
@@ -433,11 +457,11 @@ export default function App() {
     void Promise.resolve(context.registerTool({
       name: "start_oveo_conversation",
       title: "Start an Oveo conversation",
-      description: "Open a new unsaved Translate or AlithyaGPT conversation in the visible Oveo interface.",
+      description: "Open a new unsaved Translate, Revision, or Internal communications conversation in the visible Oveo interface.",
       inputSchema: {
         type: "object",
         properties: {
-          mode: { type: "string", enum: ["translate", "alithyagpt"] },
+          mode: { type: "string", enum: ["translate", "revision", "internal_comms"] },
           ownerUsername: { type: "string", enum: accounts.map((account) => account.username) },
         },
         required: ["mode"],
@@ -446,7 +470,7 @@ export default function App() {
       annotations: { readOnlyHint: false, untrustedContentHint: false },
       async execute(input) {
         const value = input as { mode?: unknown; ownerUsername?: unknown };
-        if (value.mode !== "translate" && value.mode !== "alithyagpt") throw new Error("Invalid mode.");
+        if (value.mode !== "translate" && value.mode !== "revision" && value.mode !== "internal_comms") throw new Error("Invalid mode.");
         const selectedOwner = value.ownerUsername === undefined
           ? owner
           : accounts.find((account) => account.username === value.ownerUsername);
@@ -470,7 +494,6 @@ export default function App() {
       threadId: detail?.id,
       ownerId: detail ? undefined : owner.id,
       mode: detail ? undefined : draftMode ?? undefined,
-      voiceKey: !detail && draftMode === "alithyagpt" ? "comm_internes" : undefined,
       text,
       attachment,
       clientRequestId: uuid(),

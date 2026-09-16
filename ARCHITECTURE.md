@@ -1,43 +1,105 @@
 # Architecture
 
-## Boundaries
+## Runtime and security boundaries
 
-Caddy terminates HTTPS and proxies only to the app's loopback port. FastAPI serves authenticated REST/SSE routes and the compiled React application. The one application process owns an in-process generation manager, an async OpenRouter client, SQLite, and a private attachment directory. Uploaded/source text and model output are content, never trusted control instructions.
+Caddy terminates HTTPS and proxies only to the app's loopback port. FastAPI serves
+authenticated REST/SSE routes and the compiled React application. One application
+process owns the generation manager, async OpenRouter client, SQLite database, and
+private attachment directory.
 
-Authentication uses opaque random cookies whose SHA-256 hashes are stored in `sessions`. Sessions have a fixed 30-day deadline and carry a credential version. Unsafe cookie-authenticated requests require a per-session CSRF token and same-origin validation. Every thread route resolves ownership on the server; the owner account selector changes scope, never identity. The true sending actor is stored on each user message.
+Authentication uses opaque random cookies whose SHA-256 hashes are stored in
+`sessions`. Sessions have a fixed deadline and credential version. Unsafe requests
+require a per-session CSRF token and same-origin validation. Every thread route
+resolves ownership on the server; the owner selector changes scope, never identity.
+The true sending actor remains stored on every user message.
 
-Operational logs contain opaque IDs, durations, sizes, route/status information, and error classifications only. They exclude prompt/message/attachment content, provider payloads, credentials, cookies, and authorization headers.
+Operational logs exclude prompt, message, attachment, provider-payload, credential,
+cookie, and authorization-header content.
 
-## Data model
+## Three section model
 
-- `users` and `sessions` hold the two permanent identities and revocable authentication state.
-- `threads`, immutable `messages`, and one optional `attachment` per user message form the visible conversation.
-- `generations` hold idempotency keys, frozen request context, status, replayable partial blocks, provider IDs, and safe errors.
-- `work_items` and immutable `work_versions` hold complete canonical source/output/brief snapshots independently of chat presentation.
-- `usage_events` form an append-only micro-USD ledger and deliberately survive thread deletion.
+Threads persist one current mode: `translate`, `revision`, or `internal_comms`.
+Translate owns translation direction and target-locale selection. Revision owns
+inference, preservation, or intentional same-language adaptation of the existing
+locale. Internal communications owns draft-locale selection and alone applies the
+`Comm internes` house style. No user-facing or model-active voice selector exists.
 
-SQLite foreign keys, check/unique constraints, and a partial unique active-generation index protect invariants. Connections enable WAL, foreign keys, normal synchronous mode, and a bounded busy timeout. Model calls and streaming never hold database transactions open.
+Legacy API input `alithyagpt` normalizes to `internal_comms`. `voice_key` is retained
+only as dormant compatibility data for legacy records/clients; it is neither placed
+in the trusted model context nor used to select behavior.
 
-## Generation lifecycle
+## Prompt composition and trust
 
-The server validates input and atomically stores the user message plus queued generation. It then starts an independent task. The task freezes the prompt/context manifest, calls OpenRouter with the fixed model and verified privacy routing, incrementally decodes the versioned typed-block protocol, and checkpoints replayable blocks without exposing wire markers. Reconnecting SSE clients receive an authoritative snapshot.
+For an ordinary visible chat generation, the system message contains exactly:
 
-Success atomically creates the assistant message, validates and stores any complete work version, and completes the generation. Stop or terminal failure discards partial assistant output but retains the user message. Retry creates no duplicate user message and reuses the saved message, attachment, context, and intent. On startup, orphaned queued/running generations become failed and retryable.
+1. machine-generated trusted application context with canonical mode, generation
+   purpose, instruction/data boundary, and explicit conflict policy;
+2. the shared technical `protocol.md`;
+3. exactly one active mode prompt;
+4. exactly one shared `alithya_rules.md`.
 
-At most one active foreground generation exists per thread; different threads and accounts may run concurrently. The provider uses bounded cancellable retries only for transient network, 429, and 5xx failures.
+Title and summary generations retain safe purpose-specific contracts but do not
+load the visible response protocol. Prompt handoff compaction continues to use its
+separate user-only extraction contract.
 
-## Typed responses and canonical work
+The conflict policy is explicit: runtime security/protocol invariants; mode scope,
+semantics, and preservation; mandatory Alithya terminology/names/protected content;
+permitted explicit user choices; then default brand/style. Prompt ordering is not
+the conflict-resolution mechanism.
 
-Assistant messages store versioned blocks: `conversation`, plain-text `deliverable`, and `advice`. Deliverables appear first and each has an exact-text Copy action. Markdown is limited to safe advisory blocks and raw HTML is disabled.
+Conversation, source, attachment, quoted, summary, prior assistant, brief, and
+canonical document text is serialized in one separately delimited JSON data
+envelope. Raw angle brackets are escaped during serialization and decode to the
+exact original text. Canonical provenance separates application-managed version,
+word-count, and last-operation metadata from document data. A model may copy the
+version for a state precondition, but neither that metadata nor document text can
+redefine instructions.
 
-Translate and AlithyaGPT use separate version-controlled prompts. Translate canonical state supports validated establish, append, exact-anchor replacement, and full-version operations. Every committed version is a complete immutable snapshot. The application validates anchors, grounding, base-version freshness, and the cumulative 25,000-word ceiling; it does not perform linguistic QA or silently repair invalid model operations.
+The single shared rule file owns authorized terminology (including HCBP/PACH),
+brand/naming, locale conventions, official names, protected URLs/placeholders,
+and the common adviser posture. The three independent mode prompts own all task
+behavior. The protocol owns only typed NDJSON structure and canonical-operation
+mechanics. Future global rule edits affect future generations, not immutable saved
+canonical versions.
 
-Recent discussion and replaceable summaries are context policy. Canonical source/output/brief state is always injected directly and is never reconstructed from or summarized out of the transcript.
+## Data model and migrations
 
-## Cost accounting
+- `users` and `sessions` hold identities and revocable authentication state.
+- `threads`, immutable `messages`, and one optional attachment per user message
+  form the visible conversation.
+- `generations` hold idempotency keys, frozen request context, status, replayable
+  partial blocks, provider IDs, and safe errors.
+- `work_items` use kinds `translation`, `revision`, or `draft`; immutable
+  `work_versions` hold complete canonical source/output/brief snapshots.
+- `usage_events` form an append-only micro-USD ledger and survive thread deletion.
 
-Every provider call creates a deduplicated append-only usage event. Actual provider cost is stored in integer micro-USD; missing cost remains pending and is reconciled by provider request ID. Stopped and failed calls count when the provider reports a charge. Thread deletion cannot cascade into the ledger.
+Migration `20260916_0002` maps legacy `alithyagpt` threads to `internal_comms`
+without rewriting related rows. Its downgrade preserves all rows and content but
+must collapse Revision and Internal communications into `alithyagpt` and revision
+work items into `draft`, because the old schema has no third representation.
+
+SQLite foreign keys, check/unique constraints, and partial unique indexes protect
+invariants. Connections enable WAL, foreign keys, normal synchronous mode, and a
+bounded busy timeout. Model calls and streaming never hold transactions open.
+
+## Generation and canonical state
+
+The server atomically stores validated input and a queued generation, then starts
+an independent task. It composes a frozen context, calls the fixed model with
+privacy routing, incrementally validates typed NDJSON, and checkpoints replayable
+visible blocks. Reconnecting clients receive an authoritative SSE snapshot.
+
+Success atomically creates the assistant message, validates any state operation,
+and completes the generation. The server enforces closed schemas, exact anchors,
+non-overlap, source limits, and current `base_version`; stale operations fail.
+Mode prompts decide when those valid operations semantically apply. Each mode maps
+new canonical work to its corresponding work kind. Stop/failure discards partial
+assistant output but retains the user turn; retry does not duplicate it.
 
 ## Deliberate omissions
 
-Oveo has no Redis, worker service, queue broker, Supervisor, watchdog, lease renewal, Office/OCR pipeline, prompt database/editor, model selector, analytics, live-data encryption, linguistic repair scanner, signup/recovery flow, or mutable-message/branching machinery. These systems are unnecessary for this private two-user deployment and would weaken its simplicity.
+Oveo has no dynamic rule-pack loader, prompt database/editor, unified-conversation
+router, Redis, worker service, queue broker, model selector, mutable-message
+branching, Office/OCR pipeline, analytics, signup/recovery flow, or linguistic
+repair scanner. These are unnecessary for this private deployment and would make
+the trust and maintenance paths less clear.
