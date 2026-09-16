@@ -45,6 +45,11 @@ All settings use the `OVEO_` prefix. See `.env.example`. Production requires:
 - `OVEO_ENVIRONMENT=production`, the trusted public origin/host, secure cookies, and persistent data paths;
 - the fixed `openai/gpt-5.6-luna` model and privacy-eligible provider routing implemented server-side.
 
+Conversation and handoff inputs are counted with Luna's tokenizer. Oveo compacts at
+240,000 input tokens by default, leaving a 32,000-token margin below Luna's long-context
+pricing boundary. Oversized handoffs are reduced in user-only chunks; assistant turns,
+internal summaries, canonical work, and application prompts never enter those chunks.
+
 Never commit `.env`, credentials, live databases, attachments, backup identities, or decrypted backups.
 
 ## Runtime

@@ -94,10 +94,14 @@ class CanonicalReconcileProvider:
 
 
 class CompactingProvider:
+    def __init__(self) -> None:
+        self.requests: list[ProviderRequest] = []
+
     async def generate(
         self, request: ProviderRequest, emit: object, cancel_event: asyncio.Event
     ) -> ProviderCompletion:
         del cancel_event
+        self.requests.append(request)
         if request.purpose == "summary":
             await emit(  # type: ignore[operator]
                 b'{"version":1,"summary":"Earlier decisions.","unresolved":["Tone"]}'
@@ -105,6 +109,29 @@ class CompactingProvider:
             return ProviderCompletion(cost_microusd=11)
         await emit(_SUCCESS)  # type: ignore[operator]
         return ProviderCompletion(cost_microusd=22)
+
+
+class HandoffCompactingProvider:
+    def __init__(self) -> None:
+        self.requests: list[ProviderRequest] = []
+
+    async def generate(
+        self, request: ProviderRequest, emit: object, cancel_event: asyncio.Event
+    ) -> ProviderCompletion:
+        del cancel_event
+        self.requests.append(request)
+        if ":prompt_handoff_compaction:" in request.generation_id:
+            await emit(  # type: ignore[operator]
+                b'{"v":1,"event":"response_start"}\n'
+                b'{"v":1,"event":"block_start","id":"b1","type":"deliverable"}\n'
+                b'{"v":1,"event":"block_delta","id":"b1","text":"Extracted user instruction."}\n'
+                b'{"v":1,"event":"block_end","id":"b1"}\n'
+                b'{"v":1,"event":"state","operation":"none"}\n'
+                b'{"v":1,"event":"response_end"}\n'
+            )
+            return ProviderCompletion(cost_microusd=1)
+        await emit(_SUCCESS)  # type: ignore[operator]
+        return ProviderCompletion(cost_microusd=2)
 
 
 class HandoffCaptureProvider:
@@ -302,7 +329,7 @@ async def test_automatic_compaction_preserves_recent_transcript_and_accounts_cos
 ) -> None:
     database, base_settings, user = manager_database
     settings = base_settings.model_copy(
-        update={"context_compaction_chars": 1_000, "context_recent_messages": 4}
+        update={"context_compaction_tokens": 10_000, "context_recent_messages": 4}
     )
     async with database.sessions() as db:
         thread = Thread(
@@ -321,13 +348,19 @@ async def test_automatic_compaction_preserves_recent_transcript_and_accounts_cos
                     ordinal=ordinal,
                     role=role,
                     actor_user_id=user.id if role == "user" else None,
-                    content=[{"type": "conversation", "text": f"Prior turn {ordinal}"}],
+                    content=[
+                        {
+                            "type": "conversation",
+                            "text": f"Prior turn {ordinal} " * 400,
+                        }
+                    ],
                 )
             )
         await db.commit()
         thread_id = thread.id
 
-    manager = GenerationManager(database, settings, CompactingProvider())
+    provider = CompactingProvider()
+    manager = GenerationManager(database, settings, provider)
     submitted = await manager.submit_turn(
         requester_id=user.id,
         client_request_id="compact",
@@ -345,6 +378,87 @@ async def test_automatic_compaction_preserves_recent_transcript_and_accounts_cos
             select(func.sum(UsageEvent.amount_microusd)).where(UsageEvent.event_type == "charge")
         )
         assert total == 33
+    assert [request.purpose for request in provider.requests] == ["summary", "chat"]
+    await manager.shutdown()
+
+
+async def test_large_handoff_is_compacted_from_user_material_only(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, base_settings, user = manager_database
+    settings = base_settings.model_copy(update={"context_compaction_tokens": 2_000})
+    async with database.sessions() as db:
+        thread = Thread(
+            owner_id=user.id,
+            mode="translate",
+            voice_key=None,
+            title="Existing thread",
+            context_summary="Private internal summary.",
+            summary_through_ordinal=2,
+        )
+        db.add(thread)
+        await db.flush()
+        db.add_all(
+            [
+                Message(
+                    thread_id=thread.id,
+                    ordinal=1,
+                    role="user",
+                    actor_user_id=user.id,
+                    content=[
+                        {
+                            "type": "conversation",
+                            "text": "First explicit instruction " + "word " * 1_000,
+                        }
+                    ],
+                ),
+                Message(
+                    thread_id=thread.id,
+                    ordinal=2,
+                    role="assistant",
+                    actor_user_id=None,
+                    content=[{"type": "conversation", "text": "Private assistant reply."}],
+                ),
+                Message(
+                    thread_id=thread.id,
+                    ordinal=3,
+                    role="user",
+                    actor_user_id=user.id,
+                    content=[
+                        {
+                            "type": "conversation",
+                            "text": "Second explicit instruction " + "word " * 1_000,
+                        }
+                    ],
+                ),
+            ]
+        )
+        await db.commit()
+        thread_id = thread.id
+
+    provider = HandoffCompactingProvider()
+    manager = GenerationManager(database, settings, provider)
+    generation_id = await manager.submit_handoff(
+        thread_id=thread_id,
+        requester_id=user.id,
+        client_request_id="large-handoff-user-only",
+    )
+    assert (await _wait_status(manager, generation_id, {"completed"}))["status"] == "completed"
+    assert len(provider.requests) == 3
+    serialized_requests = [
+        str(request.snapshot["provider_messages"]) for request in provider.requests
+    ]
+    assert "First explicit instruction" in serialized_requests[0]
+    assert "Second explicit instruction" in serialized_requests[1]
+    assert "Extracted user instruction." in serialized_requests[2]
+    assert all("Private assistant reply." not in item for item in serialized_requests)
+    assert all("Private internal summary." not in item for item in serialized_requests)
+    assert all("VERSION-CONTROLLED MODE PROMPT" not in item for item in serialized_requests)
+    async with database.sessions() as db:
+        total = await db.scalar(
+            select(func.sum(UsageEvent.amount_microusd)).where(UsageEvent.event_type == "charge")
+        )
+        assert total == 4
     await manager.shutdown()
 
 

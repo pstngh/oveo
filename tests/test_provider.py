@@ -12,6 +12,7 @@ from oveo.provider import (
     OpenRouterClient,
     ProviderError,
     ProviderMessage,
+    count_input_tokens,
     parse_usage,
 )
 
@@ -29,6 +30,15 @@ def settings(tmp_path: Path, **overrides: object) -> Settings:
 
 def sse(payload: dict[str, object]) -> bytes:
     return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode()
+
+
+def test_input_token_count_uses_luna_tokenizer_and_chat_framing() -> None:
+    short = count_input_tokens([ProviderMessage("user", "hello")])
+    longer = count_input_tokens([ProviderMessage("user", "hello " * 100)])
+
+    assert short > 1
+    assert longer > short
+    assert longer < len("hello " * 100)
 
 
 @pytest.mark.asyncio

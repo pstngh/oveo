@@ -6,9 +6,12 @@ import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from functools import lru_cache
 from typing import Literal, cast
 
 import httpx
+import tiktoken
+from tiktoken import Encoding
 
 from .config import Settings
 
@@ -47,6 +50,29 @@ class ProviderCompletion:
     provider_generation_id: str | None
     provider_name: str | None
     usage: ProviderUsage | None
+
+
+@lru_cache(maxsize=1)
+def _model_encoding() -> Encoding:
+    return tiktoken.encoding_for_model(OPENROUTER_MODEL.partition("/")[2])
+
+
+def count_input_tokens(messages: Sequence[ProviderMessage]) -> int:
+    """Count model input tokens with a small allowance for chat framing.
+
+    OpenRouter does not expose OpenAI's preflight input-token endpoint. The content and
+    roles use Luna's model tokenizer exactly; the framing allowance is deliberately
+    conservative and the default 32K-token margin absorbs provider serialization
+    differences.
+    """
+
+    encoding = _model_encoding()
+    total = 3  # Assistant reply priming.
+    for message in messages:
+        total += 4  # Per-message role and framing markers.
+        total += len(encoding.encode(message.role, disallowed_special=()))
+        total += len(encoding.encode(message.content, disallowed_special=()))
+    return total
 
 
 class ProviderError(RuntimeError):

@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     login_lock_seconds: int = Field(default=900, ge=60, le=86_400)
     max_upload_bytes: int = Field(default=2_000_000, ge=1024, le=10_000_000)
     max_source_words: int = Field(default=25_000, ge=1000, le=100_000)
-    context_compaction_chars: int = Field(default=300_000, ge=1_000, le=5_000_000)
+    context_compaction_tokens: int = Field(default=240_000, ge=1_000, le=260_000)
     context_recent_messages: int = Field(default=12, ge=4, le=100)
     openrouter_api_key: SecretStr | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"

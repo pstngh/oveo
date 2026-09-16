@@ -15,7 +15,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from oveo.attachments import ValidatedAttachment, count_words, persist_attachment
 from oveo.config import Settings
-from oveo.context import AttachmentText, build_provider_messages
+from oveo.context import (
+    AttachmentText,
+    build_handoff_merge_messages,
+    build_provider_messages,
+)
 from oveo.db import Database
 from oveo.models import (
     Attachment,
@@ -43,7 +47,7 @@ from oveo.protocol import (
     SourceOutputReplacement,
     StateOperation,
 )
-from oveo.provider import OpenRouterClient, ProviderMessage
+from oveo.provider import OpenRouterClient, ProviderMessage, count_input_tokens
 from oveo.provider import ProviderError as OpenRouterError
 from oveo.usage import append_usage_event
 
@@ -83,6 +87,33 @@ class ProviderError(RuntimeError):
         self.provider_request_id = provider_request_id
         self.provider_generation_id = provider_generation_id
         self.cost_microusd = cost_microusd
+
+
+def _snapshot_messages(snapshot: Mapping[str, Any]) -> list[ProviderMessage]:
+    raw_messages = snapshot.get("provider_messages")
+    if not isinstance(raw_messages, list):
+        raise ProviderError("context_compaction_failed")
+    messages: list[ProviderMessage] = []
+    for item in raw_messages:
+        if not isinstance(item, dict):
+            raise ProviderError("context_compaction_failed")
+        role = item.get("role")
+        content = item.get("content")
+        if role not in {"system", "user", "assistant"} or not isinstance(content, str):
+            raise ProviderError("context_compaction_failed")
+        messages.append(
+            ProviderMessage(
+                role=cast(Literal["system", "user", "assistant"], role),
+                content=content,
+            )
+        )
+    if not messages:
+        raise ProviderError("context_compaction_failed")
+    return messages
+
+
+def _snapshot_input_tokens(snapshot: Mapping[str, Any]) -> int:
+    return count_input_tokens(_snapshot_messages(snapshot))
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +235,7 @@ class Submission:
 
 _TERMINAL = frozenset({"completed", "failed", "stopped"})
 _ACTIVE = frozenset({"queued", "running", "stopping"})
+_MIN_RECENT_MESSAGES = 4
 _ERROR_MESSAGES = {
     "provider_not_configured": "The model provider is not configured.",
     "provider_network": "The model provider could not be reached.",
@@ -211,6 +243,7 @@ _ERROR_MESSAGES = {
     "provider_rejected": "The model provider rejected the request.",
     "provider_invalid_stream": "The model provider returned an invalid response.",
     "protocol_error": "The model returned an invalid response format.",
+    "context_compaction_failed": "Oveo could not safely fit this conversation in context.",
     "restart_interrupted": "Generation was interrupted by an application restart.",
     "provider_error": "Oveo could not complete this response.",
 }
@@ -386,9 +419,12 @@ class GenerationManager:
         thread: Thread,
         *,
         purpose: str,
+        after_ordinal: int | None = None,
         through_ordinal: int | None = None,
     ) -> dict[str, Any]:
         message_query = select(Message).where(Message.thread_id == thread.id)
+        if after_ordinal is not None:
+            message_query = message_query.where(Message.ordinal > after_ordinal)
         if through_ordinal is not None:
             message_query = message_query.where(Message.ordinal <= through_ordinal)
         messages = list((await db.execute(message_query.order_by(Message.ordinal))).scalars())
@@ -397,15 +433,16 @@ class GenerationManager:
             user.id: user.display_name
             for user in (await db.execute(select(User).where(User.id.in_(actor_ids)))).scalars()
         }
-        attachment_rows = list(
-            (
-                await db.execute(
-                    select(Attachment)
-                    .join(Message, Attachment.message_id == Message.id)
-                    .where(Message.thread_id == thread.id)
-                )
-            ).scalars()
+        attachment_query = (
+            select(Attachment)
+            .join(Message, Attachment.message_id == Message.id)
+            .where(Message.thread_id == thread.id)
         )
+        if after_ordinal is not None:
+            attachment_query = attachment_query.where(Message.ordinal > after_ordinal)
+        if through_ordinal is not None:
+            attachment_query = attachment_query.where(Message.ordinal <= through_ordinal)
+        attachment_rows = list((await db.execute(attachment_query)).scalars())
         attachments: dict[str, AttachmentText] = {}
         for attachment in attachment_rows:
             path = self.settings.attachments_dir / attachment.storage_name
@@ -1028,6 +1065,7 @@ class GenerationManager:
         *,
         purpose: str,
         record_ids: bool = True,
+        dedupe_scope: str | None = None,
     ) -> None:
         async with self.database.sessions() as db:
             generation = await db.get(Generation, generation_id)
@@ -1039,9 +1077,9 @@ class GenerationManager:
                 )
                 generation.provider_generation_id = (
                     completion.provider_generation_id or generation.provider_generation_id
-                )
+            )
             if completion.cost_microusd is not None:
-                provider_key = completion.provider_request_id or generation.id
+                provider_key = completion.provider_request_id or dedupe_scope or generation.id
                 await append_usage_event(
                     db,
                     dedupe_key=f"{provider_key}:{purpose}:charge",
@@ -1208,61 +1246,113 @@ class GenerationManager:
 
     async def _maybe_compact_context(self, generation: Generation) -> Mapping[str, Any]:
         snapshot = generation.request_snapshot
-        provider_messages = snapshot.get("provider_messages")
-        context_chars = (
-            sum(
-                len(str(message.get("content", "")))
-                for message in provider_messages
-                if isinstance(message, dict)
-            )
-            if isinstance(provider_messages, list)
-            else 0
-        )
-        if (
-            generation.purpose != "chat"
-            or generation.thread_id is None
-            or context_chars <= self.settings.context_compaction_chars
-        ):
+        if generation.purpose not in {"chat", "prompt_handoff"}:
             return snapshot
+        if _snapshot_input_tokens(snapshot) <= self.settings.context_compaction_tokens:
+            return snapshot
+        if generation.thread_id is None:
+            raise ProviderError("context_compaction_failed")
+        if generation.purpose == "prompt_handoff":
+            return await self._compact_handoff_context(generation)
+        return await self._compact_chat_context(generation)
 
-        async with self.database.sessions() as db:
-            thread = await db.get(Thread, generation.thread_id)
-            if thread is None:
-                raise ProviderError("context_compaction_failed")
-            unsummarized = list(
-                (
-                    await db.execute(
-                        select(Message)
-                        .where(
-                            Message.thread_id == thread.id,
-                            Message.ordinal > (thread.summary_through_ordinal or 0),
+    async def _compact_chat_context(self, generation: Generation) -> Mapping[str, Any]:
+        snapshot: Mapping[str, Any] = generation.request_snapshot
+        budget = self.settings.context_compaction_tokens
+        while _snapshot_input_tokens(snapshot) > budget:
+            async with self.database.sessions() as db:
+                thread = await db.get(Thread, generation.thread_id)
+                if thread is None:
+                    raise ProviderError("context_compaction_failed")
+                unsummarized = list(
+                    (
+                        await db.execute(
+                            select(Message)
+                            .where(
+                                Message.thread_id == thread.id,
+                                Message.ordinal > (thread.summary_through_ordinal or 0),
+                            )
+                            .order_by(Message.ordinal)
                         )
-                        .order_by(Message.ordinal)
-                    )
-                ).scalars()
+                    ).scalars()
+                )
+                if len(unsummarized) <= _MIN_RECENT_MESSAGES:
+                    raise ProviderError("context_compaction_failed")
+
+                retain = (
+                    self.settings.context_recent_messages
+                    if len(unsummarized) > self.settings.context_recent_messages
+                    else _MIN_RECENT_MESSAGES
+                )
+                candidates = unsummarized[:-retain]
+                bounded = await self._largest_bounded_summary_snapshot(db, thread, candidates)
+                if bounded is None:
+                    raise ProviderError("context_compaction_failed")
+                cutoff, summary_snapshot = bounded
+                await append_usage_event(
+                    db,
+                    dedupe_key=f"{generation.id}:summary:{cutoff}:pending",
+                    event_type="pending",
+                    purpose="summary",
+                    amount_microusd=None,
+                    generation_id=generation.id,
+                    thread_id=thread.id,
+                    requester_id=generation.requester_id,
+                    provider_request_id=None,
+                )
+                await db.commit()
+
+            compacted = await self._generate_context_summary(
+                generation,
+                cutoff=cutoff,
+                summary_snapshot=summary_snapshot,
             )
-            if len(unsummarized) <= self.settings.context_recent_messages:
-                return snapshot
-            cutoff = unsummarized[-self.settings.context_recent_messages - 1].ordinal
-            summary_snapshot = await self._request_snapshot(
+
+            async with self.database.sessions() as db:
+                thread = await db.get(Thread, generation.thread_id)
+                current = await db.get(Generation, generation.id)
+                if thread is None or current is None or current.status != "running":
+                    raise asyncio.CancelledError
+                thread.context_summary = compacted
+                thread.summary_through_ordinal = cutoff
+                fresh_snapshot = await self._request_snapshot(db, thread, purpose="chat")
+                current.request_snapshot = fresh_snapshot
+                await db.commit()
+                snapshot = fresh_snapshot
+        return snapshot
+
+    async def _largest_bounded_summary_snapshot(
+        self,
+        db: AsyncSession,
+        thread: Thread,
+        candidates: Sequence[Message],
+    ) -> tuple[int, Mapping[str, Any]] | None:
+        low = 0
+        high = len(candidates) - 1
+        best: tuple[int, Mapping[str, Any]] | None = None
+        while low <= high:
+            middle = (low + high) // 2
+            cutoff = candidates[middle].ordinal
+            candidate = await self._request_snapshot(
                 db,
                 thread,
                 purpose="summary",
                 through_ordinal=cutoff,
             )
-            await append_usage_event(
-                db,
-                dedupe_key=f"{generation.id}:summary:{cutoff}:pending",
-                event_type="pending",
-                purpose="summary",
-                amount_microusd=None,
-                generation_id=generation.id,
-                thread_id=thread.id,
-                requester_id=generation.requester_id,
-                provider_request_id=None,
-            )
-            await db.commit()
+            if _snapshot_input_tokens(candidate) <= self.settings.context_compaction_tokens:
+                best = (cutoff, candidate)
+                low = middle + 1
+            else:
+                high = middle - 1
+        return best
 
+    async def _generate_context_summary(
+        self,
+        generation: Generation,
+        *,
+        cutoff: int,
+        summary_snapshot: Mapping[str, Any],
+    ) -> str:
         parts: list[bytes] = []
 
         async def collect(chunk: bytes) -> None:
@@ -1310,6 +1400,7 @@ class GenerationManager:
                 compacted += "\n\nUnresolved:\n" + "\n".join(
                     f"- {item}" for item in unresolved_text
                 )
+            return compacted
         except (ProviderError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             error = (
                 exc
@@ -1324,17 +1415,196 @@ class GenerationManager:
             )
             raise error from exc
 
+    async def _compact_handoff_context(self, generation: Generation) -> Mapping[str, Any]:
+        budget = self.settings.context_compaction_tokens
+        chunks: list[Mapping[str, Any]] = []
         async with self.database.sessions() as db:
             thread = await db.get(Thread, generation.thread_id)
+            if thread is None:
+                raise ProviderError("context_compaction_failed")
+            user_ordinals = list(
+                (
+                    await db.execute(
+                        select(Message.ordinal)
+                        .where(Message.thread_id == thread.id, Message.role == "user")
+                        .order_by(Message.ordinal)
+                    )
+                ).scalars()
+            )
+            start = 0
+            after_ordinal: int | None = None
+            while start < len(user_ordinals):
+                low = start
+                high = len(user_ordinals) - 1
+                best_end: int | None = None
+                best_snapshot: Mapping[str, Any] | None = None
+                while low <= high:
+                    middle = (low + high) // 2
+                    candidate = await self._request_snapshot(
+                        db,
+                        thread,
+                        purpose="prompt_handoff",
+                        after_ordinal=after_ordinal,
+                        through_ordinal=user_ordinals[middle],
+                    )
+                    if _snapshot_input_tokens(candidate) <= budget:
+                        best_end = middle
+                        best_snapshot = candidate
+                        low = middle + 1
+                    else:
+                        high = middle - 1
+                if best_end is None or best_snapshot is None:
+                    raise ProviderError("context_compaction_failed")
+                chunks.append(best_snapshot)
+                after_ordinal = user_ordinals[best_end]
+                start = best_end + 1
+
+        extracts = [
+            await self._generate_handoff_extract(
+                generation,
+                snapshot=chunk,
+                request_suffix=f"source:{index}",
+            )
+            for index, chunk in enumerate(chunks, start=1)
+        ]
+        while True:
+            final_snapshot = self._snapshot_with_messages(
+                generation.request_snapshot,
+                build_handoff_merge_messages(extracts),
+            )
+            if _snapshot_input_tokens(final_snapshot) <= budget:
+                break
+            groups = self._bounded_handoff_groups(generation.request_snapshot, extracts)
+            if len(groups) >= len(extracts):
+                raise ProviderError("context_compaction_failed")
+            extracts = [
+                await self._generate_handoff_extract(
+                    generation,
+                    snapshot=self._snapshot_with_messages(
+                        generation.request_snapshot,
+                        build_handoff_merge_messages(group),
+                    ),
+                    request_suffix=f"merge:{index}",
+                )
+                for index, group in enumerate(groups, start=1)
+            ]
+
+        async with self.database.sessions() as db:
             current = await db.get(Generation, generation.id)
-            if thread is None or current is None or current.status != "running":
+            if current is None or current.status != "running":
                 raise asyncio.CancelledError
-            thread.context_summary = compacted
-            thread.summary_through_ordinal = cutoff
-            fresh_snapshot = await self._request_snapshot(db, thread, purpose="chat")
-            current.request_snapshot = fresh_snapshot
+            current.request_snapshot = dict(final_snapshot)
             await db.commit()
-            return fresh_snapshot
+        return final_snapshot
+
+    def _bounded_handoff_groups(
+        self,
+        base_snapshot: Mapping[str, Any],
+        extracts: Sequence[str],
+    ) -> list[list[str]]:
+        groups: list[list[str]] = []
+        current: list[str] = []
+        for extract in extracts:
+            candidate = [*current, extract]
+            candidate_snapshot = self._snapshot_with_messages(
+                base_snapshot,
+                build_handoff_merge_messages(candidate),
+            )
+            within_budget = (
+                _snapshot_input_tokens(candidate_snapshot)
+                <= self.settings.context_compaction_tokens
+            )
+            if within_budget:
+                current = candidate
+                continue
+            if not current:
+                raise ProviderError("context_compaction_failed")
+            groups.append(current)
+            current = [extract]
+        if current:
+            groups.append(current)
+        return groups
+
+    @staticmethod
+    def _snapshot_with_messages(
+        base_snapshot: Mapping[str, Any],
+        messages: Sequence[ProviderMessage],
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "mode": str(base_snapshot.get("mode", "translate")),
+            "voice_key": cast(str | None, base_snapshot.get("voice_key")),
+            "provider_messages": [
+                {"role": message.role, "content": message.content} for message in messages
+            ],
+        }
+
+    async def _generate_handoff_extract(
+        self,
+        generation: Generation,
+        *,
+        snapshot: Mapping[str, Any],
+        request_suffix: str,
+    ) -> str:
+        async with self.database.sessions() as db:
+            await append_usage_event(
+                db,
+                dedupe_key=f"{generation.id}:prompt_handoff_compaction:{request_suffix}:pending",
+                event_type="pending",
+                purpose="prompt_handoff_compaction",
+                amount_microusd=None,
+                generation_id=generation.id,
+                thread_id=generation.thread_id,
+                requester_id=generation.requester_id,
+                provider_request_id=None,
+            )
+            await db.commit()
+
+        decoder = ProtocolDecoder()
+
+        async def collect(chunk: bytes) -> None:
+            decoder.feed(chunk)
+
+        request = ProviderRequest(
+            generation_id=f"{generation.id}:prompt_handoff_compaction:{request_suffix}",
+            purpose="prompt_handoff",
+            mode=str(snapshot.get("mode", "translate")),
+            voice_key=cast(str | None, snapshot.get("voice_key")),
+            snapshot=snapshot,
+        )
+        try:
+            completion = await self.provider.generate(request, collect, asyncio.Event())
+            document = decoder.finish()
+            if (
+                not isinstance(document.state, NoState)
+                or len(document.blocks) != 1
+                or document.blocks[0].type != "deliverable"
+            ):
+                raise ProviderError("context_compaction_failed")
+            await self._record_provider_completion(
+                generation.id,
+                completion,
+                purpose="prompt_handoff_compaction",
+                record_ids=False,
+                dedupe_scope=(
+                    f"{generation.id}:prompt_handoff_compaction:{request_suffix}"
+                ),
+            )
+            await self.reconcile_pending_costs()
+            return document.blocks[0].text
+        except (ProviderError, ProtocolError) as exc:
+            error = (
+                exc
+                if isinstance(exc, ProviderError)
+                else ProviderError("context_compaction_failed")
+            )
+            await self._record_provider_error(
+                generation.id,
+                error,
+                attempt=1,
+                purpose="prompt_handoff_compaction",
+            )
+            raise error from exc
 
     async def _fail(self, generation_id: str, code: str) -> None:
         async with self.database.sessions() as db:
