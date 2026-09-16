@@ -1,7 +1,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Composer, ResponseBlocks } from "./App";
+import { Composer, EmptyThread, ResponseBlocks } from "./App";
 
 afterEach(cleanup);
 
@@ -46,5 +46,28 @@ describe("composer attachments", () => {
     await user.paste("y".repeat(4000));
     expect(screen.getByRole("alert")).toHaveTextContent("Remove the current attachment");
     expect(screen.getByText("first.txt")).toBeInTheDocument();
+  });
+});
+
+describe("new conversation mode selection", () => {
+  it("shows mode choices inline without the old subheader or writing voices", async () => {
+    const user = userEvent.setup();
+    const onSelect = vi.fn();
+    render(<EmptyThread mode={null} onSelect={onSelect} />);
+
+    expect(screen.getByRole("heading", { name: "Start a conversation" })).toBeInTheDocument();
+    expect(screen.queryByText("Choose Translate or AlithyaGPT to begin.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Writing voices")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /Translate/ }));
+    expect(onSelect).toHaveBeenCalledWith("translate");
+  });
+
+  it("replaces the choices with mode-specific guidance after selection", () => {
+    render(<EmptyThread mode="alithyagpt" onSelect={vi.fn()} />);
+
+    expect(screen.getByRole("heading", { name: "What are you working on?" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Translate/ })).not.toBeInTheDocument();
+    expect(screen.getByText("Draft, revise, translate, or talk through a professional communication.")).toBeInTheDocument();
   });
 });

@@ -256,24 +256,19 @@ export function Composer({
   );
 }
 
-function NewConversation({ ownerName, onClose, onSelect }: { ownerName: string; onClose: () => void; onSelect: (mode: Mode) => void }) {
-  return (
-    <Modal title={`New conversation for ${ownerName}`} onClose={onClose}>
-      <div className="mode-choices">
-        <button onClick={() => onSelect("translate")}><span className="choice-icon"><MessageSquareText /></span><strong>Translate</strong><small>Translation, revision, and terminology advice</small></button>
-        <button onClick={() => onSelect("alithyagpt")}><span className="choice-icon"><Sparkles /></span><strong>AlithyaGPT</strong><small>Professional writing and communications advice</small></button>
-      </div>
-      <div className="voices-preview"><strong>Writing voices</strong><span className="voice active">Comm internes</span>{["Paul", "Bernard", "Giulia", "Dany"].map((voice) => <span className="voice disabled" key={voice}>{voice} · Not configured</span>)}</div>
-    </Modal>
-  );
-}
-
-function EmptyThread({ mode }: { mode: Mode | null }) {
+export function EmptyThread({ mode, onSelect }: { mode: Mode | null; onSelect: (mode: Mode) => void }) {
   return (
     <div className="empty-thread">
       <div className="empty-mark"><BrandLogo compact /></div>
       <h1>{mode === "translate" ? "What would you like to translate?" : mode === "alithyagpt" ? "What are you working on?" : "Start a conversation"}</h1>
-      <p>{mode === "translate" ? "Share your direction, audience, and requirements with the source text." : mode === "alithyagpt" ? "Draft, revise, translate, or talk through a professional communication." : "Choose Translate or AlithyaGPT to begin."}</p>
+      {mode === null ? (
+        <div className="mode-choices" aria-label="Conversation type">
+          <button type="button" onClick={() => onSelect("translate")}><span className="choice-icon"><MessageSquareText /></span><strong>Translate</strong><small>Translation, revision, and terminology advice</small></button>
+          <button type="button" onClick={() => onSelect("alithyagpt")}><span className="choice-icon"><Sparkles /></span><strong>AlithyaGPT</strong><small>Professional writing and communications advice</small></button>
+        </div>
+      ) : (
+        <p>{mode === "translate" ? "Share your direction, audience, and requirements with the source text." : "Draft, revise, translate, or talk through a professional communication."}</p>
+      )}
     </div>
   );
 }
@@ -287,7 +282,6 @@ export default function App() {
   const [draftMode, setDraftMode] = useState<Mode | null>(null);
   const [generation, setGeneration] = useState<GenerationSnapshot | null>(null);
   const [usage, setUsage] = useState("$0.00");
-  const [newOpen, setNewOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [handoff, setHandoff] = useState<ContentBlock[] | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -450,6 +444,12 @@ export default function App() {
     await api.logout();
     setUser(null);
   }
+  function startNewConversation() {
+    setDetail(undefined);
+    setGeneration(null);
+    setDraftMode(null);
+    setSidebarOpen(false);
+  }
 
   if (user === undefined) return <div className="app-loading"><BrandLogo /></div>;
   if (!user) return <Login onLogin={() => void bootstrap()} />;
@@ -460,7 +460,7 @@ export default function App() {
       <button className="mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar"><Menu /></button>
       <aside className={sidebarOpen ? "sidebar open" : "sidebar"}>
         <div className="sidebar-head"><BrandLogo compact /><button className="mobile-close icon-button" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar"><X /></button></div>
-        <button className="new-button" onClick={() => setNewOpen(true)}><Plus /> New</button>
+        <button className="new-button" onClick={startNewConversation}><Plus /> New</button>
         {user.role === "owner" && (
           <label className="account-picker"><span>Viewing</span><select value={owner?.id} onChange={(e) => setOwner(accounts.find((account) => account.id === e.target.value))}>{accounts.map((account) => <option value={account.id} key={account.id}>{account.display_name}</option>)}</select></label>
         )}
@@ -487,11 +487,10 @@ export default function App() {
           </header>
         )}
         <section className="conversation-area">
-          {detail ? <MessageList detail={detail} generation={active} /> : <EmptyThread mode={draftMode} />}
+          {detail ? <MessageList detail={detail} generation={active} /> : <EmptyThread mode={draftMode} onSelect={setDraftMode} />}
         </section>
         {(detail || draftMode) && <Composer activeGeneration={active} onSend={send} onStop={() => active ? api.stop(active.id) : Promise.resolve()} onRetry={retry} />}
       </main>
-      {newOpen && owner && <NewConversation ownerName={owner.display_name} onClose={() => setNewOpen(false)} onSelect={(mode) => { setNewOpen(false); setDetail(undefined); setGeneration(null); setDraftMode(mode); }} />}
       {deleteOpen && detail && <Modal title="Delete conversation?" onClose={() => setDeleteOpen(false)}><p className="modal-copy">This permanently deletes the conversation and its attachments. This cannot be undone.</p><div className="modal-actions"><button onClick={() => setDeleteOpen(false)}>Cancel</button><button className="danger-button" onClick={removeThread}>Delete permanently</button></div></Modal>}
       {handoff !== null && <Modal title="Prompt handoff" onClose={() => setHandoff(null)}><div className="handoff-body">{handoff.length ? <ResponseBlocks blocks={handoff.map((block) => ({ ...block, type: "deliverable" }))} /> : <div className="handoff-loading">Creating maintenance brief…</div>}</div></Modal>}
       {globalError && <div className="toast" role="alert">{globalError}<button onClick={() => setGlobalError("")} aria-label="Dismiss"><X /></button></div>}
