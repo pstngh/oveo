@@ -150,7 +150,7 @@ describe("new conversation mode selection", () => {
     expect(screen.queryByRole("img", { name: "Oveo" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Translate/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Revision/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Internal communications/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Communications/ })).toBeInTheDocument();
     expect(screen.queryByText(/Translate faithfully/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Proofread, copyedit/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Draft a new employee-facing/)).not.toBeInTheDocument();

@@ -127,15 +127,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .empty-thread { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 32px 24px 14vh; text-align: center; }
 .empty-thread h1 { margin: 0 0 9px; font-size: clamp(1.5rem, 3vw, 2.05rem); font-weight: 550; letter-spacing: -.035em; }
 .empty-thread p { max-width: 520px; margin: 0; color: var(--muted); line-height: 1.55; }
-.empty-thread .mode-choices { width: min(840px, 100%); margin-top: 20px; text-align: left; }
-.empty-thread .mode-choices > button { min-height: 132px; display: grid; grid-template-rows: 46px auto; align-content: center; justify-items: center; gap: 10px; text-align: center; }
+.empty-thread .mode-choices { width: min(500px, 100%); margin-top: 20px; text-align: left; }
+.empty-thread .mode-choices > button { min-height: 0; display: grid; grid-template-rows: 46px auto; align-content: center; justify-items: center; gap: 10px; text-align: center; }
 
 .modal-backdrop { position: fixed; z-index: 50; inset: 0; display: grid; place-items: center; padding: 18px; background: rgba(8,9,10,.7); backdrop-filter: blur(6px); }
 .modal { width: min(520px, 100%); max-height: calc(100vh - 36px); overflow: auto; padding: 18px; border: 1px solid #44454a; border-radius: 14px; background: #242529; box-shadow: 0 30px 90px rgba(0,0,0,.48); }
 .modal > header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px; }
 .modal h2 { margin: 0; font-size: 1.05rem; }
 .mode-choices { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-.mode-choices > button { min-height: 132px; display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding: 16px; border: 1px solid #3f4045; border-radius: 11px; background: #292a2e; text-align: left; cursor: pointer; }
+.mode-choices > button { width: 100%; min-height: 0; aspect-ratio: 1; display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding: 16px; border: 1px solid #3f4045; border-radius: 11px; background: #292a2e; text-align: left; cursor: pointer; }
 .mode-choices > button:hover { border-color: #866b4c; background: #2d2d30; }
 .mode-choices strong { font-size: 1rem; line-height: 1.4; }
 .choice-icon { width: 46px; height: 46px; display: grid; place-items: center; border-radius: 11px; color: #e5b577; background: #3b3126; }
@@ -167,7 +167,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .messages { padding-top: 62px; }
   .message-inner, .message.user .message-inner { width: calc(100% - 28px); margin: 0 auto; }
   .composer-wrap { width: calc(100% - 20px); padding-bottom: 8px; }
-  .mode-choices { grid-template-columns: 1fr; }
+  .mode-choices { grid-template-columns: 132px; justify-content: center; }
 }
 
 @media (prefers-reduced-motion: reduce) {

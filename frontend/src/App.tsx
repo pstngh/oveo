@@ -45,7 +45,7 @@ const MODE_COPY: Record<Mode, { label: string; heading: string; guidance: string
     guidance: "Share the existing text and, when it matters, the depth you want: proofread, copyedit, revise, or rewrite.",
   },
   internal_comms: {
-    label: "Internal communications",
+    label: "Communications",
     heading: "What internal communication do you need?",
     guidance: "Share the brief, known facts, audience, desired locale, and any practical constraints. Oveo will not invent missing details.",
   },
@@ -494,7 +494,7 @@ export default function App() {
     void Promise.resolve(context.registerTool({
       name: "start_oveo_conversation",
       title: "Start an Oveo conversation",
-      description: "Open a new unsaved Translate, Revision, or Internal communications conversation in the visible Oveo interface.",
+      description: "Open a new unsaved Translate, Revision, or Communications conversation in the visible Oveo interface.",
       inputSchema: {
         type: "object",
         properties: {
