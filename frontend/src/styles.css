@@ -127,7 +127,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .empty-thread h1 { margin: 0 0 9px; font-size: clamp(1.5rem, 3vw, 2.05rem); font-weight: 550; letter-spacing: -.035em; }
 .empty-thread p { max-width: 520px; margin: 0; color: var(--muted); line-height: 1.55; }
 .empty-thread .mode-choices { width: min(840px, 100%); margin-top: 20px; text-align: left; }
-.empty-thread .mode-choices > button { min-height: 140px; align-items: center; justify-content: center; text-align: center; }
+.empty-thread .mode-choices > button { min-height: 168px; display: grid; grid-template-rows: 35px auto auto; align-content: center; justify-items: center; gap: 8px; text-align: center; }
 
 .modal-backdrop { position: fixed; z-index: 50; inset: 0; display: grid; place-items: center; padding: 18px; background: rgba(8,9,10,.7); backdrop-filter: blur(6px); }
 .modal { width: min(520px, 100%); max-height: calc(100vh - 36px); overflow: auto; padding: 18px; border: 1px solid #44454a; border-radius: 14px; background: #242529; box-shadow: 0 30px 90px rgba(0,0,0,.48); }
@@ -136,9 +136,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .mode-choices { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .mode-choices > button { min-height: 150px; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; padding: 16px; border: 1px solid #3f4045; border-radius: 11px; background: #292a2e; text-align: left; cursor: pointer; }
 .mode-choices > button:hover { border-color: #866b4c; background: #2d2d30; }
-.mode-choices strong { font-size: .96rem; }
-.mode-choices small { color: var(--muted); line-height: 1.45; }
-.choice-icon { width: 35px; height: 35px; display: grid; place-items: center; margin-bottom: 7px; border-radius: 9px; color: #e5b577; background: #3b3126; }
+.mode-choices strong { font-size: .96rem; line-height: 1.45; }
+.mode-choices small { min-height: calc(3 * 1.45em); color: var(--muted); line-height: 1.45; }
+.choice-icon { width: 35px; height: 35px; display: grid; place-items: center; border-radius: 9px; color: #e5b577; background: #3b3126; }
 .choice-icon svg { width: 19px; }
 .modal-copy { color: var(--muted); line-height: 1.55; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px; }
