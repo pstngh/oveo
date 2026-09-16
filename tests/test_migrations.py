@@ -23,6 +23,74 @@ def test_alembic_head_matches_sqlalchemy_metadata(tmp_path: Path, monkeypatch: o
     command.check(config)
 
 
+def test_repair_migration_corrects_a_stale_schema_stamped_at_revision_two(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    database_path = tmp_path / "stale-three-sections.sqlite3"
+    config = _config(database_path, monkeypatch)
+    command.upgrade(config, "20260916_0001")
+
+    connection = sqlite3.connect(database_path)
+    try:
+        now = "2026-09-16T12:00:00+00:00"
+        connection.execute(
+            "INSERT INTO users "
+            "(id, username, display_name, role, password_hash, credential_version, "
+            "failed_login_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("user-1", "charles", "Charles", "owner", "synthetic", 1, 0, now),
+        )
+        connection.execute(
+            "INSERT INTO threads "
+            "(id, owner_id, mode, voice_key, title, updated_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-thread",
+                "user-1",
+                "alithyagpt",
+                "comm_internes",
+                "Legacy thread",
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO work_items (id, thread_id, kind, active, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("legacy-work", "legacy-thread", "draft", 1, now),
+        )
+        connection.execute("UPDATE alembic_version SET version_num = '20260916_0002'")
+        connection.commit()
+    finally:
+        connection.close()
+
+    command.upgrade(config, "head")
+
+    connection = sqlite3.connect(database_path)
+    try:
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+            "20260916_0003",
+        )
+        assert connection.execute(
+            "SELECT mode, voice_key FROM threads WHERE id = 'legacy-thread'"
+        ).fetchone() == ("internal_comms", "comm_internes")
+
+        now = "2026-09-16T13:00:00+00:00"
+        connection.execute(
+            "INSERT INTO threads "
+            "(id, owner_id, mode, voice_key, title, updated_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("revision-thread", "user-1", "revision", None, "Revision", now, now),
+        )
+        connection.execute(
+            "INSERT INTO work_items (id, thread_id, kind, active, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("revision-work", "revision-thread", "revision", 1, now),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def test_three_section_upgrade_downgrade_preserves_rows_and_legacy_data(
     tmp_path: Path, monkeypatch: object
 ) -> None:
