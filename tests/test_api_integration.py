@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import re
 import time
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import select
+from starlette.requests import Request
 
 from oveo.auth import change_password, hash_password, verify_password
 from oveo.config import Settings
@@ -163,6 +168,86 @@ def test_login_submit_idempotency_handoff_and_cost(api_client: TestClient) -> No
     detail_after = api_client.get(f"/api/threads/{ids['thread_id']}").json()
     assert len(detail_after["messages"]) == 2
     assert api_client.get("/api/usage/lifetime").json() == {"formatted": "$0.000369"}
+
+
+def test_lifetime_usage_is_a_database_only_read(api_client: TestClient) -> None:
+    _login(api_client, "charles", "charles password")
+    manager = api_client.app.state.generation_manager
+    reconcile = AsyncMock(side_effect=AssertionError("metadata lookup must not run"))
+    manager.reconcile_pending_costs = reconcile
+
+    response = api_client.get("/api/usage/lifetime")
+
+    assert response.status_code == 200
+    assert response.json() == {"formatted": "$0.00"}
+    reconcile.assert_not_awaited()
+
+
+async def test_startup_does_not_wait_for_provider_metadata(tmp_path: Path) -> None:
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'startup.sqlite3'}"
+    database = Database(database_url)
+    await _prepare_database(database)
+    settings = Settings(
+        environment="test",
+        public_origin="http://testserver",
+        trusted_hosts=["testserver"],
+        data_dir=tmp_path,
+        database_url=database_url,
+        attachments_dir=tmp_path / "attachments",
+        frontend_dir=tmp_path / "frontend",
+        secure_cookies=False,
+    )
+    app = create_app(settings=settings, database=database, provider=ImmediateProvider())
+    manager = app.state.generation_manager
+    started = asyncio.Event()
+
+    async def blocked_reconciliation() -> int:
+        started.set()
+        await asyncio.Event().wait()
+        return 0
+
+    manager.reconcile_pending_costs = blocked_reconciliation
+    try:
+        async with asyncio.timeout(2):
+            async with app.router.lifespan_context(app):
+                await asyncio.wait_for(started.wait(), timeout=0.5)
+    finally:
+        await database.dispose()
+
+
+def test_unexpected_http_failure_returns_and_logs_an_opaque_error_id(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'errors.sqlite3'}"
+    database = Database(database_url)
+    asyncio.run(_prepare_database(database))
+    settings = Settings(
+        environment="test",
+        public_origin="http://testserver",
+        trusted_hosts=["testserver"],
+        data_dir=tmp_path,
+        database_url=database_url,
+        attachments_dir=tmp_path / "attachments",
+        frontend_dir=tmp_path / "frontend",
+        secure_cookies=False,
+    )
+    app = create_app(settings=settings, database=database, provider=ImmediateProvider())
+    caplog.set_level(logging.ERROR, logger="oveo.http")
+    handler = app.exception_handlers[Exception]
+    response = asyncio.run(
+        handler(Request({"type": "http"}), RuntimeError("private request marker"))
+    )
+    asyncio.run(database.dispose())
+
+    assert response.status_code == 500
+    error_id = json.loads(response.body)["error_id"]
+    assert re.fullmatch(r"[0-9a-f]{32}", error_id)
+    diagnostics = "\n".join(record.getMessage() for record in caplog.records)
+    assert f"error_id={error_id}" in diagnostics
+    assert "area=http" in diagnostics
+    assert "exception_class=RuntimeError" in diagnostics
+    assert "locations=" in diagnostics
+    assert "private request marker" not in diagnostics
 
 
 def test_three_current_modes_and_legacy_alias_are_normalized(api_client: TestClient) -> None:

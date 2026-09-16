@@ -186,10 +186,19 @@ async def test_generation_metadata_uses_reported_total_cost(tmp_path: Path) -> N
         assert request.url.path.endswith("/generation")
         assert request.url.params.get("id") == "generation-cost"
         assert request.headers["authorization"].startswith("Bearer ")
+        assert request.extensions["timeout"] == {
+            "connect": 1.25,
+            "read": 1.25,
+            "write": 1.25,
+            "pool": 1.25,
+        }
         return httpx.Response(200, json={"data": {"total_cost": "0.000055"}})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
-        provider = OpenRouterClient(settings(tmp_path), client=http_client)
+        provider = OpenRouterClient(
+            settings(tmp_path, provider_metadata_timeout_seconds=1.25),
+            client=http_client,
+        )
         assert await provider.generation_cost("generation-cost") == 55
 
 

@@ -1,10 +1,68 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canonicalPath, Composer, conversationIdFromPath, conversationPath, EmptyThread, Login, MessageList, ResponseBlocks, SidebarHeader } from "./App";
+import { useState } from "react";
+import App, { canonicalPath, Composer, conversationIdFromPath, conversationPath, EmptyThread, Login, MessageList, Modal, ResponseBlocks, SidebarHeader } from "./App";
+import { api } from "./api";
 import type { ThreadDetail } from "./types";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  window.history.replaceState(null, "", "/");
+});
+
+describe("authenticated bootstrap", () => {
+  it("loads conversations even when the independent usage request fails", async () => {
+    window.history.replaceState(null, "", "/new");
+    vi.spyOn(api, "me").mockResolvedValue({
+      id: "user-1",
+      username: "charles",
+      display_name: "Charles",
+      role: "owner",
+      csrf_token: "csrf",
+    });
+    vi.spyOn(api, "accounts").mockResolvedValue([{
+      id: "user-1",
+      username: "charles",
+      display_name: "Charles",
+      role: "owner",
+    }]);
+    vi.spyOn(api, "threads").mockResolvedValue([]);
+    vi.spyOn(api, "usage").mockRejectedValue(new Error("metadata unavailable"));
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Start a conversation" })).toBeInTheDocument();
+    expect(screen.queryByRole("form", { name: "Sign in to Oveo" })).not.toBeInTheDocument();
+  });
+});
+
+describe("modal keyboard behavior", () => {
+  function Harness() {
+    const [open, setOpen] = useState(false);
+    return <><button onClick={() => setOpen(true)}>Open dialog</button>{open && <Modal title="Test dialog" onClose={() => setOpen(false)}><button>Last action</button></Modal>}</>;
+  }
+
+  it("traps focus, closes on Escape, and returns focus to its trigger", async () => {
+    const user = userEvent.setup();
+    render(<Harness />);
+    const trigger = screen.getByRole("button", { name: "Open dialog" });
+    await user.click(trigger);
+    const close = screen.getByRole("button", { name: "Close dialog" });
+    const action = screen.getByRole("button", { name: "Last action" });
+    expect(close).toHaveFocus();
+
+    await user.keyboard("{Shift>}{Tab}{/Shift}");
+    expect(action).toHaveFocus();
+    await user.tab();
+    expect(close).toHaveFocus();
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+});
 
 describe("sign-in page", () => {
   it("uses a centered brand lockup without redundant welcome copy", () => {
@@ -168,6 +226,27 @@ describe("conversation scrolling", () => {
     render(<MessageList detail={detail} generation={null} />);
     expect(screen.queryByText(/^You$/)).not.toBeInTheDocument();
     expect(screen.queryByText(/^Oveo$/)).not.toBeInTheDocument();
+  });
+
+  it("shows authorship only for a user acting across accounts", () => {
+    const detail = {
+      id: "thread-1",
+      owner_id: "user-2",
+      owner_username: "yousra",
+      mode: "revision",
+      voice_key: null,
+      title: "Cross-account revision",
+      updated_at: "2026-09-16T00:00:00Z",
+      active_generation_id: null,
+      messages: [
+        { id: "message-1", role: "user", actor_username: "charles", blocks: [{ type: "conversation", text: "Revise this" }], attachment: null, created_at: "2026-09-16T00:00:00Z" },
+        { id: "message-2", role: "user", actor_username: null, blocks: [{ type: "conversation", text: "Owner follow-up" }], attachment: null, created_at: "2026-09-16T00:00:01Z" },
+      ],
+    } satisfies ThreadDetail;
+
+    render(<MessageList detail={detail} generation={null} />);
+    expect(screen.getByText("charles")).toBeInTheDocument();
+    expect(screen.queryByText("yousra")).not.toBeInTheDocument();
   });
 });
 

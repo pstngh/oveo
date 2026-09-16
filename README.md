@@ -20,10 +20,10 @@ Requirements: Python 3.13 (3.12+ supported), Node.js 22+, `uv`, and SQLite.
 ```bash
 cp .env.example .env
 # Set development password hashes and, for real model calls, OVEO_OPENROUTER_API_KEY.
-uv sync --extra dev
-uv run alembic upgrade head
+uv sync --frozen --extra dev
+uv run --frozen alembic upgrade head
 cd frontend && npm ci && npm run build && cd ..
-uv run uvicorn oveo.main:app --reload
+uv run --frozen uvicorn oveo.main:app --reload
 ```
 
 Open `http://127.0.0.1:8000`. The backend serves the compiled frontend. For
@@ -34,7 +34,7 @@ Generate Argon2id password hashes without putting a plaintext password in shell
 history:
 
 ```bash
-uv run oveo-admin hash-password
+uv run --frozen oveo-admin hash-password
 ```
 
 ## Prompt maintenance
@@ -75,10 +75,10 @@ cannot be recovered by a later re-upgrade.
 ## Quality gate
 
 ```bash
-uv run ruff format --check .
-uv run ruff check .
-uv run mypy
-uv run pytest
+uv run --frozen ruff format --check .
+uv run --frozen ruff check .
+uv run --frozen mypy
+uv run --frozen pytest
 cd frontend
 npm ci
 npm run typecheck
@@ -108,6 +108,9 @@ runs in WAL mode with foreign keys and a bounded busy timeout. Background calls
 have durable generation rows and replayable snapshots, so navigation and browser
 disconnects do not cancel them. See [ARCHITECTURE.md](ARCHITECTURE.md) and
 [OPERATIONS.md](OPERATIONS.md).
+
+The production application origin is `https://oveo.duckdns.org`. The direct VPS
+IP is retained only as a secondary operations check, not as the user-facing URL.
 
 Never commit `.env`, credentials, live databases, attachments, backup identities,
 or decrypted backups.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -17,6 +18,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from oveo.api import ApiError, router
 from oveo.config import Settings, get_settings
 from oveo.db import Database
+from oveo.diagnostics import log_unexpected
 from oveo.generation import (
     GenerationManager,
     GenerationProvider,
@@ -25,6 +27,8 @@ from oveo.generation import (
 )
 from oveo.models import User
 from oveo.provider import warm_tokenizer
+
+_LOGGER = logging.getLogger("oveo.http")
 
 
 def _validated_argon2id_hash(encoded: str, *, username: str) -> str:
@@ -127,8 +131,8 @@ def create_app(
         await asyncio.to_thread(warm_tokenizer)
         await seed_configured_accounts(app_database, app_settings)
         await manager.reconcile_orphans()
-        await manager.reconcile_pending_costs()
         await manager.sweep_orphan_attachments()
+        manager.reconcile_later()
         try:
             yield
         finally:
@@ -186,12 +190,15 @@ def create_app(
         )
 
     @app.exception_handler(Exception)
-    async def internal_error_handler(_request: Request, _exc: Exception) -> JSONResponse:
-        # Do not stringify arbitrary exceptions: provider/SQL errors can retain private
-        # payload or parameter data. Operational correlation belongs in opaque IDs.
+    async def internal_error_handler(_request: Request, exc: Exception) -> JSONResponse:
+        error_id = log_unexpected(_LOGGER, exc, area="http")
         return JSONResponse(
             status_code=500,
-            content={"code": "internal_error", "message": "The request could not be completed."},
+            content={
+                "code": "internal_error",
+                "message": "The request could not be completed.",
+                "error_id": error_id,
+            },
         )
 
     app.include_router(router)

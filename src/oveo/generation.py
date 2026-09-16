@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from typing import Any, Literal, Protocol, cast
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from oveo.attachments import ValidatedAttachment, count_words, persist_attachment
 from oveo.config import Settings
@@ -21,6 +23,7 @@ from oveo.context import (
     build_provider_messages,
 )
 from oveo.db import Database
+from oveo.diagnostics import log_unexpected
 from oveo.models import (
     Attachment,
     Generation,
@@ -76,14 +79,12 @@ class ProviderError(RuntimeError):
         self,
         code: str,
         *,
-        transient: bool = False,
         provider_request_id: str | None = None,
         provider_generation_id: str | None = None,
         cost_microusd: int | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
-        self.transient = transient
         self.provider_request_id = provider_request_id
         self.provider_generation_id = provider_generation_id
         self.cost_microusd = cost_microusd
@@ -192,7 +193,6 @@ class OpenRouterProvider:
             # OpenRouterClient has already exhausted safe pre-content retries.
             raise ProviderError(
                 exc.code,
-                transient=False,
                 provider_request_id=exc.provider_request_id,
                 provider_generation_id=exc.provider_generation_id,
                 cost_microusd=(exc.usage.cost_microusd if exc.usage else None),
@@ -214,6 +214,9 @@ _TERMINAL = frozenset({"completed", "failed", "stopped"})
 _ACTIVE = frozenset({"queued", "running", "stopping"})
 _COMPLETION_TOKEN_LIMITS = {"title": 64, "summary": 2_048, "prompt_handoff": 4_096}
 _MIN_RECENT_MESSAGES = 4
+_RECONCILE_BATCH_SIZE = 8
+_CANCEL_WAIT_SECONDS = 1.0
+_LOGGER = logging.getLogger("oveo.background")
 _ERROR_MESSAGES = {
     "provider_not_configured": "The model provider is not configured.",
     "provider_network": "The model provider could not be reached.",
@@ -266,6 +269,9 @@ class GenerationManager:
         self._cancel: dict[str, asyncio.Event] = {}
         self._conditions: dict[str, asyncio.Condition] = {}
         self._reconcile_lock = asyncio.Lock()
+        self._reconcile_task: asyncio.Task[None] | None = None
+        self._reconcile_requested = False
+        self._shutting_down = False
 
     async def reconcile_orphans(self) -> int:
         async with self.database.sessions() as db:
@@ -290,21 +296,34 @@ class GenerationManager:
         if reconcile is None:
             return 0
         async with self._reconcile_lock:
+            charge = aliased(UsageEvent)
+            reconciled_charge_exists = (
+                select(charge.id)
+                .where(
+                    charge.event_type == "charge",
+                    charge.dedupe_key
+                    == (
+                        UsageEvent.provider_generation_id
+                        + ":"
+                        + UsageEvent.purpose
+                        + ":reconciled-charge"
+                    ),
+                )
+                .correlate(UsageEvent)
+                .exists()
+            )
             async with self.database.sessions() as db:
                 pending = list(
                     (
                         await db.execute(
-                            select(UsageEvent).where(
+                            select(UsageEvent)
+                            .where(
                                 UsageEvent.event_type == "pending",
                                 UsageEvent.provider_generation_id.is_not(None),
+                                ~reconciled_charge_exists,
                             )
-                        )
-                    ).scalars()
-                )
-                existing_keys = set(
-                    (
-                        await db.execute(
-                            select(UsageEvent.dedupe_key).where(UsageEvent.event_type == "charge")
+                            .order_by(UsageEvent.created_at.desc(), UsageEvent.id.desc())
+                            .limit(_RECONCILE_BATCH_SIZE)
                         )
                     ).scalars()
                 )
@@ -315,11 +334,12 @@ class GenerationManager:
                 if provider_generation_id is None:
                     continue
                 dedupe_key = f"{provider_generation_id}:{event.purpose}:reconciled-charge"
-                if dedupe_key in existing_keys:
-                    continue
                 try:
-                    cost_microusd = await reconcile(provider_generation_id)
-                except Exception:  # noqa: S112 -- provider metadata failures are non-fatal
+                    cost_microusd = await asyncio.wait_for(
+                        reconcile(provider_generation_id),
+                        timeout=self.settings.provider_metadata_timeout_seconds,
+                    )
+                except Exception:  # noqa: S112 -- best-effort metadata
                     # Reconciliation is best effort and must never make startup/readiness
                     # depend on a metadata endpoint. No provider body is retained or logged.
                     continue
@@ -341,8 +361,34 @@ class GenerationManager:
                     await db.commit()
                 if added is not None:
                     reconciled += 1
-                    existing_keys.add(dedupe_key)
             return reconciled
+
+    def reconcile_later(self) -> None:
+        """Coalesce a best-effort reconciliation pass outside request/readiness paths."""
+
+        if self._shutting_down:
+            return
+        if self._reconcile_task is not None and not self._reconcile_task.done():
+            self._reconcile_requested = True
+            return
+        self._reconcile_requested = False
+        task = asyncio.create_task(self._reconcile_safely())
+        self._reconcile_task = task
+
+        def finished(_task: asyncio.Task[None]) -> None:
+            self._reconcile_task = None
+            if self._reconcile_requested and not self._shutting_down:
+                self.reconcile_later()
+
+        task.add_done_callback(finished)
+
+    async def _reconcile_safely(self) -> None:
+        try:
+            await self.reconcile_pending_costs()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log_unexpected(_LOGGER, error, area="cost_reconciliation")
 
     async def sweep_orphan_attachments(self) -> int:
         """Remove only generated attachment files that have no live database row."""
@@ -368,11 +414,16 @@ class GenerationManager:
         return removed
 
     async def shutdown(self) -> None:
+        self._shutting_down = True
         tasks = tuple(self._tasks.values())
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        reconcile_task = self._reconcile_task
+        if reconcile_task is not None and not reconcile_task.done():
+            reconcile_task.cancel()
+            await asyncio.gather(reconcile_task, return_exceptions=True)
         close = getattr(self.provider, "aclose", None)
         if close is not None:
             await close()
@@ -385,9 +436,12 @@ class GenerationManager:
         task = asyncio.create_task(self._run(generation_id, cancel_event))
         self._tasks[generation_id] = task
 
-        def finished(_task: asyncio.Task[None]) -> None:
+        def finished(done_task: asyncio.Task[None]) -> None:
             self._tasks.pop(generation_id, None)
             self._cancel.pop(generation_id, None)
+            self._conditions.pop(generation_id, None)
+            if not done_task.cancelled() and (error := done_task.exception()) is not None:
+                log_unexpected(_LOGGER, error, area="generation_task")
 
         task.add_done_callback(finished)
 
@@ -780,8 +834,14 @@ class GenerationManager:
                     )
                 ).scalars()
             )
+        tasks: list[asyncio.Task[None]] = []
         for generation_id in ids:
+            task = self._tasks.get(generation_id)
             await self.stop(generation_id)
+            if task is not None:
+                tasks.append(task)
+        if tasks:
+            await asyncio.wait(tasks, timeout=_CANCEL_WAIT_SECONDS)
 
     async def get_snapshot(self, generation_id: str) -> dict[str, Any] | None:
         async with self.database.sessions() as db:
@@ -847,15 +907,6 @@ class GenerationManager:
             )
             await db.commit()
             return generation
-
-    async def _reset_partial(self, generation_id: str) -> None:
-        async with self.database.sessions() as db:
-            generation = await db.get(Generation, generation_id)
-            if generation is not None and generation.status == "running":
-                generation.partial_blocks = []
-                generation.stream_revision += 1
-                await db.commit()
-        await self._notify(generation_id)
 
     async def _record_events(self, generation_id: str, events: Sequence[ProtocolEvent]) -> None:
         if not events:
@@ -1101,7 +1152,6 @@ class GenerationManager:
         generation_id: str,
         error: ProviderError,
         *,
-        attempt: int,
         purpose: str,
     ) -> None:
         async with self.database.sessions() as db:
@@ -1115,7 +1165,7 @@ class GenerationManager:
                 error.provider_generation_id or generation.provider_generation_id
             )
             if error.cost_microusd is not None:
-                provider_key = error.provider_request_id or f"{generation.id}:{attempt}"
+                provider_key = error.provider_request_id or generation.id
                 await append_usage_event(
                     db,
                     dedupe_key=f"{provider_key}:{purpose}:failed-charge",
@@ -1199,7 +1249,6 @@ class GenerationManager:
                 purpose="title",
                 record_ids=False,
             )
-            await self.reconcile_pending_costs()
             title = b"".join(parts).decode("utf-8").strip()
             if not title or len(title) > 60 or "\n" in title or not 2 <= len(title.split()) <= 6:
                 return
@@ -1213,7 +1262,7 @@ class GenerationManager:
                     thread.updated_at = utc_now()
                 await db.commit()
         except ProviderError as exc:
-            await self._record_provider_error(generation_id, exc, attempt=1, purpose="title")
+            await self._record_provider_error(generation_id, exc, purpose="title")
         except (UnicodeDecodeError, ValueError):
             return
 
@@ -1362,7 +1411,6 @@ class GenerationManager:
                 purpose="summary",
                 record_ids=False,
             )
-            await self.reconcile_pending_costs()
             raw = b"".join(parts).decode("utf-8")
             payload = json.loads(raw)
             if not isinstance(payload, dict) or set(payload) != {
@@ -1397,7 +1445,6 @@ class GenerationManager:
             await self._record_provider_error(
                 generation.id,
                 error,
-                attempt=1,
                 purpose="summary",
             )
             raise error from exc
@@ -1573,7 +1620,6 @@ class GenerationManager:
                 record_ids=False,
                 dedupe_scope=(f"{generation.id}:prompt_handoff_compaction:{request_suffix}"),
             )
-            await self.reconcile_pending_costs()
             return document.blocks[0].text
         except (ProviderError, ProtocolError) as exc:
             error = (
@@ -1584,7 +1630,6 @@ class GenerationManager:
             await self._record_provider_error(
                 generation.id,
                 error,
-                attempt=1,
                 purpose="prompt_handoff_compaction",
             )
             raise error from exc
@@ -1614,50 +1659,39 @@ class GenerationManager:
                 mode=str(request_snapshot.get("mode", "translate")),
                 snapshot=request_snapshot,
             )
-            last_error = "provider_error"
-            for attempt in range(self.settings.provider_retry_attempts):
-                if attempt:
-                    await self._reset_partial(generation_id)
-                decoder = ProtocolDecoder()
+            decoder = ProtocolDecoder()
 
-                async def emit(chunk: bytes, active_decoder: ProtocolDecoder = decoder) -> None:
-                    if cancel_event.is_set():
-                        raise asyncio.CancelledError
-                    await self._record_events(generation_id, active_decoder.feed(chunk))
+            async def emit(chunk: bytes) -> None:
+                if cancel_event.is_set():
+                    raise asyncio.CancelledError
+                await self._record_events(generation_id, decoder.feed(chunk))
 
-                try:
-                    completion = await self.provider.generate(request, emit, cancel_event)
-                    await self._record_provider_completion(
-                        generation_id,
-                        completion,
-                        purpose=generation.purpose,
-                    )
-                    document = decoder.finish()
-                    await self._commit_success(generation_id, document, completion)
-                    await self.reconcile_pending_costs()
-                    if generation.purpose == "chat" and generation.thread_id is not None:
-                        await self._maybe_generate_title(generation.id, generation.thread_id)
-                    return
-                except ProviderError as exc:
-                    last_error = exc.code
-                    await self._record_provider_error(
-                        generation_id,
-                        exc,
-                        attempt=attempt + 1,
-                        purpose=generation.purpose,
-                    )
-                    if not exc.transient or attempt + 1 >= self.settings.provider_retry_attempts:
-                        break
-                    try:
-                        await asyncio.wait_for(cancel_event.wait(), timeout=0.25 * (2**attempt))
-                        raise asyncio.CancelledError
-                    except TimeoutError:
-                        continue
-                except ProtocolError:
-                    last_error = "protocol_error"
-                    break
-            await self._fail(generation_id, last_error)
+            try:
+                completion = await self.provider.generate(request, emit, cancel_event)
+                await self._record_provider_completion(
+                    generation_id,
+                    completion,
+                    purpose=generation.purpose,
+                )
+                document = decoder.finish()
+                await self._commit_success(generation_id, document, completion)
+                if generation.purpose == "chat" and generation.thread_id is not None:
+                    await self._maybe_generate_title(generation.id, generation.thread_id)
+            except ProviderError as error:
+                await self._record_provider_error(
+                    generation_id,
+                    error,
+                    purpose=generation.purpose,
+                )
+                await self._fail(generation_id, error.code)
+            except ProtocolError:
+                await self._fail(generation_id, "protocol_error")
         except asyncio.CancelledError:
             await asyncio.shield(self._finish_stopped(generation_id))
-        except Exception:
+        except ProviderError as error:
+            await self._fail(generation_id, error.code)
+        except Exception as error:
+            log_unexpected(_LOGGER, error, area="generation")
             await self._fail(generation_id, "provider_error")
+        finally:
+            self.reconcile_later()

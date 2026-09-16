@@ -8,7 +8,7 @@ deploy_env=/etc/oveo/deploy.env
 runtime_env=/etc/oveo/runtime.env
 staging_validator=/usr/local/lib/oveo/validate_staging.py
 data_dir=/var/lib/oveo
-public_ready=https://87.106.103.162/health/ready
+public_ready=https://oveo.duckdns.org/health/ready
 
 die() {
   echo "oveo-deploy: $*" >&2

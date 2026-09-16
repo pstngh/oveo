@@ -16,6 +16,13 @@ def _config(database_path: Path, monkeypatch: object) -> Config:
     return Config("alembic.ini")
 
 
+def test_alembic_head_matches_sqlalchemy_metadata(tmp_path: Path, monkeypatch: object) -> None:
+    config = _config(tmp_path / "schema-drift.sqlite3", monkeypatch)
+    command.upgrade(config, "head")
+
+    command.check(config)
+
+
 def test_three_section_upgrade_downgrade_preserves_rows_and_legacy_data(
     tmp_path: Path, monkeypatch: object
 ) -> None:

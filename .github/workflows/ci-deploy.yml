@@ -21,12 +21,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-          cache: pip
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e '.[dev]'
-      - run: ruff check .
-      - run: mypy src
-      - run: pytest
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.12.13"
+          enable-cache: true
+      - run: uv sync --frozen --extra dev
+      - run: uv run --frozen ruff format --check .
+      - run: uv run --frozen ruff check .
+      - run: uv run --frozen mypy src
+      - run: uv run --frozen pytest
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -233,6 +236,4 @@ jobs:
             "$VPS_USER@$VPS_HOST" \
             "read -r token; set -eu; stage=/var/tmp/oveo-host-${GITHUB_SHA}; archive=\$stage.tar.gz; checksum=\$archive.sha256; docker_config=; cleanup() { if [ -n \"\$docker_config\" ]; then DOCKER_CONFIG=\$docker_config docker logout ghcr.io >/dev/null 2>&1 || true; fi; rm -f -- \"\$archive\" \"\$checksum\"; rm -rf -- \"\$stage\"; }; trap cleanup EXIT HUP INT TERM; cd /var/tmp; sha256sum --check \"\$checksum\"; rm -rf -- \"\$stage\"; mkdir \"\$stage\"; tar --extract --gzip --file \"\$archive\" --directory \"\$stage\"; \"\$stage/deploy/install-host.sh\"; docker_config=\$stage/docker-config; install -d -m 0700 \"\$docker_config\"; export DOCKER_CONFIG=\$docker_config; if ! printf '%s' \"\$token\" | docker login ghcr.io --username '$GHCR_USER' --password-stdin >/dev/null; then unset token; exit 1; fi; unset token; if docker inspect translation-agent-staging-app-1 >/dev/null 2>&1; then /usr/local/sbin/oveo-remove-v1 '$IMAGE' --confirm REMOVE_V1; fi; set +e; /usr/local/sbin/oveo-deploy '$IMAGE'; status=\$?; exit \$status"
       - name: Verify public production readiness
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-        run: curl --fail --silent --show-error --max-time 20 "https://$VPS_HOST/health/ready"
+        run: curl --fail --silent --show-error --max-time 20 "https://oveo.duckdns.org/health/ready"

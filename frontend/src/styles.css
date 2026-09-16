@@ -83,6 +83,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .message.user .message-inner { width: min(720px, calc(100% - 48px)); margin-right: max(24px, calc((100% - 820px) / 2)); }
 .message.user .message-inner > * { width: max-content; max-width: 100%; margin-left: auto; }
 .user-text { margin-top: 0; margin-bottom: 4px; padding: 8px 12px; border: 1px solid #393a3e; border-radius: 14px 14px 4px 14px; background: #292a2e; white-space: pre-wrap; line-height: 1.48; }
+.message-author { margin: 0 12px 4px; color: var(--muted); font-size: .75rem; }
 .user-text:last-of-type { margin-bottom: 0; }
 .sent-attachment { display: flex; align-items: center; gap: 8px; margin-top: 6px; padding: 8px 10px; border: 1px solid #3e3f44; border-radius: 9px; color: #d5d4d0; background: #25262a; font-size: .83rem; }
 .sent-attachment svg { width: 17px; color: var(--accent); }

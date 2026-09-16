@@ -289,6 +289,7 @@ class OpenRouterClient:
                 url,
                 params={"id": provider_generation_id},
                 headers=headers,
+                timeout=self._settings.provider_metadata_timeout_seconds,
             )
         except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
             raise ProviderError("provider_network", retryable=True) from exc

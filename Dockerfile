@@ -7,19 +7,20 @@ RUN --mount=type=cache,target=/root/.npm npm ci
 COPY frontend/ ./
 RUN npm run build
 
+FROM ghcr.io/astral-sh/uv:0.12.13@sha256:b485bd65cc2cf1c9a93b3554012c9c3778cf7b1b5fd3d3096ce9e1226c97e1e6 AS uv
+
 FROM python:3.13-slim-bookworm AS python-build
-ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+ENV UV_PROJECT_ENVIRONMENT=/opt/oveo-venv \
+    UV_LINK_MODE=copy
 WORKDIR /build
-COPY pyproject.toml ./
+COPY --from=uv /uv /usr/local/bin/uv
+COPY pyproject.toml uv.lock README.md ./
 COPY src/ ./src/
-# The wheel metadata names README.md, but runtime images do not need documentation.
-RUN printf '# Oveo\n' > README.md \
-    && python -m pip install --prefix=/install .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-editable
 RUN mkdir -p /build/tiktoken-cache \
     && TIKTOKEN_CACHE_DIR=/build/tiktoken-cache \
-       PYTHONPATH=/install/lib/python3.13/site-packages \
-       python -c 'import tiktoken; tiktoken.get_encoding("o200k_base")'
+       /opt/oveo-venv/bin/python -c 'import tiktoken; tiktoken.get_encoding("o200k_base")'
 
 FROM python:3.13-slim-bookworm AS runtime
 ARG VCS_REF=unknown
@@ -29,6 +30,8 @@ LABEL org.opencontainers.image.title="Oveo" \
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    VIRTUAL_ENV=/opt/oveo-venv \
+    PATH="/opt/oveo-venv/bin:$PATH" \
     OVEO_ENVIRONMENT=production \
     OVEO_DATA_DIR=/data \
     OVEO_DATABASE_URL=sqlite+aiosqlite:////data/oveo.sqlite3 \
@@ -42,7 +45,7 @@ RUN groupadd --gid 10001 oveo \
     && mkdir -p /app /data \
     && chown 10001:10001 /app /data
 
-COPY --from=python-build /install/ /usr/local/
+COPY --from=python-build /opt/oveo-venv/ /opt/oveo-venv/
 COPY --from=python-build --chown=10001:10001 /build/tiktoken-cache/ /app/tiktoken-cache/
 COPY --from=frontend-build --chown=10001:10001 /build/frontend/dist/ /app/frontend/
 COPY --chown=10001:10001 alembic.ini /app/alembic.ini

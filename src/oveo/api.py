@@ -541,8 +541,7 @@ async def prompt_handoff(
 
 @router.get("/api/usage/lifetime")
 async def usage_lifetime(request: Request, principal: Principal, db: Db) -> dict[str, str]:
-    del principal
-    await _manager(request).reconcile_pending_costs()
+    del request, principal
     return {"formatted": format_lifetime_cost(await lifetime_total(db))}
 
 

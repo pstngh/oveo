@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 from collections.abc import AsyncGenerator, AsyncIterator
 from pathlib import Path
 from typing import cast
@@ -65,6 +67,50 @@ class BlockingProvider:
         raise asyncio.CancelledError
 
 
+class DelayedCancellationProvider:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cleanup_done = asyncio.Event()
+
+    async def generate(
+        self, request: ProviderRequest, emit: object, cancel_event: asyncio.Event
+    ) -> ProviderCompletion:
+        del request, emit, cancel_event
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.03)
+            self.cleanup_done.set()
+            raise
+
+
+class UnexpectedFailureProvider:
+    async def generate(
+        self, request: ProviderRequest, emit: object, cancel_event: asyncio.Event
+    ) -> ProviderCompletion:
+        del request, emit, cancel_event
+        raise RuntimeError("private prompt marker")
+
+
+class MetadataProvider:
+    def __init__(self, *, delay: float = 0) -> None:
+        self.calls: list[str] = []
+        self.delay = delay
+
+    async def generate(
+        self, request: ProviderRequest, emit: object, cancel_event: asyncio.Event
+    ) -> ProviderCompletion:
+        del request, emit, cancel_event
+        raise AssertionError("generation is not used by this test")
+
+    async def reconcile_cost(self, provider_generation_id: str) -> int:
+        self.calls.append(provider_generation_id)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        return 1
+
+
 class FailThenSucceedProvider:
     def __init__(self) -> None:
         self.calls = 0
@@ -75,7 +121,10 @@ class FailThenSucceedProvider:
         del request, cancel_event
         self.calls += 1
         if self.calls == 1:
-            raise ProviderError("provider_network")
+            error = ProviderError("provider_network")
+            # A provider adapter adding legacy retry state must not revive manager retries.
+            error.__dict__["transient"] = True
+            raise error
         await emit(_SUCCESS)  # type: ignore[operator]
         return ProviderCompletion(provider_request_id="provider-retry", cost_microusd=7)
 
@@ -237,12 +286,42 @@ async def test_same_thread_guard_stop_and_snapshot_reconnect(
     await manager.shutdown()
 
 
+async def test_thread_cancellation_awaits_task_cleanup_before_returning(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, settings, user = manager_database
+    provider = DelayedCancellationProvider()
+    manager = GenerationManager(database, settings, provider)
+    submitted = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="cancel-thread",
+        text="Synthetic source.",
+        attachment=None,
+        owner_id=user.id,
+        mode="translate",
+    )
+    await provider.started.wait()
+
+    await manager.cancel_thread(submitted.thread_id)
+
+    assert provider.cleanup_done.is_set()
+    stopped = await manager.get_snapshot(submitted.generation_id)
+    assert stopped is not None and stopped["status"] == "stopped"
+    assert submitted.generation_id not in manager._tasks
+    assert submitted.generation_id not in manager._conditions
+    await manager.shutdown()
+
+
 async def test_retry_reuses_user_message_without_duplication(
     manager_database: tuple[Database, Settings, User],
 ) -> None:
     database, settings, user = manager_database
     provider = FailThenSucceedProvider()
-    manager = GenerationManager(database, settings, provider)
+    manager = GenerationManager(
+        database,
+        settings.model_copy(update={"provider_retry_attempts": 3}),
+        provider,
+    )
     original = await manager.submit_turn(
         requester_id=user.id,
         client_request_id="original",
@@ -252,6 +331,7 @@ async def test_retry_reuses_user_message_without_duplication(
         mode="translate",
     )
     await _wait_status(manager, original.generation_id, {"failed"})
+    assert provider.calls == 1
     retry_id = await manager.retry(
         generation_id=original.generation_id,
         requester_id=user.id,
@@ -266,6 +346,32 @@ async def test_retry_reuses_user_message_without_duplication(
             ).scalars()
         )
         assert [message.role for message in messages] == ["user", "assistant"]
+    await manager.shutdown()
+
+
+async def test_unexpected_generation_failure_logs_only_safe_diagnostics(
+    manager_database: tuple[Database, Settings, User], caplog: pytest.LogCaptureFixture
+) -> None:
+    database, settings, user = manager_database
+    manager = GenerationManager(database, settings, UnexpectedFailureProvider())
+    caplog.set_level(logging.ERROR, logger="oveo.background")
+    submitted = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="unexpected",
+        text="Synthetic source.",
+        attachment=None,
+        owner_id=user.id,
+        mode="translate",
+    )
+
+    await _wait_status(manager, submitted.generation_id, {"failed"})
+
+    diagnostics = "\n".join(record.getMessage() for record in caplog.records)
+    assert "area=generation" in diagnostics
+    assert "exception_class=RuntimeError" in diagnostics
+    assert "locations=" in diagnostics
+    assert re.search(r"error_id=[0-9a-f]{32}", diagnostics)
+    assert "private prompt marker" not in diagnostics
     await manager.shutdown()
 
 
@@ -396,6 +502,7 @@ async def test_canonical_state_and_pending_cost_reconcile_atomically(
         "completed"
     )
     await provider.title_done.wait()
+    await manager.reconcile_pending_costs()
     async with database.sessions() as db:
         version = await db.scalar(select(WorkVersion))
         assert version is not None
@@ -414,6 +521,65 @@ async def test_canonical_state_and_pending_cost_reconcile_atomically(
         )
         assert sum(value or 0 for value in charges) == 55
     assert await manager.reconcile_pending_costs() == 0
+    await manager.shutdown()
+
+
+async def test_pending_cost_reconciliation_uses_bounded_batches(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, settings, user = manager_database
+    async with database.sessions() as db:
+        db.add_all(
+            [
+                UsageEvent(
+                    provider="openrouter",
+                    dedupe_key=f"pending-{index}",
+                    event_type="pending",
+                    purpose="chat",
+                    amount_microusd=None,
+                    requester_id=user.id,
+                    provider_generation_id=f"provider-generation-{index}",
+                )
+                for index in range(10)
+            ]
+        )
+        await db.commit()
+    provider = MetadataProvider()
+    manager = GenerationManager(database, settings, provider)
+
+    assert await manager.reconcile_pending_costs() == 8
+    assert len(provider.calls) == 8
+    assert await manager.reconcile_pending_costs() == 2
+    assert len(provider.calls) == 10
+    assert await manager.reconcile_pending_costs() == 0
+    await manager.shutdown()
+
+
+async def test_pending_cost_metadata_call_has_a_short_timeout(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, base_settings, user = manager_database
+    async with database.sessions() as db:
+        db.add(
+            UsageEvent(
+                provider="openrouter",
+                dedupe_key="slow-pending",
+                event_type="pending",
+                purpose="chat",
+                amount_microusd=None,
+                requester_id=user.id,
+                provider_generation_id="slow-generation",
+            )
+        )
+        await db.commit()
+    provider = MetadataProvider(delay=60)
+    settings = base_settings.model_copy(update={"provider_metadata_timeout_seconds": 0.1})
+    manager = GenerationManager(database, settings, provider)
+    started = asyncio.get_running_loop().time()
+
+    assert await manager.reconcile_pending_costs() == 0
+    assert asyncio.get_running_loop().time() - started < 0.5
+    assert provider.calls == ["slow-generation"]
     await manager.shutdown()
 
 

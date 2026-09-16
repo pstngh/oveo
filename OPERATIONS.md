@@ -1,10 +1,10 @@
 # Oveo operations
 
-Oveo runs as one container bound to `127.0.0.1:8000` behind the existing Caddy service. Images are built in GitHub Actions and production always records an immutable `ghcr.io/pstngh/oveo@sha256:...` reference. Never build application dependencies on the VPS.
+Oveo runs at `https://oveo.duckdns.org` as one container bound to `127.0.0.1:8000` behind the existing Caddy service. Images are built in GitHub Actions and production always records an immutable `ghcr.io/pstngh/oveo@sha256:...` reference. Never build application dependencies on the VPS.
 
 ## Verified production host
 
-The production target is `87.106.103.162` (`my-vps`, Debian 13, amd64, one vCPU). At the pre-cutover inventory it had 854 MiB RAM, 2 GiB swap, and 2.3 GiB free on a 9.7 GiB root filesystem. Root and `debian` key authentication were verified with the locally configured Ionos key. Caddy owns public ports 80/443 and a trusted short-lived Let's Encrypt IP certificate; preserve `/etc/caddy/Caddyfile` and `/var/lib/caddy`. The host has no UFW/firewalld INPUT policy, so loopback binding is mandatory.
+The production target is `87.106.103.162` (`my-vps`, Debian 13, amd64, one vCPU), with `oveo.duckdns.org` as the public application host. At the pre-cutover inventory it had 854 MiB RAM, 2 GiB swap, and 2.3 GiB free on a 9.7 GiB root filesystem. Root and `debian` key authentication were verified with the locally configured Ionos key. Caddy owns public ports 80/443; preserve `/etc/caddy/Caddyfile` and `/var/lib/caddy`. The host has no UFW/firewalld INPUT policy, so loopback binding is mandatory.
 
 Unrelated resources must never be touched: the `noku-bot` Compose project, its images, network, volumes, `/opt/noku-bot`, `/opt/noku-bot-backups`, `fortebot.service`, `/home/debian/fortebot`, and all shared Caddy, Docker, containerd, SSH, and system-timer state.
 
@@ -28,7 +28,7 @@ Copy the deployment artifacts with root ownership:
 
 The checksummed `oveo-host-COMMIT.tar.gz` workflow artifact packages all of these files plus `deploy/install-host.sh`; after verifying its adjacent SHA-256 file, extract it and run that installer as root. It installs executable and configuration artifacts with the required modes, creates the host directories, and reloads systemd without enabling the timer or changing secrets. `/etc/oveo` and `/var/backups/oveo` are mode `0700`; `/var/lib/oveo` is mode `0700` owned by UID/GID 10001.
 
-Create `/etc/oveo/runtime.env` from `deploy/runtime.env.example`, root-owned mode `0600`. Replace every example value: the OpenRouter key must be the working `sk-or-v1-...` credential and both password values must be complete Argon2id encodings, mapped OWNER to `charles` and USER to `yousra`. Stage only those three existing credentials; do not copy v1 sessions, encryption keys, or content. Single-quote Argon2 strings so their `$` characters remain literal. Validate the file without printing values with `python3 /usr/local/lib/oveo/validate_staging.py --runtime /etc/oveo/runtime.env`. Both deployment and v1 removal repeat this check. The OpenRouter request layer must retain model `openai/gpt-5.6-luna`, preferred provider `azure/eu`, same-model fallback, `data_collection=deny`, and `zdr=true`.
+Create `/etc/oveo/runtime.env` from `deploy/runtime.env.example`, root-owned mode `0600`. Keep `OVEO_PUBLIC_ORIGIN=https://oveo.duckdns.org` and include that hostname in `OVEO_TRUSTED_HOSTS`. Replace every secret example value: the OpenRouter key must be the working `sk-or-v1-...` credential and both password values must be complete Argon2id encodings, mapped OWNER to `charles` and USER to `yousra`. Stage only those three existing credentials; do not copy v1 sessions, encryption keys, or content. Single-quote Argon2 strings so their `$` characters remain literal. Validate the file without printing values with `python3 /usr/local/lib/oveo/validate_staging.py --runtime /etc/oveo/runtime.env`. Both deployment and v1 removal repeat this check. The OpenRouter request layer must retain model `openai/gpt-5.6-luna`, preferred provider `azure/eu`, same-model fallback, `data_collection=deny`, and `zdr=true`.
 
 Create new backup encryption material; the v1 host has none to preserve:
 
@@ -69,6 +69,8 @@ Manual status and health checks:
 ```bash
 docker compose --project-name oveo --env-file /etc/oveo/deploy.env -f /opt/oveo/compose.yml ps
 curl --fail http://127.0.0.1:8000/health/ready
+curl --fail https://oveo.duckdns.org/health/ready
+# Secondary emergency check only; the DuckDNS origin above is authoritative.
 curl --fail https://87.106.103.162/health/ready
 cat /var/lib/oveo/deployed-image
 ```

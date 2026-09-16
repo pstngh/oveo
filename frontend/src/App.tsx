@@ -16,7 +16,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { type FormEvent, type KeyboardEvent, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { type FormEvent, type KeyboardEvent, type ReactNode, useCallback, useEffect, useId, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api, ApiError, setCsrfToken } from "./api";
@@ -91,14 +91,50 @@ interface WebMcpContext {
   }, options: { signal: AbortSignal }): void | Promise<void>;
 }
 
-function Modal({ title, children, onClose }: { title: string; children: ReactNode; onClose: () => void }) {
+export function Modal({ title, children, onClose }: { title: string; children: ReactNode; onClose: () => void }) {
+  const dialogRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
-  useEffect(() => closeRef.current?.focus(), []);
+  const closeHandler = useRef(onClose);
+  const titleId = useId();
+  useEffect(() => { closeHandler.current = onClose; }, [onClose]);
+  useEffect(() => {
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    closeRef.current?.focus();
+    const keyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeHandler.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ) ?? []);
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      } else if (!dialogRef.current?.contains(document.activeElement)) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", keyDown);
+    return () => {
+      document.removeEventListener("keydown", keyDown);
+      previousFocus?.focus();
+    };
+  }, []);
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <section ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby={titleId}>
         <header>
-          <h2 id="modal-title">{title}</h2>
+          <h2 id={titleId}>{title}</h2>
           <button ref={closeRef} className="icon-button" onClick={onClose} aria-label="Close dialog"><X /></button>
         </header>
         {children}
@@ -202,6 +238,7 @@ export function MessageList({ detail, generation }: { detail: ThreadDetail; gene
           <div className="message-inner">
             {message.role === "assistant" ? <ResponseBlocks blocks={message.blocks} /> : (
               <>
+                {message.actor_username && message.actor_username !== detail.owner_username && <div className="message-author">{message.actor_username}</div>}
                 {message.blocks.map((block, index) => <p className="user-text" key={index}>{block.text}</p>)}
                 {message.attachment && <div className="sent-attachment"><FileText /> <span>{message.attachment.filename}</span></div>}
               </>
@@ -348,19 +385,22 @@ export default function App() {
   const [globalError, setGlobalError] = useState("");
   const preserveDraftOnOwnerChange = useRef(false);
 
+  const refreshUsage = useCallback(() => {
+    void api.usage().then((total) => setUsage(total.formatted)).catch(() => undefined);
+  }, []);
   const bootstrap = useCallback(async () => {
     try {
       const current = await api.me();
       if (current.csrf_token) setCsrfToken(current.csrf_token);
-      const [availableAccounts, total] = await Promise.all([api.accounts(), api.usage()]);
+      const availableAccounts = await api.accounts();
       setUser(current);
       setAccounts(availableAccounts);
       setOwner(availableAccounts.find((a) => a.id === current.id) ?? availableAccounts[0]);
-      setUsage(total.formatted);
+      refreshUsage();
     } catch {
       setUser(null);
     }
-  }, []);
+  }, [refreshUsage]);
   useEffect(() => { void bootstrap(); }, [bootstrap]);
   useEffect(() => {
     const unauthorized = () => setUser(null);
@@ -442,13 +482,13 @@ export default function App() {
         source.close();
         if (next.thread_id) void openThread(next.thread_id, false);
         void refreshThreads();
-        void api.usage().then((result) => setUsage(result.formatted));
+        refreshUsage();
       }
     };
     // EventSource reconnects automatically after a transient network interruption.
     source.onerror = () => undefined;
     return () => source.close();
-  }, [generationId, generationStatus, openThread, refreshThreads]);
+  }, [generationId, generationStatus, openThread, refreshThreads, refreshUsage]);
 
   useEffect(() => {
     const context = (document as Document & { modelContext?: WebMcpContext }).modelContext;
@@ -535,7 +575,7 @@ export default function App() {
         setHandoff(current.blocks);
       }
       if (current.status !== "completed") setGlobalError(current.error_message ?? "Prompt handoff could not be created.");
-      void api.usage().then((result) => setUsage(result.formatted));
+      refreshUsage();
     } catch (reason) {
       setHandoff(null);
       setGlobalError(reason instanceof Error ? reason.message : "Prompt handoff could not be created.");

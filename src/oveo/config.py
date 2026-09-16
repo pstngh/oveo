@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_model: str = "openai/gpt-5.6-luna"
     openrouter_timeout_seconds: float = Field(default=300.0, ge=10, le=900)
+    provider_metadata_timeout_seconds: float = Field(default=3.0, ge=0.1, le=10)
     provider_retry_attempts: int = Field(default=3, ge=1, le=5)
     session_cookie_name: str = "oveo_session"
     csrf_cookie_name: str = "oveo_csrf"
