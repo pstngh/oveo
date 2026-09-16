@@ -255,8 +255,8 @@ export function Composer({
       <div className="composer">
         {attachment && <div className="attachment-chip"><FileText /><span>{attachment.name}</span><button onClick={() => setAttachment(undefined)} aria-label="Remove attachment"><X /></button></div>}
         <textarea
-          aria-label="Message Oveo"
-          placeholder="Message Oveo"
+          aria-label="Message"
+          placeholder="Message"
           value={text}
           onChange={(event) => setText(event.target.value)}
           onPaste={pasted}

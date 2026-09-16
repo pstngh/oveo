@@ -44,7 +44,7 @@ describe("composer attachments", () => {
     const user = userEvent.setup();
     const onSend = vi.fn().mockResolvedValue(undefined);
     render(<Composer activeGeneration={null} onSend={onSend} onStop={vi.fn()} onRetry={vi.fn()} />);
-    const textbox = screen.getByRole("textbox", { name: "Message Oveo" });
+    const textbox = screen.getByRole("textbox", { name: "Message" });
     await user.type(textbox, "Translate this carefully: ");
     textbox.focus();
     await user.paste("x".repeat(4000));
@@ -62,7 +62,7 @@ describe("composer attachments", () => {
     render(<Composer activeGeneration={null} onSend={vi.fn()} onStop={vi.fn()} onRetry={vi.fn()} />);
     const input = document.querySelector('input[type="file"]') as HTMLInputElement;
     await user.upload(input, new File(["first"], "first.txt", { type: "text/plain" }));
-    const textbox = screen.getByRole("textbox", { name: "Message Oveo" });
+    const textbox = screen.getByRole("textbox", { name: "Message" });
     textbox.focus();
     await user.paste("y".repeat(4000));
     expect(screen.getByRole("alert")).toHaveTextContent("Remove the current attachment");
