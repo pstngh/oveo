@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Oveo encrypted backup nightly
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 UTC
+Persistent=true
+RandomizedDelaySec=10m
+Unit=oveo-backup.service
+
+[Install]
+WantedBy=timers.target
+

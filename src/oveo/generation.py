@@ -1,0 +1,1416 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
+from itertools import pairwise
+from pathlib import Path
+from typing import Any, Literal, Protocol, cast
+
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from oveo.attachments import ValidatedAttachment, count_words, persist_attachment
+from oveo.config import Settings
+from oveo.context import AttachmentText, build_provider_messages
+from oveo.db import Database
+from oveo.models import (
+    Attachment,
+    Generation,
+    Message,
+    Thread,
+    UsageEvent,
+    User,
+    WorkItem,
+    WorkVersion,
+    new_id,
+    utc_now,
+)
+from oveo.protocol import (
+    AppendState,
+    EstablishState,
+    FullState,
+    NoState,
+    OutputReplacement,
+    ProtocolDecoder,
+    ProtocolDocument,
+    ProtocolError,
+    ProtocolEvent,
+    ReplaceState,
+    SourceOutputReplacement,
+    StateOperation,
+)
+from oveo.provider import OpenRouterClient, ProviderMessage
+from oveo.provider import ProviderError as OpenRouterError
+from oveo.usage import append_usage_event
+
+EmitChunk = Callable[[bytes], Awaitable[None]]
+
+
+class GenerationError(RuntimeError):
+    def __init__(self, code: str, message: str, *, status_code: int = 422) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+
+
+class ActiveGenerationError(GenerationError):
+    def __init__(self) -> None:
+        super().__init__(
+            "active_generation",
+            "This conversation already has an active generation.",
+            status_code=409,
+        )
+
+
+class ProviderError(RuntimeError):
+    def __init__(
+        self,
+        code: str,
+        *,
+        transient: bool = False,
+        provider_request_id: str | None = None,
+        provider_generation_id: str | None = None,
+        cost_microusd: int | None = None,
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.transient = transient
+        self.provider_request_id = provider_request_id
+        self.provider_generation_id = provider_generation_id
+        self.cost_microusd = cost_microusd
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRequest:
+    generation_id: str
+    purpose: str
+    mode: str
+    voice_key: str | None
+    snapshot: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderCompletion:
+    provider_request_id: str | None = None
+    provider_generation_id: str | None = None
+    cost_microusd: int | None = None
+
+
+class GenerationProvider(Protocol):
+    async def generate(
+        self,
+        request: ProviderRequest,
+        emit: EmitChunk,
+        cancel_event: asyncio.Event,
+    ) -> ProviderCompletion: ...
+
+
+class UnavailableProvider:
+    async def generate(
+        self,
+        request: ProviderRequest,
+        emit: EmitChunk,
+        cancel_event: asyncio.Event,
+    ) -> ProviderCompletion:
+        del request, emit, cancel_event
+        raise ProviderError("provider_not_configured")
+
+
+class OpenRouterProvider:
+    """Adapt the tested OpenRouter client to the generation-manager callback contract."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._client = OpenRouterClient(settings)
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def reconcile_cost(self, provider_generation_id: str) -> int | None:
+        try:
+            return await self._client.generation_cost(provider_generation_id)
+        except OpenRouterError:
+            return None
+
+    async def generate(
+        self,
+        request: ProviderRequest,
+        emit: EmitChunk,
+        cancel_event: asyncio.Event,
+    ) -> ProviderCompletion:
+        raw_messages = request.snapshot.get("provider_messages")
+        if not isinstance(raw_messages, list):
+            raise ProviderError("invalid_request_snapshot")
+        messages: list[ProviderMessage] = []
+        for item in raw_messages:
+            if not isinstance(item, dict):
+                raise ProviderError("invalid_request_snapshot")
+            role = item.get("role")
+            content = item.get("content")
+            if role not in {"system", "user", "assistant"} or not isinstance(content, str):
+                raise ProviderError("invalid_request_snapshot")
+            messages.append(
+                ProviderMessage(
+                    role=cast(Literal["system", "user", "assistant"], role),
+                    content=content,
+                )
+            )
+
+        async def on_delta(delta: str) -> None:
+            if cancel_event.is_set():
+                raise asyncio.CancelledError
+            await emit(delta.encode("utf-8"))
+
+        try:
+            token_limit = (
+                64
+                if request.purpose == "title"
+                else 2_048
+                if request.purpose == "summary"
+                else 32_000
+            )
+            completion = await self._client.stream_chat(
+                messages,
+                max_completion_tokens=token_limit,
+                on_delta=on_delta,
+            )
+        except OpenRouterError as exc:
+            # OpenRouterClient has already exhausted safe pre-content retries.
+            raise ProviderError(
+                exc.code,
+                transient=False,
+                provider_request_id=exc.provider_request_id,
+                provider_generation_id=exc.provider_generation_id,
+                cost_microusd=(exc.usage.cost_microusd if exc.usage else None),
+            ) from exc
+        return ProviderCompletion(
+            provider_request_id=completion.provider_request_id,
+            provider_generation_id=completion.provider_generation_id,
+            cost_microusd=(completion.usage.cost_microusd if completion.usage else None),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Submission:
+    thread_id: str
+    generation_id: str
+
+
+_TERMINAL = frozenset({"completed", "failed", "stopped"})
+_ACTIVE = frozenset({"queued", "running", "stopping"})
+_ERROR_MESSAGES = {
+    "provider_not_configured": "The model provider is not configured.",
+    "provider_network": "The model provider could not be reached.",
+    "provider_transient": "The model provider is temporarily unavailable.",
+    "provider_rejected": "The model provider rejected the request.",
+    "provider_invalid_stream": "The model provider returned an invalid response.",
+    "protocol_error": "The model returned an invalid response format.",
+    "restart_interrupted": "Generation was interrupted by an application restart.",
+    "provider_error": "Oveo could not complete this response.",
+}
+
+
+def _replacement_span(text: str, anchor: str, *, label: str) -> tuple[int, int]:
+    first = text.find(anchor)
+    if first < 0:
+        raise ProtocolError(f"state_missing_{label}_anchor")
+    if text.find(anchor, first + len(anchor)) >= 0:
+        raise ProtocolError(f"state_ambiguous_{label}_anchor")
+    return first, first + len(anchor)
+
+
+def _apply_base_replacements(
+    text: str,
+    replacements: Sequence[tuple[str, str]],
+    *,
+    label: str,
+) -> str:
+    edits = [
+        (*_replacement_span(text, anchor, label=label), replacement)
+        for anchor, replacement in replacements
+    ]
+    ordered = sorted(edits, key=lambda edit: edit[0])
+    if any(left[1] > right[0] for left, right in pairwise(ordered)):
+        raise ProtocolError(f"state_overlapping_{label}_anchors")
+    result = text
+    for start, end, replacement in reversed(ordered):
+        result = f"{result[:start]}{replacement}{result[end:]}"
+    return result
+
+
+class GenerationManager:
+    def __init__(
+        self, database: Database, settings: Settings, provider: GenerationProvider
+    ) -> None:
+        self.database = database
+        self.settings = settings
+        self.provider = provider
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._cancel: dict[str, asyncio.Event] = {}
+        self._conditions: dict[str, asyncio.Condition] = {}
+        self._reconcile_lock = asyncio.Lock()
+
+    async def reconcile_orphans(self) -> int:
+        async with self.database.sessions() as db:
+            result = await db.execute(
+                update(Generation)
+                .where(Generation.status.in_(_ACTIVE))
+                .values(
+                    status="failed",
+                    error_code="restart_interrupted",
+                    partial_blocks=[],
+                    finished_at=utc_now(),
+                    stream_revision=Generation.stream_revision + 1,
+                )
+            )
+            await db.commit()
+            return int(result.rowcount or 0)  # type: ignore[attr-defined]
+
+    async def reconcile_pending_costs(self) -> int:
+        """Append charges for provider calls whose final stream omitted usage."""
+
+        reconcile = getattr(self.provider, "reconcile_cost", None)
+        if reconcile is None:
+            return 0
+        async with self._reconcile_lock:
+            async with self.database.sessions() as db:
+                pending = list(
+                    (
+                        await db.execute(
+                            select(UsageEvent).where(
+                                UsageEvent.event_type == "pending",
+                                UsageEvent.provider_generation_id.is_not(None),
+                            )
+                        )
+                    ).scalars()
+                )
+                existing_keys = set(
+                    (
+                        await db.execute(
+                            select(UsageEvent.dedupe_key).where(UsageEvent.event_type == "charge")
+                        )
+                    ).scalars()
+                )
+
+            reconciled = 0
+            for event in pending:
+                provider_generation_id = event.provider_generation_id
+                if provider_generation_id is None:
+                    continue
+                dedupe_key = f"{provider_generation_id}:{event.purpose}:reconciled-charge"
+                if dedupe_key in existing_keys:
+                    continue
+                try:
+                    cost_microusd = await reconcile(provider_generation_id)
+                except Exception:  # noqa: S112 -- provider metadata failures are non-fatal
+                    # Reconciliation is best effort and must never make startup/readiness
+                    # depend on a metadata endpoint. No provider body is retained or logged.
+                    continue
+                if cost_microusd is None:
+                    continue
+                async with self.database.sessions() as db:
+                    added = await append_usage_event(
+                        db,
+                        dedupe_key=dedupe_key,
+                        event_type="charge",
+                        purpose=event.purpose,
+                        amount_microusd=cost_microusd,
+                        generation_id=event.generation_id,
+                        thread_id=event.thread_id,
+                        requester_id=event.requester_id,
+                        provider_request_id=event.provider_request_id,
+                        provider_generation_id=provider_generation_id,
+                    )
+                    await db.commit()
+                if added is not None:
+                    reconciled += 1
+                    existing_keys.add(dedupe_key)
+            return reconciled
+
+    async def sweep_orphan_attachments(self) -> int:
+        """Remove only generated attachment files that have no live database row."""
+
+        directory = self.settings.attachments_dir
+        if not directory.is_dir():
+            return 0
+        async with self.database.sessions() as db:
+            referenced = set((await db.execute(select(Attachment.storage_name))).scalars())
+        removed = 0
+        for candidate in directory.iterdir():
+            if (
+                not candidate.is_file()
+                or re.fullmatch(r"[0-9a-f-]{36}\.txt", candidate.name) is None
+                or candidate.name in referenced
+            ):
+                continue
+            try:
+                candidate.unlink()
+            except OSError:
+                continue
+            removed += 1
+        return removed
+
+    async def shutdown(self) -> None:
+        tasks = tuple(self._tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        close = getattr(self.provider, "aclose", None)
+        if close is not None:
+            await close()
+
+    def _schedule(self, generation_id: str) -> None:
+        if generation_id in self._tasks:
+            return
+        cancel_event = asyncio.Event()
+        self._cancel[generation_id] = cancel_event
+        task = asyncio.create_task(self._run(generation_id, cancel_event))
+        self._tasks[generation_id] = task
+
+        def finished(_task: asyncio.Task[None]) -> None:
+            self._tasks.pop(generation_id, None)
+            self._cancel.pop(generation_id, None)
+
+        task.add_done_callback(finished)
+
+    async def _request_snapshot(
+        self,
+        db: AsyncSession,
+        thread: Thread,
+        *,
+        purpose: str,
+        through_ordinal: int | None = None,
+    ) -> dict[str, Any]:
+        message_query = select(Message).where(Message.thread_id == thread.id)
+        if through_ordinal is not None:
+            message_query = message_query.where(Message.ordinal <= through_ordinal)
+        messages = list((await db.execute(message_query.order_by(Message.ordinal))).scalars())
+        actor_ids = {message.actor_user_id for message in messages if message.actor_user_id}
+        actors = {
+            user.id: user.display_name
+            for user in (await db.execute(select(User).where(User.id.in_(actor_ids)))).scalars()
+        }
+        attachment_rows = list(
+            (
+                await db.execute(
+                    select(Attachment)
+                    .join(Message, Attachment.message_id == Message.id)
+                    .where(Message.thread_id == thread.id)
+                )
+            ).scalars()
+        )
+        attachments: dict[str, AttachmentText] = {}
+        for attachment in attachment_rows:
+            path = self.settings.attachments_dir / attachment.storage_name
+            try:
+                attachment_text = path.read_bytes().decode("utf-8-sig")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise GenerationError(
+                    "attachment_unavailable",
+                    "The saved text attachment is unavailable.",
+                ) from exc
+            attachments[attachment.message_id] = AttachmentText(
+                text=attachment_text,
+                word_count=attachment.word_count,
+            )
+        canonical = await db.scalar(
+            select(WorkVersion)
+            .join(WorkItem, WorkVersion.work_item_id == WorkItem.id)
+            .where(WorkItem.thread_id == thread.id, WorkItem.active.is_(True))
+            .order_by(WorkVersion.version_no.desc())
+            .limit(1)
+        )
+        provider_messages = build_provider_messages(
+            thread,
+            purpose=cast(Any, purpose),
+            recent_messages=messages,
+            actor_labels=actors,
+            attachments=attachments,
+            canonical_state=canonical,
+        )
+        return {
+            "schema_version": 1,
+            "mode": thread.mode,
+            "voice_key": thread.voice_key,
+            "provider_messages": [
+                {"role": message.role, "content": message.content} for message in provider_messages
+            ],
+        }
+
+    async def submit_turn(
+        self,
+        *,
+        requester_id: str,
+        client_request_id: str,
+        text: str,
+        attachment: ValidatedAttachment | None,
+        thread_id: str | None = None,
+        owner_id: str | None = None,
+        mode: str | None = None,
+        voice_key: str | None = None,
+    ) -> Submission:
+        staged_files: list[Path] = []
+        try:
+            return await self._submit_turn(
+                requester_id=requester_id,
+                client_request_id=client_request_id,
+                text=text,
+                attachment=attachment,
+                thread_id=thread_id,
+                owner_id=owner_id,
+                mode=mode,
+                voice_key=voice_key,
+                staged_files=staged_files,
+            )
+        except BaseException:
+            for staged_file in staged_files:
+                staged_file.unlink(missing_ok=True)
+            raise
+
+    async def _submit_turn(
+        self,
+        *,
+        requester_id: str,
+        client_request_id: str,
+        text: str,
+        attachment: ValidatedAttachment | None,
+        thread_id: str | None,
+        owner_id: str | None,
+        mode: str | None,
+        voice_key: str | None,
+        staged_files: list[Path],
+    ) -> Submission:
+        clean_text = text.strip()
+        if not clean_text and attachment is None:
+            raise GenerationError("empty_message", "Enter a message or attach a text file.")
+        if not client_request_id or len(client_request_id) > 100:
+            raise GenerationError("invalid_request_id", "The request identifier is invalid.")
+
+        storage_path: Path | None = None
+        async with self.database.sessions() as db:
+            existing = await db.scalar(
+                select(Generation).where(
+                    Generation.requester_id == requester_id,
+                    Generation.client_request_id == client_request_id,
+                )
+            )
+            if existing is not None:
+                if existing.thread_id is None:
+                    raise GenerationError("invalid_generation", "The saved request is invalid.")
+                return Submission(existing.thread_id, existing.id)
+
+            if thread_id is None:
+                if owner_id is None or mode not in {"translate", "alithyagpt"}:
+                    raise GenerationError("invalid_thread", "Choose a conversation mode.")
+                if mode == "translate" and voice_key is not None:
+                    raise GenerationError(
+                        "invalid_voice", "Translate does not use a writing voice."
+                    )
+                if mode == "alithyagpt" and voice_key != "comm_internes":
+                    raise GenerationError(
+                        "invalid_voice", "Only Comm internes is configured.", status_code=422
+                    )
+                thread = Thread(
+                    id=new_id(),
+                    owner_id=owner_id,
+                    mode=mode,
+                    voice_key=voice_key,
+                    title="New conversation",
+                )
+                db.add(thread)
+                await db.flush()
+            else:
+                existing_thread = await db.get(Thread, thread_id)
+                if existing_thread is None:
+                    raise GenerationError(
+                        "thread_not_found", "Conversation not found.", status_code=404
+                    )
+                thread = existing_thread
+
+            active = await db.scalar(
+                select(Generation.id).where(
+                    Generation.thread_id == thread.id,
+                    Generation.status.in_(_ACTIVE),
+                )
+            )
+            if active is not None:
+                raise ActiveGenerationError
+
+            latest_words = await db.scalar(
+                select(WorkVersion.source_word_count)
+                .join(WorkItem, WorkVersion.work_item_id == WorkItem.id)
+                .where(WorkItem.thread_id == thread.id, WorkItem.active.is_(True))
+                .order_by(WorkVersion.version_no.desc())
+                .limit(1)
+            )
+            added_words = attachment.word_count if attachment is not None else 0
+            if thread.mode == "translate" and attachment is None:
+                added_words = count_words(clean_text)
+            measured_words = int(latest_words or 0) + added_words
+            if measured_words > self.settings.max_source_words:
+                raise GenerationError(
+                    "source_word_limit",
+                    f"Source contains {measured_words:,} words; the maximum is "
+                    f"{self.settings.max_source_words:,} words.",
+                )
+
+            ordinal = (
+                int(
+                    await db.scalar(
+                        select(func.coalesce(func.max(Message.ordinal), 0)).where(
+                            Message.thread_id == thread.id
+                        )
+                    )
+                    or 0
+                )
+                + 1
+            )
+            message = Message(
+                id=new_id(),
+                thread_id=thread.id,
+                ordinal=ordinal,
+                role="user",
+                actor_user_id=requester_id,
+                content=([{"type": "conversation", "text": text}] if text else []),
+            )
+            db.add(message)
+            # Flush the parent row before the optional attachment. The models use IDs
+            # rather than ORM relationships, so this explicit ordering is required.
+            await db.flush()
+            if attachment is not None:
+                attachment_id = new_id()
+                storage_name = f"{attachment_id}.txt"
+                storage_path = persist_attachment(
+                    self.settings.attachments_dir, storage_name, attachment.content
+                )
+                staged_files.append(storage_path)
+                db.add(
+                    Attachment(
+                        id=attachment_id,
+                        message_id=message.id,
+                        storage_name=storage_name,
+                        original_name=attachment.original_name,
+                        byte_count=attachment.byte_count,
+                        word_count=attachment.word_count,
+                        sha256=attachment.sha256,
+                    )
+                )
+                await db.flush()
+            request_snapshot = await self._request_snapshot(db, thread, purpose="chat")
+            generation = Generation(
+                id=new_id(),
+                thread_id=thread.id,
+                requester_id=requester_id,
+                source_message_id=message.id,
+                client_request_id=client_request_id,
+                purpose="chat",
+                status="queued",
+                request_snapshot=request_snapshot,
+            )
+            db.add(generation)
+            thread.updated_at = utc_now()
+            try:
+                await db.commit()
+            except IntegrityError as exc:
+                await db.rollback()
+                if storage_path is not None:
+                    storage_path.unlink(missing_ok=True)
+                existing = await db.scalar(
+                    select(Generation).where(
+                        Generation.requester_id == requester_id,
+                        Generation.client_request_id == client_request_id,
+                    )
+                )
+                if existing is not None and existing.thread_id is not None:
+                    return Submission(existing.thread_id, existing.id)
+                raise ActiveGenerationError from exc
+
+        self._schedule(generation.id)
+        return Submission(thread.id, generation.id)
+
+    async def submit_handoff(
+        self,
+        *,
+        thread_id: str,
+        requester_id: str,
+        client_request_id: str,
+    ) -> str:
+        async with self.database.sessions() as db:
+            existing = await db.scalar(
+                select(Generation).where(
+                    Generation.requester_id == requester_id,
+                    Generation.client_request_id == client_request_id,
+                )
+            )
+            if existing is not None:
+                return existing.id
+            thread = await db.get(Thread, thread_id)
+            if thread is None:
+                raise GenerationError(
+                    "thread_not_found", "Conversation not found.", status_code=404
+                )
+            request_snapshot = await self._request_snapshot(db, thread, purpose="prompt_handoff")
+            generation = Generation(
+                id=new_id(),
+                thread_id=thread.id,
+                requester_id=requester_id,
+                client_request_id=client_request_id,
+                purpose="prompt_handoff",
+                status="queued",
+                request_snapshot=request_snapshot,
+            )
+            db.add(generation)
+            try:
+                await db.commit()
+            except IntegrityError as exc:
+                await db.rollback()
+                existing = await db.scalar(
+                    select(Generation).where(
+                        Generation.requester_id == requester_id,
+                        Generation.client_request_id == client_request_id,
+                    )
+                )
+                if existing is not None:
+                    return str(existing.id)
+                raise ActiveGenerationError from exc
+        self._schedule(generation.id)
+        return generation.id
+
+    async def retry(
+        self,
+        *,
+        generation_id: str,
+        requester_id: str,
+        client_request_id: str,
+    ) -> str:
+        async with self.database.sessions() as db:
+            existing = await db.scalar(
+                select(Generation).where(
+                    Generation.requester_id == requester_id,
+                    Generation.client_request_id == client_request_id,
+                )
+            )
+            if existing is not None:
+                return existing.id
+            original = await db.get(Generation, generation_id)
+            if original is None or original.status not in {"failed", "stopped"}:
+                raise GenerationError(
+                    "generation_not_retryable",
+                    "This generation cannot be retried.",
+                    status_code=409,
+                )
+            retry = Generation(
+                id=new_id(),
+                thread_id=original.thread_id,
+                requester_id=requester_id,
+                source_message_id=original.source_message_id,
+                retry_of_generation_id=original.id,
+                client_request_id=client_request_id,
+                purpose=original.purpose,
+                status="queued",
+                request_snapshot=original.request_snapshot,
+            )
+            db.add(retry)
+            try:
+                await db.commit()
+            except IntegrityError as exc:
+                await db.rollback()
+                raise ActiveGenerationError from exc
+        self._schedule(retry.id)
+        return retry.id
+
+    async def stop(self, generation_id: str) -> None:
+        async with self.database.sessions() as db:
+            generation = await db.get(Generation, generation_id)
+            if generation is None:
+                raise GenerationError(
+                    "generation_not_found", "Generation not found.", status_code=404
+                )
+            if generation.status not in _ACTIVE:
+                return
+            generation.status = "stopping"
+            generation.stream_revision += 1
+            await db.commit()
+        await self._notify(generation_id)
+        cancel_event = self._cancel.get(generation_id)
+        if cancel_event is not None:
+            cancel_event.set()
+        task = self._tasks.get(generation_id)
+        if task is not None:
+            task.cancel()
+
+    async def cancel_thread(self, thread_id: str) -> None:
+        async with self.database.sessions() as db:
+            ids = tuple(
+                (
+                    await db.execute(
+                        select(Generation.id).where(
+                            Generation.thread_id == thread_id,
+                            Generation.status.in_(_ACTIVE),
+                        )
+                    )
+                ).scalars()
+            )
+        for generation_id in ids:
+            await self.stop(generation_id)
+
+    async def get_snapshot(self, generation_id: str) -> dict[str, Any] | None:
+        async with self.database.sessions() as db:
+            generation = await db.get(Generation, generation_id)
+            if generation is None:
+                return None
+            blocks = (
+                generation.partial_blocks if isinstance(generation.partial_blocks, list) else []
+            )
+            return {
+                "id": generation.id,
+                "thread_id": generation.thread_id,
+                "status": generation.status,
+                "blocks": blocks,
+                "error_code": generation.error_code,
+                "error_message": _ERROR_MESSAGES.get(generation.error_code or ""),
+                "retryable": generation.status in {"failed", "stopped"},
+                "seq": generation.stream_revision,
+            }
+
+    async def events(self, generation_id: str) -> AsyncIterator[str]:
+        last_seq = -1
+        while True:
+            snapshot = await self.get_snapshot(generation_id)
+            if snapshot is None:
+                return
+            seq = int(snapshot["seq"])
+            if seq != last_seq:
+                yield f"id: {seq}\ndata: {json.dumps(snapshot, separators=(',', ':'))}\n\n"
+                last_seq = seq
+            if snapshot["status"] in _TERMINAL:
+                return
+            condition = self._conditions.setdefault(generation_id, asyncio.Condition())
+            try:
+                async with condition:
+                    await asyncio.wait_for(condition.wait(), timeout=15)
+            except TimeoutError:
+                yield ": keep-alive\n\n"
+
+    async def _notify(self, generation_id: str) -> None:
+        condition = self._conditions.setdefault(generation_id, asyncio.Condition())
+        async with condition:
+            condition.notify_all()
+
+    async def _set_running(self, generation_id: str) -> Generation | None:
+        async with self.database.sessions() as db:
+            generation = await db.get(Generation, generation_id)
+            if generation is None or generation.status != "queued":
+                return None
+            generation.status = "running"
+            generation.started_at = utc_now()
+            generation.stream_revision += 1
+            await append_usage_event(
+                db,
+                dedupe_key=f"{generation.id}:pending",
+                event_type="pending",
+                purpose=generation.purpose,
+                amount_microusd=None,
+                generation_id=generation.id,
+                thread_id=generation.thread_id,
+                requester_id=generation.requester_id,
+                provider_request_id=None,
+            )
+            await db.commit()
+            return generation
+
+    async def _reset_partial(self, generation_id: str) -> None:
+        async with self.database.sessions() as db:
+            generation = await db.get(Generation, generation_id)
+            if generation is not None and generation.status == "running":
+                generation.partial_blocks = []
+                generation.stream_revision += 1
+                await db.commit()
+        await self._notify(generation_id)
+
+    async def _record_events(self, generation_id: str, events: Sequence[ProtocolEvent]) -> None:
+        if not events:
+            return
+        async with self.database.sessions() as db:
+            generation = await db.get(Generation, generation_id)
+            if generation is None or generation.status != "running":
+                raise asyncio.CancelledError
+            blocks = [dict(block) for block in generation.partial_blocks]
+            for event in events:
+                if event.event == "block_start":
+                    blocks.append({"type": event.block_type, "text": ""})
+                elif event.event == "block_delta":
+                    if not blocks or event.text is None:
+                        raise ProtocolError("delta_without_active_block")
+                    blocks[-1]["text"] = f"{blocks[-1].get('text', '')}{event.text}"
+            generation.partial_blocks = blocks
+            generation.stream_revision += 1
+            await db.commit()
+        await self._notify(generation_id)
+
+    async def _commit_success(
+        self,
+        generation_id: str,
+        document: ProtocolDocument,
+        completion: ProviderCompletion,
+    ) -> None:
+        blocks = [{"type": block.type, "text": block.text} for block in document.blocks]
+        async with self.database.sessions() as db:
+            generation = await db.get(Generation, generation_id)
+            if generation is None:
+                return
+            if generation.status == "stopping":
+                await self._mark_stopped(db, generation)
+                await db.commit()
+                return
+            if generation.status != "running":
+                return
+            if generation.purpose != "chat" and not isinstance(document.state, NoState):
+                raise ProtocolError("state_invalid_purpose")
+            if generation.purpose == "chat" and generation.thread_id is not None:
+                thread = await db.get(Thread, generation.thread_id)
+                if thread is None:
+                    raise ProtocolError("state_thread_missing")
+                ordinal = (
+                    int(
+                        await db.scalar(
+                            select(func.coalesce(func.max(Message.ordinal), 0)).where(
+                                Message.thread_id == generation.thread_id
+                            )
+                        )
+                        or 0
+                    )
+                    + 1
+                )
+                message = Message(
+                    id=new_id(),
+                    thread_id=generation.thread_id,
+                    ordinal=ordinal,
+                    role="assistant",
+                    actor_user_id=None,
+                    content=blocks,
+                )
+                db.add(message)
+                # Ensure the assistant row exists before updating the generation's
+                # result-message foreign key.
+                await db.flush()
+                await self._apply_state_operation(
+                    db,
+                    generation=generation,
+                    thread=thread,
+                    state=document.state,
+                )
+                generation.result_message_id = message.id
+                thread.updated_at = utc_now()
+            generation.partial_blocks = blocks
+            generation.provider_request_id = completion.provider_request_id
+            generation.provider_generation_id = completion.provider_generation_id
+            generation.status = "completed"
+            generation.finished_at = utc_now()
+            generation.stream_revision += 1
+            await db.commit()
+        await self._notify(generation_id)
+
+    async def _apply_state_operation(
+        self,
+        db: AsyncSession,
+        *,
+        generation: Generation,
+        thread: Thread | None,
+        state: StateOperation,
+    ) -> None:
+        """Validate and persist one hidden canonical mutation in the response commit."""
+
+        if thread is None:
+            raise ProtocolError("state_thread_missing")
+        if isinstance(state, NoState):
+            return
+
+        item = await db.scalar(
+            select(WorkItem).where(
+                WorkItem.thread_id == thread.id,
+                WorkItem.active.is_(True),
+            )
+        )
+        current: WorkVersion | None = None
+        if item is not None:
+            current = await db.scalar(
+                select(WorkVersion)
+                .where(WorkVersion.work_item_id == item.id)
+                .order_by(WorkVersion.version_no.desc())
+                .limit(1)
+            )
+
+        if isinstance(state, EstablishState):
+            if item is not None:
+                item.active = False
+            item = WorkItem(
+                thread_id=thread.id,
+                kind="translation" if thread.mode == "translate" else "draft",
+                active=True,
+            )
+            db.add(item)
+            await db.flush()
+            source = state.source
+            output = state.output
+            brief = state.brief
+            version_no = 1
+            parent_version_id = None
+            operation = "establish"
+        else:
+            if item is None or current is None:
+                raise ProtocolError("state_base_missing")
+            if state.base_version != current.version_no:
+                raise ProtocolError("state_base_mismatch")
+            source = current.source_text
+            output = current.output_text
+            brief = current.brief
+            version_no = current.version_no + 1
+            parent_version_id = current.id
+            operation = state.operation
+
+            if isinstance(state, AppendState):
+                source = f"{source}\n\n{state.source_addition}"
+                output = f"{output}\n\n{state.output_addition}"
+            elif isinstance(state, ReplaceState):
+                source_replacements: list[tuple[str, str]] = []
+                output_replacements: list[tuple[str, str]] = []
+                for replacement in state.replacements:
+                    if isinstance(replacement, SourceOutputReplacement):
+                        source_replacements.append(
+                            (replacement.source_anchor, replacement.source_replacement)
+                        )
+                    elif not isinstance(replacement, OutputReplacement):
+                        raise ProtocolError("invalid_replacement")
+                    output_replacements.append(
+                        (replacement.output_anchor, replacement.output_replacement)
+                    )
+                source = _apply_base_replacements(source, source_replacements, label="source")
+                output = _apply_base_replacements(output, output_replacements, label="output")
+            elif isinstance(state, FullState):
+                source = state.source if state.source is not None else source
+                output = state.output
+                brief = state.brief if state.brief is not None else brief
+            else:  # pragma: no cover - kept defensive for future protocol variants
+                raise ProtocolError("invalid_state_operation")
+
+        if not source.strip() or not output.strip() or not brief:
+            raise ProtocolError("invalid_canonical_state")
+        source_word_count = count_words(source)
+        if source_word_count > self.settings.max_source_words:
+            raise ProtocolError("state_source_word_limit")
+        db.add(
+            WorkVersion(
+                work_item_id=item.id,
+                version_no=version_no,
+                parent_version_id=parent_version_id,
+                cause_message_id=generation.source_message_id,
+                operation=operation,
+                source_text=source,
+                output_text=output,
+                source_word_count=source_word_count,
+                brief=brief,
+            )
+        )
+        await db.flush()
+
+    async def _record_provider_completion(
+        self,
+        generation_id: str,
+        completion: ProviderCompletion,
+        *,
+        purpose: str,
+        record_ids: bool = True,
+    ) -> None:
+        async with self.database.sessions() as db:
+            generation = await db.get(Generation, generation_id)
+            if generation is None:
+                return
+            if record_ids:
+                generation.provider_request_id = (
+                    completion.provider_request_id or generation.provider_request_id
+                )
+                generation.provider_generation_id = (
+                    completion.provider_generation_id or generation.provider_generation_id
+                )
+            if completion.cost_microusd is not None:
+                provider_key = completion.provider_request_id or generation.id
+                await append_usage_event(
+                    db,
+                    dedupe_key=f"{provider_key}:{purpose}:charge",
+                    event_type="charge",
+                    purpose=purpose,
+                    amount_microusd=completion.cost_microusd,
+                    generation_id=generation.id,
+                    thread_id=generation.thread_id,
+                    requester_id=generation.requester_id,
+                    provider_request_id=completion.provider_request_id,
+                    provider_generation_id=completion.provider_generation_id,
+                )
+            elif completion.provider_generation_id is not None:
+                await append_usage_event(
+                    db,
+                    dedupe_key=(f"{completion.provider_generation_id}:{purpose}:reconcile-pending"),
+                    event_type="pending",
+                    purpose=purpose,
+                    amount_microusd=None,
+                    generation_id=generation.id,
+                    thread_id=generation.thread_id,
+                    requester_id=generation.requester_id,
+                    provider_request_id=completion.provider_request_id,
+                    provider_generation_id=completion.provider_generation_id,
+                )
+            await db.commit()
+
+    async def _record_provider_error(
+        self,
+        generation_id: str,
+        error: ProviderError,
+        *,
+        attempt: int,
+        purpose: str,
+    ) -> None:
+        async with self.database.sessions() as db:
+            generation = await db.get(Generation, generation_id)
+            if generation is None:
+                return
+            generation.provider_request_id = (
+                error.provider_request_id or generation.provider_request_id
+            )
+            generation.provider_generation_id = (
+                error.provider_generation_id or generation.provider_generation_id
+            )
+            if error.cost_microusd is not None:
+                provider_key = error.provider_request_id or f"{generation.id}:{attempt}"
+                await append_usage_event(
+                    db,
+                    dedupe_key=f"{provider_key}:{purpose}:failed-charge",
+                    event_type="charge",
+                    purpose=purpose,
+                    amount_microusd=error.cost_microusd,
+                    generation_id=generation.id,
+                    thread_id=generation.thread_id,
+                    requester_id=generation.requester_id,
+                    provider_request_id=error.provider_request_id,
+                    provider_generation_id=error.provider_generation_id,
+                )
+            elif error.provider_generation_id is not None:
+                await append_usage_event(
+                    db,
+                    dedupe_key=(f"{error.provider_generation_id}:{purpose}:reconcile-pending"),
+                    event_type="pending",
+                    purpose=purpose,
+                    amount_microusd=None,
+                    generation_id=generation.id,
+                    thread_id=generation.thread_id,
+                    requester_id=generation.requester_id,
+                    provider_request_id=error.provider_request_id,
+                    provider_generation_id=error.provider_generation_id,
+                )
+            await db.commit()
+
+    async def _maybe_generate_title(self, generation_id: str, thread_id: str) -> None:
+        """Generate the first title as a non-transcript, separately accounted model call."""
+
+        async with self.database.sessions() as db:
+            thread = await db.get(Thread, thread_id)
+            generation = await db.get(Generation, generation_id)
+            if (
+                thread is None
+                or generation is None
+                or thread.title != "New conversation"
+                or generation.status != "completed"
+            ):
+                return
+            message_count = int(
+                await db.scalar(
+                    select(func.count()).select_from(Message).where(Message.thread_id == thread.id)
+                )
+                or 0
+            )
+            if message_count != 2:
+                return
+            snapshot = await self._request_snapshot(db, thread, purpose="title")
+            await append_usage_event(
+                db,
+                dedupe_key=f"{generation.id}:title:pending",
+                event_type="pending",
+                purpose="title",
+                amount_microusd=None,
+                generation_id=generation.id,
+                thread_id=thread.id,
+                requester_id=generation.requester_id,
+                provider_request_id=None,
+            )
+            await db.commit()
+
+        parts: list[bytes] = []
+
+        async def collect(chunk: bytes) -> None:
+            if sum(map(len, parts)) + len(chunk) > 1_024:
+                raise ProviderError("title_too_large")
+            parts.append(chunk)
+
+        request = ProviderRequest(
+            generation_id=f"{generation_id}:title",
+            purpose="title",
+            mode=str(snapshot.get("mode", "translate")),
+            voice_key=cast(str | None, snapshot.get("voice_key")),
+            snapshot=snapshot,
+        )
+        try:
+            completion = await self.provider.generate(request, collect, asyncio.Event())
+            await self._record_provider_completion(
+                generation_id,
+                completion,
+                purpose="title",
+                record_ids=False,
+            )
+            await self.reconcile_pending_costs()
+            title = b"".join(parts).decode("utf-8").strip()
+            if not title or len(title) > 60 or "\n" in title or not 2 <= len(title.split()) <= 6:
+                return
+            async with self.database.sessions() as db:
+                thread = await db.get(Thread, thread_id)
+                generation = await db.get(Generation, generation_id)
+                if thread is None or generation is None:
+                    return
+                if thread.title == "New conversation":
+                    thread.title = title
+                    thread.updated_at = utc_now()
+                await db.commit()
+        except ProviderError as exc:
+            await self._record_provider_error(generation_id, exc, attempt=1, purpose="title")
+        except (UnicodeDecodeError, ValueError):
+            return
+
+    async def _mark_stopped(self, db: AsyncSession, generation: Generation) -> None:
+        generation.status = "stopped"
+        generation.partial_blocks = []
+        generation.error_code = None
+        generation.finished_at = utc_now()
+        generation.stream_revision += 1
+
+    async def _finish_stopped(self, generation_id: str) -> None:
+        async with self.database.sessions() as db:
+            generation = await db.get(Generation, generation_id)
+            if generation is not None and generation.status in _ACTIVE:
+                await self._mark_stopped(db, generation)
+                await db.commit()
+        await self._notify(generation_id)
+
+    async def _maybe_compact_context(self, generation: Generation) -> Mapping[str, Any]:
+        snapshot = generation.request_snapshot
+        provider_messages = snapshot.get("provider_messages")
+        context_chars = (
+            sum(
+                len(str(message.get("content", "")))
+                for message in provider_messages
+                if isinstance(message, dict)
+            )
+            if isinstance(provider_messages, list)
+            else 0
+        )
+        if (
+            generation.purpose != "chat"
+            or generation.thread_id is None
+            or context_chars <= self.settings.context_compaction_chars
+        ):
+            return snapshot
+
+        async with self.database.sessions() as db:
+            thread = await db.get(Thread, generation.thread_id)
+            if thread is None:
+                raise ProviderError("context_compaction_failed")
+            unsummarized = list(
+                (
+                    await db.execute(
+                        select(Message)
+                        .where(
+                            Message.thread_id == thread.id,
+                            Message.ordinal > (thread.summary_through_ordinal or 0),
+                        )
+                        .order_by(Message.ordinal)
+                    )
+                ).scalars()
+            )
+            if len(unsummarized) <= self.settings.context_recent_messages:
+                return snapshot
+            cutoff = unsummarized[-self.settings.context_recent_messages - 1].ordinal
+            summary_snapshot = await self._request_snapshot(
+                db,
+                thread,
+                purpose="summary",
+                through_ordinal=cutoff,
+            )
+            await append_usage_event(
+                db,
+                dedupe_key=f"{generation.id}:summary:{cutoff}:pending",
+                event_type="pending",
+                purpose="summary",
+                amount_microusd=None,
+                generation_id=generation.id,
+                thread_id=thread.id,
+                requester_id=generation.requester_id,
+                provider_request_id=None,
+            )
+            await db.commit()
+
+        parts: list[bytes] = []
+
+        async def collect(chunk: bytes) -> None:
+            if sum(map(len, parts)) + len(chunk) > 131_072:
+                raise ProviderError("context_compaction_failed")
+            parts.append(chunk)
+
+        request = ProviderRequest(
+            generation_id=f"{generation.id}:summary:{cutoff}",
+            purpose="summary",
+            mode=str(summary_snapshot.get("mode", "translate")),
+            voice_key=cast(str | None, summary_snapshot.get("voice_key")),
+            snapshot=summary_snapshot,
+        )
+        try:
+            completion = await self.provider.generate(request, collect, asyncio.Event())
+            await self._record_provider_completion(
+                generation.id,
+                completion,
+                purpose="summary",
+                record_ids=False,
+            )
+            await self.reconcile_pending_costs()
+            raw = b"".join(parts).decode("utf-8")
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or set(payload) != {
+                "version",
+                "summary",
+                "unresolved",
+            }:
+                raise ProviderError("context_compaction_failed")
+            summary = payload.get("summary")
+            unresolved = payload.get("unresolved")
+            if (
+                payload.get("version") != 1
+                or not isinstance(summary, str)
+                or not summary.strip()
+                or not isinstance(unresolved, list)
+                or any(not isinstance(item, str) for item in unresolved)
+            ):
+                raise ProviderError("context_compaction_failed")
+            compacted = summary.strip()
+            unresolved_text = [item.strip() for item in unresolved if item.strip()]
+            if unresolved_text:
+                compacted += "\n\nUnresolved:\n" + "\n".join(
+                    f"- {item}" for item in unresolved_text
+                )
+        except (ProviderError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            error = (
+                exc
+                if isinstance(exc, ProviderError)
+                else ProviderError("context_compaction_failed")
+            )
+            await self._record_provider_error(
+                generation.id,
+                error,
+                attempt=1,
+                purpose="summary",
+            )
+            raise error from exc
+
+        async with self.database.sessions() as db:
+            thread = await db.get(Thread, generation.thread_id)
+            current = await db.get(Generation, generation.id)
+            if thread is None or current is None or current.status != "running":
+                raise asyncio.CancelledError
+            thread.context_summary = compacted
+            thread.summary_through_ordinal = cutoff
+            fresh_snapshot = await self._request_snapshot(db, thread, purpose="chat")
+            current.request_snapshot = fresh_snapshot
+            await db.commit()
+            return fresh_snapshot
+
+    async def _fail(self, generation_id: str, code: str) -> None:
+        async with self.database.sessions() as db:
+            generation = await db.get(Generation, generation_id)
+            if generation is not None and generation.status in _ACTIVE:
+                generation.status = "failed"
+                generation.partial_blocks = []
+                generation.error_code = code if code in _ERROR_MESSAGES else "provider_error"
+                generation.finished_at = utc_now()
+                generation.stream_revision += 1
+                await db.commit()
+        await self._notify(generation_id)
+
+    async def _run(self, generation_id: str, cancel_event: asyncio.Event) -> None:
+        try:
+            generation = await self._set_running(generation_id)
+            if generation is None:
+                return
+            await self._notify(generation_id)
+            request_snapshot = await self._maybe_compact_context(generation)
+            request = ProviderRequest(
+                generation_id=generation.id,
+                purpose=generation.purpose,
+                mode=str(request_snapshot.get("mode", "translate")),
+                voice_key=cast(str | None, request_snapshot.get("voice_key")),
+                snapshot=request_snapshot,
+            )
+            last_error = "provider_error"
+            for attempt in range(self.settings.provider_retry_attempts):
+                if attempt:
+                    await self._reset_partial(generation_id)
+                decoder = ProtocolDecoder()
+
+                async def emit(chunk: bytes, active_decoder: ProtocolDecoder = decoder) -> None:
+                    if cancel_event.is_set():
+                        raise asyncio.CancelledError
+                    await self._record_events(generation_id, active_decoder.feed(chunk))
+
+                try:
+                    completion = await self.provider.generate(request, emit, cancel_event)
+                    await self._record_provider_completion(
+                        generation_id,
+                        completion,
+                        purpose=generation.purpose,
+                    )
+                    document = decoder.finish()
+                    await self._commit_success(generation_id, document, completion)
+                    await self.reconcile_pending_costs()
+                    if generation.purpose == "chat" and generation.thread_id is not None:
+                        await self._maybe_generate_title(generation.id, generation.thread_id)
+                    return
+                except ProviderError as exc:
+                    last_error = exc.code
+                    await self._record_provider_error(
+                        generation_id,
+                        exc,
+                        attempt=attempt + 1,
+                        purpose=generation.purpose,
+                    )
+                    if not exc.transient or attempt + 1 >= self.settings.provider_retry_attempts:
+                        break
+                    try:
+                        await asyncio.wait_for(cancel_event.wait(), timeout=0.25 * (2**attempt))
+                        raise asyncio.CancelledError
+                    except TimeoutError:
+                        continue
+                except ProtocolError:
+                    last_error = "protocol_error"
+                    break
+            await self._fail(generation_id, last_error)
+        except asyncio.CancelledError:
+            await asyncio.shield(self._finish_stopped(generation_id))
+        except Exception:
+            await self._fail(generation_id, "provider_error")
+
+
+async def usage_event_count(database: Database) -> int:
+    """Small readiness/test helper that does not expose ledger detail."""
+
+    async with database.sessions() as db:
+        return int(await db.scalar(select(func.count()).select_from(UsageEvent)) or 0)
