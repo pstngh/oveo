@@ -45,6 +45,13 @@ export function conversationIdFromPath(pathname: string) {
   }
 }
 
+export function canonicalPath(pathname: string, authenticated: boolean) {
+  if (!authenticated) return "/";
+  if (pathname === "/new") return pathname;
+  const conversationId = conversationIdFromPath(pathname);
+  return conversationId ? conversationPath(conversationId) : "/new";
+}
+
 function updateAddress(path: string, replace = false) {
   if (window.location.pathname === path) return;
   window.history[replace ? "replaceState" : "pushState"](null, "", path);
@@ -336,6 +343,13 @@ export default function App() {
     window.addEventListener("oveo:unauthorized", unauthorized);
     return () => window.removeEventListener("oveo:unauthorized", unauthorized);
   }, []);
+  useEffect(() => {
+    if (user !== null) return;
+    const normalizeAddress = () => updateAddress(canonicalPath(window.location.pathname, false), true);
+    normalizeAddress();
+    window.addEventListener("popstate", normalizeAddress);
+    return () => window.removeEventListener("popstate", normalizeAddress);
+  }, [user]);
 
   const refreshThreads = useCallback(async () => {
     if (!owner) return;
@@ -365,7 +379,9 @@ export default function App() {
   useEffect(() => {
     if (!user || accounts.length === 0) return;
     const applyAddress = () => {
-      const id = conversationIdFromPath(window.location.pathname);
+      const path = canonicalPath(window.location.pathname, true);
+      updateAddress(path, true);
+      const id = conversationIdFromPath(path);
       if (id) {
         void openThread(id, false).catch((reason) => {
           setGlobalError(reason instanceof Error ? reason.message : "Could not load that conversation.");
@@ -380,7 +396,6 @@ export default function App() {
       setGeneration(null);
       setDraftMode(null);
       setSidebarOpen(false);
-      if (window.location.pathname === "/") updateAddress("/new", true);
     };
     applyAddress();
     window.addEventListener("popstate", applyAddress);

@@ -1,7 +1,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Composer, conversationIdFromPath, conversationPath, EmptyThread, Login, MessageList, ResponseBlocks, SidebarHeader } from "./App";
+import { canonicalPath, Composer, conversationIdFromPath, conversationPath, EmptyThread, Login, MessageList, ResponseBlocks, SidebarHeader } from "./App";
 import type { ThreadDetail } from "./types";
 
 afterEach(cleanup);
@@ -165,5 +165,14 @@ describe("conversation addresses", () => {
     expect(conversationPath("thread-1")).toBe("/conversations/thread-1");
     expect(conversationIdFromPath("/conversations/thread-1")).toBe("thread-1");
     expect(conversationIdFromPath("/new")).toBeNull();
+  });
+
+  it("normalizes signed-out, signed-in, and legacy addresses", () => {
+    expect(canonicalPath("/webpages/login.html", false)).toBe("/");
+    expect(canonicalPath("/conversations/thread-1", false)).toBe("/");
+    expect(canonicalPath("/", true)).toBe("/new");
+    expect(canonicalPath("/webpages/login.html", true)).toBe("/new");
+    expect(canonicalPath("/new", true)).toBe("/new");
+    expect(canonicalPath("/conversations/thread-1/", true)).toBe("/conversations/thread-1");
   });
 });

@@ -122,6 +122,13 @@ def _wait_title(client: TestClient, thread_id: str) -> dict[str, Any]:
     raise AssertionError("title was not generated")
 
 
+def test_legacy_login_path_redirects_to_root(api_client: TestClient) -> None:
+    response = api_client.get("/webpages/login.html", follow_redirects=False)
+
+    assert response.status_code == 308
+    assert response.headers["location"] == "/"
+
+
 def test_login_submit_idempotency_handoff_and_cost(api_client: TestClient) -> None:
     owner_id, csrf = _login(api_client, "charles", "charles password")
     headers = {"X-CSRF-Token": csrf, "Origin": "http://testserver"}
