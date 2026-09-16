@@ -24,16 +24,16 @@ button { color: inherit; }
 button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, a:focus-visible { outline: 2px solid #e9bd7f; outline-offset: 2px; }
 
 .brand-lockup { display: inline-flex; align-items: center; gap: .78rem; color: var(--text); line-height: 1; }
-.brand-mark { position: relative; display: inline-block; flex: 0 0 auto; width: 3rem; height: 3rem; border-radius: .78rem; background: #f6f4ee; color: #090909; }
+.brand-mark { position: relative; display: inline-block; flex: 0 0 auto; width: 1.82rem; height: 2.15rem; color: var(--text); }
 .brand-mark::before, .brand-mark::after { position: absolute; top: 50%; width: 1.08rem; height: 1.08rem; border: .16rem solid currentColor; border-radius: 50%; content: ""; transform: translateY(-50%); }
-.brand-mark::before { left: .59rem; }
-.brand-mark::after { right: .59rem; }
+.brand-mark::before { left: 0; }
+.brand-mark::after { right: 0; }
 .brand-wordmark { font-size: 2.15rem; font-weight: 790; letter-spacing: -.075em; }
 .brand-lockup-compact { gap: .5rem; }
-.brand-lockup-compact .brand-mark { width: 2rem; height: 2rem; border-radius: .52rem; }
+.brand-lockup-compact .brand-mark { width: 1.22rem; height: 1.08rem; }
 .brand-lockup-compact .brand-mark::before, .brand-lockup-compact .brand-mark::after { width: .73rem; height: .73rem; border-width: .11rem; }
-.brand-lockup-compact .brand-mark::before { left: .39rem; }
-.brand-lockup-compact .brand-mark::after { right: .39rem; }
+.brand-lockup-compact .brand-mark::before { left: 0; }
+.brand-lockup-compact .brand-mark::after { right: 0; }
 .brand-lockup-compact .brand-wordmark { font-size: 1.08rem; }
 
 .app-loading, .login-page { height: 100%; display: grid; place-items: center; background: radial-gradient(circle at 50% 35%, #242529 0, var(--bg) 42%); }
