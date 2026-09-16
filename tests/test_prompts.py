@@ -87,6 +87,26 @@ def test_internal_communications_redirects_external_editing_but_refines_own_draf
         assert protected_fact in prompt
 
 
+def test_all_modes_are_restrained_professional_copilots() -> None:
+    expected_examples = {
+        "translate.md": ("translation copilot", "terminology choice"),
+        "revision.md": ("editing copilot", "recurring weakness"),
+        "internal_communications.md": ("communications copilot", "missing owner or deadline"),
+    }
+    for name, examples in expected_examples.items():
+        prompt = read_prompt(name)
+        normalized = " ".join(prompt.split())
+        assert all(example in prompt for example in examples)
+        assert "Before starting," in normalized
+        assert "ask a focused question, flag a concern, or" in normalized
+        assert "Do not delay clear," in normalized
+        assert "turn intake into a broad interview" in normalized
+        assert "one to three high-value points" in normalized
+        assert "nothing material to add" in normalized
+        assert "Never manufacture commentary" in normalized
+        assert "at most one concise `advice` block" in normalized
+
+
 def test_locale_ownership_and_isolation_are_explicit() -> None:
     shared = read_prompt("alithya_rules.md")
     translate = read_prompt("translate.md")
