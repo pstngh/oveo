@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from argon2 import extract_parameters
 from argon2.exceptions import InvalidHashError
@@ -199,12 +198,12 @@ def create_app(
 
     @app.get("/{path:path}", include_in_schema=False, response_model=None)
     async def spa(path: str) -> Response:
-        if path.startswith("api/") or path.startswith("health/"):
+        if path.startswith(("api/", "health/")):
             return JSONResponse(
                 status_code=404,
                 content={"code": "not_found", "message": "Endpoint not found."},
             )
-        index = Path(frontend_dir) / "index.html"
+        index = frontend_dir / "index.html"
         if not index.is_file():
             return JSONResponse(
                 status_code=404,

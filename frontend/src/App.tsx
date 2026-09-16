@@ -488,16 +488,22 @@ export default function App() {
   }
   async function createHandoff() {
     if (!detail) return;
-    const { generation_id } = await api.handoff(detail.id, uuid());
-    let current = await api.generation(generation_id);
     setHandoff([]);
-    while (["queued", "running"].includes(current.status)) {
-      await new Promise((resolve) => window.setTimeout(resolve, 700));
-      current = await api.generation(generation_id);
+    try {
+      const { generation_id } = await api.handoff(detail.id, uuid());
+      let current = await api.generation(generation_id);
       setHandoff(current.blocks);
+      while (["queued", "running", "stopping"].includes(current.status)) {
+        await new Promise((resolve) => window.setTimeout(resolve, 700));
+        current = await api.generation(generation_id);
+        setHandoff(current.blocks);
+      }
+      if (current.status !== "completed") setGlobalError(current.error_message ?? "Prompt handoff could not be created.");
+      void api.usage().then((result) => setUsage(result.formatted));
+    } catch (reason) {
+      setHandoff(null);
+      setGlobalError(reason instanceof Error ? reason.message : "Prompt handoff could not be created.");
     }
-    if (current.status !== "completed") setGlobalError(current.error_message ?? "Prompt handoff could not be created.");
-    void api.usage().then((result) => setUsage(result.formatted));
   }
   async function logout() {
     await api.logout();

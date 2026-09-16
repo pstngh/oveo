@@ -1077,7 +1077,7 @@ class GenerationManager:
                 )
                 generation.provider_generation_id = (
                     completion.provider_generation_id or generation.provider_generation_id
-            )
+                )
             if completion.cost_microusd is not None:
                 provider_key = completion.provider_request_id or dedupe_scope or generation.id
                 await append_usage_event(

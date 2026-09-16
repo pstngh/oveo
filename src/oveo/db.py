@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -59,10 +58,6 @@ class Database:
             expire_on_commit=False,
             autoflush=False,
         )
-
-    async def session(self) -> AsyncIterator[AsyncSession]:
-        async with self.sessions() as session:
-            yield session
 
     async def dispose(self) -> None:
         await self.engine.dispose()

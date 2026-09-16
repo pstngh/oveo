@@ -16,7 +16,7 @@ from tiktoken import Encoding
 from .config import Settings
 
 OPENROUTER_MODEL = "openai/gpt-5.6-luna"
-OPENROUTER_PROVIDER_ROUTING: dict[str, object] = {
+_PROVIDER_ROUTING: dict[str, object] = {
     "order": ["azure/eu"],
     "allow_fallbacks": True,
     "data_collection": "deny",
@@ -244,12 +244,7 @@ class OpenRouterClient:
             "stream": True,
             "stream_options": {"include_usage": True},
             "max_completion_tokens": max_completion_tokens,
-            "provider": {
-                "order": ["azure/eu"],
-                "allow_fallbacks": True,
-                "data_collection": "deny",
-                "zdr": True,
-            },
+            "provider": dict(_PROVIDER_ROUTING),
         }
 
     async def stream_chat(
