@@ -270,7 +270,6 @@ export function Composer({
         </div>
       </div>
       {error && <div className="composer-error" role="alert">{error}</div>}
-      <div className="composer-hint">Enter to send · Shift+Enter for a new line</div>
     </div>
   );
 }
@@ -278,7 +277,6 @@ export function Composer({
 export function EmptyThread({ mode, onSelect }: { mode: Mode | null; onSelect: (mode: Mode) => void }) {
   return (
     <div className="empty-thread">
-      <div className="empty-mark"><BrandLogo compact /></div>
       <h1>{mode === "translate" ? "What would you like to translate?" : mode === "alithyagpt" ? "What are you working on?" : "Start a conversation"}</h1>
       {mode === null ? (
         <div className="mode-choices" aria-label="Conversation type">
@@ -288,6 +286,14 @@ export function EmptyThread({ mode, onSelect }: { mode: Mode | null; onSelect: (
       ) : (
         <p>{mode === "translate" ? "Share your direction, audience, and requirements with the source text." : "Draft, revise, translate, or talk through a professional communication."}</p>
       )}
+    </div>
+  );
+}
+
+export function SidebarHeader({ onClose }: { onClose: () => void }) {
+  return (
+    <div className="sidebar-head">
+      <button className="mobile-close icon-button" onClick={onClose} aria-label="Close sidebar"><X /></button>
     </div>
   );
 }
@@ -511,7 +517,7 @@ export default function App() {
     <div className="app-shell">
       <button className="mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar"><Menu /></button>
       <aside className={sidebarOpen ? "sidebar open" : "sidebar"}>
-        <div className="sidebar-head"><BrandLogo compact /><button className="mobile-close icon-button" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar"><X /></button></div>
+        <SidebarHeader onClose={() => setSidebarOpen(false)} />
         <button className="new-button" onClick={startNewConversation}><Plus /> New</button>
         {user.role === "owner" && (
           <label className="account-picker"><span>Viewing</span><select value={owner?.id} onChange={(e) => changeOwner(e.target.value)}>{accounts.map((account) => <option value={account.id} key={account.id}>{account.display_name}</option>)}</select></label>

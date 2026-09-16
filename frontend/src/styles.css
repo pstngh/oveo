@@ -49,7 +49,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 .app-shell { height: 100%; height: 100dvh; min-height: 0; display: grid; grid-template-columns: 288px minmax(0, 1fr); overflow: hidden; background: var(--bg); }
 .sidebar { min-height: 0; display: flex; flex-direction: column; padding: 14px 12px 10px; border-right: 1px solid #2c2d30; background: #202124; }
-.sidebar-head { height: 48px; display: flex; align-items: center; justify-content: space-between; padding: 0 8px; }
+.sidebar-head { display: none; }
 .new-button { height: 42px; display: flex; align-items: center; justify-content: center; gap: 8px; margin: 12px 2px 14px; border: 1px solid #424348; border-radius: 9px; background: #2a2b2f; font-weight: 650; cursor: pointer; }
 .new-button:hover { background: #313236; }
 .new-button svg { width: 18px; }
@@ -120,16 +120,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .attachment-chip button { width: 22px; height: 22px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 50%; background: transparent; cursor: pointer; }
 .attachment-chip button:hover { background: #45464b; }
 .attachment-chip button svg { width: 13px; }
-.composer-hint { margin-top: 7px; color: #6f706d; text-align: center; font-size: .7rem; }
 .composer-error { padding: 6px 8px 0; }
 .retry-button { display: flex; align-items: center; gap: 6px; margin: 0 auto 8px; padding: 6px 11px; border: 1px solid #4a4138; border-radius: 8px; color: #e4c499; background: #29241f; cursor: pointer; font-size: .82rem; }
 .retry-button svg { width: 14px; }
 .empty-thread { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 32px 24px 14vh; text-align: center; }
-.empty-mark { margin-bottom: 24px; opacity: .9; }
 .empty-thread h1 { margin: 0 0 9px; font-size: clamp(1.5rem, 3vw, 2.05rem); font-weight: 550; letter-spacing: -.035em; }
 .empty-thread p { max-width: 520px; margin: 0; color: var(--muted); line-height: 1.55; }
 .empty-thread .mode-choices { width: min(520px, 100%); margin-top: 20px; text-align: left; }
-.empty-thread .mode-choices > button { min-height: 140px; }
+.empty-thread .mode-choices > button { min-height: 140px; align-items: center; justify-content: center; text-align: center; }
 
 .modal-backdrop { position: fixed; z-index: 50; inset: 0; display: grid; place-items: center; padding: 18px; background: rgba(8,9,10,.7); backdrop-filter: blur(6px); }
 .modal { width: min(520px, 100%); max-height: calc(100vh - 36px); overflow: auto; padding: 18px; border: 1px solid #44454a; border-radius: 14px; background: #242529; box-shadow: 0 30px 90px rgba(0,0,0,.48); }
@@ -160,6 +158,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .app-shell { display: block; }
   .sidebar { position: fixed; z-index: 40; inset: 0 auto 0 0; width: min(310px, 88vw); transform: translateX(-103%); transition: transform .2s ease; box-shadow: 20px 0 60px rgba(0,0,0,.5); }
   .sidebar.open { transform: translateX(0); }
+  .sidebar-head { height: 48px; display: flex; align-items: center; justify-content: flex-end; padding: 0 8px; }
   .mobile-menu { position: fixed; z-index: 20; top: 12px; left: 12px; width: 40px; height: 40px; display: grid; place-items: center; padding: 0; border: 1px solid #3b3c40; border-radius: 9px; background: rgba(35,36,39,.9); }
   .mobile-menu svg { width: 19px; }
   .mobile-close { display: grid; }
@@ -168,7 +167,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .messages { padding-top: 62px; }
   .message-inner, .message.user .message-inner { width: calc(100% - 28px); margin: 0 auto; }
   .composer-wrap { width: calc(100% - 20px); padding-bottom: 8px; }
-  .composer-hint { display: none; }
   .mode-choices { grid-template-columns: 1fr; }
 }
 

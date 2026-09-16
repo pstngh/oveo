@@ -1,7 +1,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Composer, conversationIdFromPath, conversationPath, EmptyThread, MessageList, ResponseBlocks } from "./App";
+import { Composer, conversationIdFromPath, conversationPath, EmptyThread, MessageList, ResponseBlocks, SidebarHeader } from "./App";
 import type { ThreadDetail } from "./types";
 
 afterEach(cleanup);
@@ -20,6 +20,12 @@ describe("deliverable copy", () => {
 });
 
 describe("composer attachments", () => {
+  it("does not render keyboard shortcut hint text", () => {
+    render(<Composer activeGeneration={null} onSend={vi.fn()} onStop={vi.fn()} onRetry={vi.fn()} />);
+
+    expect(screen.queryByText("Enter to send · Shift+Enter for a new line")).not.toBeInTheDocument();
+  });
+
   it("shows prompt handoff as a compact composer icon", async () => {
     const user = userEvent.setup();
     const onCreateHandoff = vi.fn();
@@ -68,6 +74,7 @@ describe("new conversation mode selection", () => {
     render(<EmptyThread mode={null} onSelect={onSelect} />);
 
     expect(screen.getByRole("heading", { name: "Start a conversation" })).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: "Oveo" })).not.toBeInTheDocument();
     expect(screen.queryByText("Choose Translate or AlithyaGPT to begin.")).not.toBeInTheDocument();
     expect(screen.queryByText("Writing voices")).not.toBeInTheDocument();
 
@@ -81,6 +88,18 @@ describe("new conversation mode selection", () => {
     expect(screen.getByRole("heading", { name: "What are you working on?" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Translate/ })).not.toBeInTheDocument();
     expect(screen.getByText("Draft, revise, translate, or talk through a professional communication.")).toBeInTheDocument();
+  });
+});
+
+describe("sidebar header", () => {
+  it("keeps the mobile close control without Oveo branding", async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    render(<SidebarHeader onClose={onClose} />);
+
+    expect(screen.queryByRole("img", { name: "Oveo" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Close sidebar" }));
+    expect(onClose).toHaveBeenCalledOnce();
   });
 });
 
