@@ -37,6 +37,14 @@ def test_alithyagpt_restores_translation_task_without_placeholder_profiles() -> 
     assert "[to be completed]" not in prompt
 
 
+def test_language_neutral_new_conversations_default_to_english() -> None:
+    for name in ("translate.md", "alithyagpt.md"):
+        prompt = read_prompt(name)
+        assert "language-neutral" in prompt
+        assert "default to English" in prompt
+        assert "standalone `test` or `OK`" in prompt
+
+
 def test_protocol_has_a_closed_versioned_event_grammar() -> None:
     protocol = read_prompt("protocol.md")
     for event in (
