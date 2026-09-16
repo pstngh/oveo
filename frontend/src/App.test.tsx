@@ -38,6 +38,7 @@ describe("composer attachments", () => {
     render(<Composer activeGeneration={null} onSend={vi.fn()} onStop={vi.fn()} onRetry={vi.fn()} />);
 
     expect(screen.queryByText("Enter to send · Shift+Enter for a new line")).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveAttribute("rows", "3");
   });
 
   it("shows prompt handoff as a compact composer icon", async () => {

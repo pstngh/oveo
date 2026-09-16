@@ -289,7 +289,7 @@ export function Composer({
           onChange={(event) => setText(event.target.value)}
           onPaste={pasted}
           onKeyDown={keyDown}
-          rows={1}
+          rows={3}
           disabled={Boolean(generating)}
         />
         <div className="composer-actions">

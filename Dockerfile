@@ -16,6 +16,10 @@ COPY src/ ./src/
 # The wheel metadata names README.md, but runtime images do not need documentation.
 RUN printf '# Oveo\n' > README.md \
     && python -m pip install --prefix=/install .
+RUN mkdir -p /build/tiktoken-cache \
+    && TIKTOKEN_CACHE_DIR=/build/tiktoken-cache \
+       PYTHONPATH=/install/lib/python3.13/site-packages \
+       python -c 'import tiktoken; tiktoken.get_encoding("o200k_base")'
 
 FROM python:3.13-slim-bookworm AS runtime
 ARG VCS_REF=unknown
@@ -30,7 +34,8 @@ ENV PYTHONUNBUFFERED=1 \
     OVEO_DATABASE_URL=sqlite+aiosqlite:////data/oveo.sqlite3 \
     OVEO_ATTACHMENTS_DIR=/data/attachments \
     OVEO_FRONTEND_DIR=/app/frontend \
-    OVEO_PROMPTS_DIR=/app/prompts
+    OVEO_PROMPTS_DIR=/app/prompts \
+    TIKTOKEN_CACHE_DIR=/app/tiktoken-cache
 
 RUN groupadd --gid 10001 oveo \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /app oveo \
@@ -38,6 +43,7 @@ RUN groupadd --gid 10001 oveo \
     && chown 10001:10001 /app /data
 
 COPY --from=python-build /install/ /usr/local/
+COPY --from=python-build --chown=10001:10001 /build/tiktoken-cache/ /app/tiktoken-cache/
 COPY --from=frontend-build --chown=10001:10001 /build/frontend/dist/ /app/frontend/
 COPY --chown=10001:10001 alembic.ini /app/alembic.ini
 COPY --chown=10001:10001 migrations/ /app/migrations/

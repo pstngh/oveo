@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -23,6 +24,7 @@ from oveo.generation import (
     UnavailableProvider,
 )
 from oveo.models import User
+from oveo.provider import warm_tokenizer
 
 
 def _validated_argon2id_hash(encoded: str, *, username: str) -> str:
@@ -120,6 +122,9 @@ def create_app(
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         validate_production_settings(app_settings)
         app_settings.ensure_directories()
+        # Tokenizer initialization performs synchronous cache I/O. Finish it before the
+        # server reports readiness so the first generation cannot stall every request.
+        await asyncio.to_thread(warm_tokenizer)
         await seed_configured_accounts(app_database, app_settings)
         await manager.reconcile_orphans()
         await manager.reconcile_pending_costs()

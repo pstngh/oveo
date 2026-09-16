@@ -57,6 +57,12 @@ def _model_encoding() -> Encoding:
     return tiktoken.encoding_for_model(OPENROUTER_MODEL.partition("/")[2])
 
 
+def warm_tokenizer() -> None:
+    """Load the model tokenizer before the server begins accepting requests."""
+
+    _model_encoding()
+
+
 def count_input_tokens(messages: Sequence[ProviderMessage]) -> int:
     """Count model input tokens with a small allowance for chat framing.
 
