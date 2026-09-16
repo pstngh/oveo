@@ -11,13 +11,14 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
 from sqlalchemy import func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from oveo.attachments import ValidatedAttachment, count_words, persist_attachment
 from oveo.config import Settings
 from oveo.context import (
+    HANDOFF_SENTINEL,
     AttachmentText,
     build_handoff_merge_messages,
     build_provider_messages,
@@ -48,7 +49,6 @@ from oveo.protocol import (
     ProtocolEvent,
     ReplaceState,
     SourceOutputReplacement,
-    StateOperation,
 )
 from oveo.provider import OpenRouterClient, ProviderMessage, count_input_tokens
 from oveo.provider import ProviderError as OpenRouterError
@@ -88,6 +88,18 @@ class ProviderError(RuntimeError):
         self.provider_request_id = provider_request_id
         self.provider_generation_id = provider_generation_id
         self.cost_microusd = cost_microusd
+
+
+class StaleStateError(RuntimeError):
+    """The model targeted canonical state that is no longer current."""
+
+
+class StatePersistenceError(RuntimeError):
+    """A valid visible response could not be applied to canonical state."""
+
+
+class SummaryFormatError(ValueError):
+    """A maintenance summary did not satisfy its closed response schema."""
 
 
 def _snapshot_messages(
@@ -191,8 +203,13 @@ class OpenRouterProvider:
             )
         except OpenRouterError as exc:
             # OpenRouterClient has already exhausted safe pre-content retries.
+            code = (
+                "provider_stream_error"
+                if exc.code in {"provider_incomplete_stream", "provider_malformed_stream"}
+                else exc.code
+            )
             raise ProviderError(
-                exc.code,
+                code,
                 provider_request_id=exc.provider_request_id,
                 provider_generation_id=exc.provider_generation_id,
                 cost_microusd=(exc.usage.cost_microusd if exc.usage else None),
@@ -222,11 +239,32 @@ _ERROR_MESSAGES = {
     "provider_network": "The model provider could not be reached.",
     "provider_transient": "The model provider is temporarily unavailable.",
     "provider_rejected": "The model provider rejected the request.",
-    "provider_invalid_stream": "The model provider returned an invalid response.",
+    "provider_stream_error": (
+        "The model provider returned an incomplete or invalid response stream."
+    ),
     "protocol_error": "The model returned an invalid response format.",
+    "stale_state": (
+        "The saved work changed before this response could be applied. "
+        "Retry to use the latest version."
+    ),
+    "state_persistence_failed": (
+        "The response was generated, but its document update could not be saved. "
+        "The visible response is preserved; retry before continuing."
+    ),
     "context_compaction_failed": "Oveo could not safely fit this conversation in context.",
+    "handoff_turn_too_large": (
+        "One user turn is too large to create a safe prompt handoff. "
+        "Split that turn into smaller messages and try again."
+    ),
     "restart_interrupted": "Generation was interrupted by an application restart.",
     "provider_error": "Oveo could not complete this response.",
+}
+
+_APPEND_SEPARATORS = {
+    "none": "",
+    "space": " ",
+    "line": "\n",
+    "paragraph": "\n\n",
 }
 
 
@@ -256,6 +294,68 @@ def _apply_base_replacements(
     for start, end, replacement in reversed(ordered):
         result = f"{result[:start]}{replacement}{result[end:]}"
     return result
+
+
+def _append_text(base: str, addition: str, separator: str) -> str:
+    try:
+        joiner = _APPEND_SEPARATORS[separator]
+    except KeyError as exc:  # Defensive: the decoder owns the closed enum.
+        raise ProtocolError("invalid_append_separator") from exc
+    return f"{base}{joiner}{addition}"
+
+
+def _validate_visible_state_correspondence(
+    document: ProtocolDocument,
+    *,
+    resulting_output: str,
+) -> None:
+    """Require one unambiguous visible representation for every mutation."""
+
+    state = document.state
+    if isinstance(state, NoState):
+        return
+    deliverables = [block.text for block in document.blocks if block.type == "deliverable"]
+    if len(deliverables) != 1:
+        raise ProtocolError("state_deliverable_count_mismatch")
+    visible = deliverables[0]
+    if isinstance(state, AppendState):
+        # Append deliberately displays just the new passage by default, while a user may
+        # explicitly request the complete updated document.
+        if visible not in {state.output_addition, resulting_output}:
+            raise ProtocolError("state_deliverable_mismatch")
+        return
+    if visible != resulting_output:
+        raise ProtocolError("state_deliverable_mismatch")
+
+
+def _parse_context_summary(raw: bytes) -> str:
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SummaryFormatError from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "version",
+        "summary",
+        "unresolved",
+    }:
+        raise SummaryFormatError
+    version = payload.get("version")
+    summary = payload.get("summary")
+    unresolved = payload.get("unresolved")
+    if (
+        isinstance(version, bool)
+        or version != 1
+        or not isinstance(summary, str)
+        or not summary.strip()
+        or not isinstance(unresolved, list)
+        or any(not isinstance(item, str) for item in unresolved)
+    ):
+        raise SummaryFormatError
+    compacted = summary.strip()
+    unresolved_text = [item.strip() for item in unresolved if item.strip()]
+    if unresolved_text:
+        compacted += "\n\nUnresolved:\n" + "\n".join(f"- {item}" for item in unresolved_text)
+    return compacted
 
 
 class GenerationManager:
@@ -766,6 +866,22 @@ class GenerationManager:
                     "This generation cannot be retried.",
                     status_code=409,
                 )
+            if original.thread_id is None:
+                raise GenerationError(
+                    "generation_not_retryable",
+                    "This generation cannot be retried.",
+                    status_code=409,
+                )
+            thread = await db.get(Thread, original.thread_id)
+            if thread is None:
+                raise GenerationError(
+                    "thread_not_found", "Conversation not found.", status_code=404
+                )
+            request_snapshot = await self._request_snapshot(
+                db,
+                thread,
+                purpose=original.purpose,
+            )
             retry = Generation(
                 id=new_id(),
                 thread_id=original.thread_id,
@@ -775,7 +891,7 @@ class GenerationManager:
                 client_request_id=client_request_id,
                 purpose=original.purpose,
                 status="queued",
-                request_snapshot=original.request_snapshot,
+                request_snapshot=request_snapshot,
             )
             db.add(retry)
             try:
@@ -919,60 +1035,82 @@ class GenerationManager:
         completion: ProviderCompletion,
     ) -> None:
         blocks = cast(list[dict[str, str]], document.to_storage()["blocks"])
-        async with self.database.sessions() as db:
-            generation = await db.get(Generation, generation_id)
-            if generation is None:
-                return
-            if generation.status == "stopping":
-                await self._mark_stopped(db, generation)
-                await db.commit()
-                return
-            if generation.status != "running":
-                return
-            if generation.purpose != "chat" and not isinstance(document.state, NoState):
-                raise ProtocolError("state_invalid_purpose")
-            if generation.purpose == "chat" and generation.thread_id is not None:
-                thread = await db.get(Thread, generation.thread_id)
-                if thread is None:
-                    raise ProtocolError("state_thread_missing")
-                ordinal = (
-                    int(
-                        await db.scalar(
-                            select(func.coalesce(func.max(Message.ordinal), 0)).where(
-                                Message.thread_id == generation.thread_id
+        mutates_state = not isinstance(document.state, NoState)
+        try:
+            async with self.database.sessions() as db:
+                generation = await db.get(Generation, generation_id)
+                if generation is None:
+                    return
+                if generation.status == "stopping":
+                    await self._mark_stopped(db, generation)
+                    await db.commit()
+                    return
+                if generation.status != "running":
+                    return
+                if generation.purpose != "chat" and mutates_state:
+                    raise ProtocolError("state_invalid_purpose")
+                if generation.purpose == "prompt_handoff" and (
+                    len(document.blocks) != 1
+                    or document.blocks[0].type != "deliverable"
+                    or HANDOFF_SENTINEL in document.blocks[0].text
+                ):
+                    raise ProtocolError("invalid_handoff_response")
+                if generation.purpose == "chat" and generation.thread_id is not None:
+                    thread = await db.get(Thread, generation.thread_id)
+                    if thread is None:
+                        raise ProtocolError("state_thread_missing")
+                    ordinal = (
+                        int(
+                            await db.scalar(
+                                select(func.coalesce(func.max(Message.ordinal), 0)).where(
+                                    Message.thread_id == generation.thread_id
+                                )
                             )
+                            or 0
                         )
-                        or 0
+                        + 1
                     )
-                    + 1
-                )
-                message = Message(
-                    id=new_id(),
-                    thread_id=generation.thread_id,
-                    ordinal=ordinal,
-                    role="assistant",
-                    actor_user_id=None,
-                    content=blocks,
-                )
-                db.add(message)
-                # Ensure the assistant row exists before updating the generation's
-                # result-message foreign key.
-                await db.flush()
-                await self._apply_state_operation(
-                    db,
-                    generation=generation,
-                    thread=thread,
-                    state=document.state,
-                )
-                generation.result_message_id = message.id
-                thread.updated_at = utc_now()
-            generation.partial_blocks = blocks
-            generation.provider_request_id = completion.provider_request_id
-            generation.provider_generation_id = completion.provider_generation_id
-            generation.status = "completed"
-            generation.finished_at = utc_now()
-            generation.stream_revision += 1
-            await db.commit()
+                    message = Message(
+                        id=new_id(),
+                        thread_id=generation.thread_id,
+                        ordinal=ordinal,
+                        role="assistant",
+                        actor_user_id=None,
+                        content=blocks,
+                    )
+                    db.add(message)
+                    # Ensure the assistant row exists before updating the generation's
+                    # result-message foreign key.
+                    await db.flush()
+                    try:
+                        await self._apply_state_operation(
+                            db,
+                            generation=generation,
+                            thread=thread,
+                            document=document,
+                        )
+                    except ProtocolError as exc:
+                        if exc.code in {
+                            "state_deliverable_count_mismatch",
+                            "state_deliverable_mismatch",
+                        }:
+                            raise
+                        if exc.code in {"state_base_missing", "state_base_mismatch"}:
+                            raise StaleStateError from exc
+                        raise StatePersistenceError from exc
+                    generation.result_message_id = message.id
+                    thread.updated_at = utc_now()
+                generation.partial_blocks = blocks
+                generation.provider_request_id = completion.provider_request_id
+                generation.provider_generation_id = completion.provider_generation_id
+                generation.status = "completed"
+                generation.finished_at = utc_now()
+                generation.stream_revision += 1
+                await db.commit()
+        except SQLAlchemyError as exc:
+            if mutates_state:
+                raise StatePersistenceError from exc
+            raise
         await self._notify(generation_id)
 
     async def _apply_state_operation(
@@ -981,10 +1119,11 @@ class GenerationManager:
         *,
         generation: Generation,
         thread: Thread | None,
-        state: StateOperation,
+        document: ProtocolDocument,
     ) -> None:
         """Validate and persist one hidden canonical mutation in the response commit."""
 
+        state = document.state
         if thread is None:
             raise ProtocolError("state_thread_missing")
         if isinstance(state, NoState):
@@ -1038,8 +1177,9 @@ class GenerationManager:
             operation = state.operation
 
             if isinstance(state, AppendState):
-                source = f"{source}\n\n{state.source_addition}"
-                output = f"{output}\n\n{state.output_addition}"
+                source = _append_text(source, state.source_addition, state.source_separator)
+                output = _append_text(output, state.output_addition, state.output_separator)
+                brief = state.brief if state.brief is not None else brief
             elif isinstance(state, ReplaceState):
                 source_replacements: list[tuple[str, str]] = []
                 output_replacements: list[tuple[str, str]] = []
@@ -1055,6 +1195,7 @@ class GenerationManager:
                     )
                 source = _apply_base_replacements(source, source_replacements, label="source")
                 output = _apply_base_replacements(output, output_replacements, label="output")
+                brief = state.brief if state.brief is not None else brief
             elif isinstance(state, FullState):
                 source = state.source if state.source is not None else source
                 output = state.output
@@ -1062,6 +1203,7 @@ class GenerationManager:
             else:  # pragma: no cover - kept defensive for future protocol variants
                 raise ProtocolError("invalid_state_operation")
 
+        _validate_visible_state_correspondence(document, resulting_output=output)
         if not source.strip() or not output.strip() or not brief:
             raise ProtocolError("invalid_canonical_state")
         source_word_count = count_words(source)
@@ -1374,64 +1516,69 @@ class GenerationManager:
         cutoff: int,
         summary_snapshot: Mapping[str, Any],
     ) -> str:
-        parts: list[bytes] = []
+        def bounded_collector(parts: list[bytes]) -> EmitChunk:
+            async def collect(chunk: bytes) -> None:
+                if sum(map(len, parts)) + len(chunk) > 131_072:
+                    raise ProviderError("context_compaction_failed")
+                parts.append(chunk)
 
-        async def collect(chunk: bytes) -> None:
-            if sum(map(len, parts)) + len(chunk) > 131_072:
-                raise ProviderError("context_compaction_failed")
-            parts.append(chunk)
+            return collect
 
-        request = ProviderRequest(
-            generation_id=f"{generation.id}:summary:{cutoff}",
-            purpose="summary",
-            mode=str(summary_snapshot.get("mode", "translate")),
-            snapshot=summary_snapshot,
-        )
-        try:
-            completion = await self.provider.generate(request, collect, asyncio.Event())
-            await self._record_provider_completion(
-                generation.id,
-                completion,
+        for attempt in range(1, 3):
+            if attempt == 2:
+                async with self.database.sessions() as db:
+                    await append_usage_event(
+                        db,
+                        dedupe_key=f"{generation.id}:summary:{cutoff}:retry:pending",
+                        event_type="pending",
+                        purpose="summary",
+                        amount_microusd=None,
+                        generation_id=generation.id,
+                        thread_id=generation.thread_id,
+                        requester_id=generation.requester_id,
+                        provider_request_id=None,
+                    )
+                    await db.commit()
+
+            parts: list[bytes] = []
+            collect = bounded_collector(parts)
+
+            request = ProviderRequest(
+                generation_id=f"{generation.id}:summary:{cutoff}:attempt:{attempt}",
                 purpose="summary",
-                record_ids=False,
+                mode=str(summary_snapshot.get("mode", "translate")),
+                snapshot=summary_snapshot,
             )
-            raw = b"".join(parts).decode("utf-8")
-            payload = json.loads(raw)
-            if not isinstance(payload, dict) or set(payload) != {
-                "version",
-                "summary",
-                "unresolved",
-            }:
-                raise ProviderError("context_compaction_failed")
-            summary = payload.get("summary")
-            unresolved = payload.get("unresolved")
-            if (
-                payload.get("version") != 1
-                or not isinstance(summary, str)
-                or not summary.strip()
-                or not isinstance(unresolved, list)
-                or any(not isinstance(item, str) for item in unresolved)
-            ):
-                raise ProviderError("context_compaction_failed")
-            compacted = summary.strip()
-            unresolved_text = [item.strip() for item in unresolved if item.strip()]
-            if unresolved_text:
-                compacted += "\n\nUnresolved:\n" + "\n".join(
-                    f"- {item}" for item in unresolved_text
+            try:
+                completion = await self.provider.generate(request, collect, asyncio.Event())
+                await self._record_provider_completion(
+                    generation.id,
+                    completion,
+                    purpose="summary",
+                    record_ids=False,
+                    dedupe_scope=request.generation_id,
                 )
-            return compacted
-        except (ProviderError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            error = (
-                exc
-                if isinstance(exc, ProviderError)
-                else ProviderError("context_compaction_failed")
-            )
-            await self._record_provider_error(
-                generation.id,
-                error,
-                purpose="summary",
-            )
-            raise error from exc
+            except ProviderError as exc:
+                await self._record_provider_error(
+                    generation.id,
+                    exc,
+                    purpose="summary",
+                )
+                raise
+
+            try:
+                return _parse_context_summary(b"".join(parts))
+            except SummaryFormatError as exc:
+                if attempt == 1:
+                    continue
+                error = ProviderError("context_compaction_failed")
+                await self._record_provider_error(
+                    generation.id,
+                    error,
+                    purpose="summary",
+                )
+                raise error from exc
+        raise AssertionError("summary attempt loop did not return or raise")
 
     async def _compact_handoff_context(self, generation: Generation) -> Mapping[str, Any]:
         budget = self.settings.context_compaction_tokens
@@ -1472,7 +1619,9 @@ class GenerationManager:
                     else:
                         high = middle - 1
                 if best_end is None or best_snapshot is None:
-                    raise ProviderError("context_compaction_failed")
+                    # Ordinal bounds cannot split one user-authored turn without changing
+                    # its structure. Fail explicitly so the user can split that turn.
+                    raise ProviderError("handoff_turn_too_large")
                 chunks.append(best_snapshot)
                 after_ordinal = user_ordinals[best_end]
                 start = best_end + 1
@@ -1595,6 +1744,7 @@ class GenerationManager:
                 not isinstance(document.state, NoState)
                 or len(document.blocks) != 1
                 or document.blocks[0].type != "deliverable"
+                or HANDOFF_SENTINEL in document.blocks[0].text
             ):
                 raise ProviderError("context_compaction_failed")
             await self._record_provider_completion(
@@ -1618,12 +1768,76 @@ class GenerationManager:
             )
             raise error from exc
 
-    async def _fail(self, generation_id: str, code: str) -> None:
+    async def _prepare_protocol_retry(self, generation_id: str) -> bool:
+        """Reset only an attempt that has not exposed substantive visible content."""
+
+        async with self.database.sessions() as db:
+            generation = await db.get(Generation, generation_id)
+            if generation is None or generation.status != "running":
+                return False
+            blocks = (
+                generation.partial_blocks if isinstance(generation.partial_blocks, list) else []
+            )
+            if any(
+                isinstance(block, dict)
+                and isinstance(block.get("text"), str)
+                and cast(str, block["text"]).strip()
+                for block in blocks
+            ):
+                return False
+            generation.partial_blocks = []
+            generation.stream_revision += 1
+            await append_usage_event(
+                db,
+                dedupe_key=f"{generation.id}:protocol_retry:pending",
+                event_type="pending",
+                purpose=generation.purpose,
+                amount_microusd=None,
+                generation_id=generation.id,
+                thread_id=generation.thread_id,
+                requester_id=generation.requester_id,
+                provider_request_id=None,
+            )
+            await db.commit()
+        await self._notify(generation_id)
+        return True
+
+    @staticmethod
+    def _protocol_retry_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+        messages = _snapshot_messages(snapshot, error_code="invalid_request_snapshot")
+        if not messages or messages[0].role != "system":
+            raise ProviderError("invalid_request_snapshot")
+        reminder = (
+            "\n\nPROTOCOL RETRY: The preceding attempt failed strict response-protocol "
+            "validation before any substantive visible content was accepted. Regenerate "
+            "the response from the same data. Emit only the exact NDJSON grammar already "
+            "specified; do not quote, explain, loosen, or work around it."
+        )
+        repaired = [
+            ProviderMessage(role="system", content=messages[0].content + reminder),
+            *messages[1:],
+        ]
+        return {
+            "schema_version": 1,
+            "mode": str(snapshot.get("mode", "translate")),
+            "provider_messages": [
+                {"role": message.role, "content": message.content} for message in repaired
+            ],
+        }
+
+    async def _fail(
+        self,
+        generation_id: str,
+        code: str,
+        *,
+        preserve_blocks: bool = False,
+    ) -> None:
         async with self.database.sessions() as db:
             generation = await db.get(Generation, generation_id)
             if generation is not None and generation.status in _ACTIVE:
                 generation.status = "failed"
-                generation.partial_blocks = []
+                if not preserve_blocks:
+                    generation.partial_blocks = []
                 generation.error_code = code if code in _ERROR_MESSAGES else "provider_error"
                 generation.finished_at = utc_now()
                 generation.stream_revision += 1
@@ -1637,28 +1851,46 @@ class GenerationManager:
                 return
             await self._notify(generation_id)
             request_snapshot = await self._maybe_compact_context(generation)
-            request = ProviderRequest(
-                generation_id=generation.id,
-                purpose=generation.purpose,
-                mode=str(request_snapshot.get("mode", "translate")),
-                snapshot=request_snapshot,
-            )
-            decoder = ProtocolDecoder()
 
-            async def emit(chunk: bytes) -> None:
-                if cancel_event.is_set():
-                    raise asyncio.CancelledError
-                await self._record_events(generation_id, decoder.feed(chunk))
+            def protocol_emitter(attempt_decoder: ProtocolDecoder) -> EmitChunk:
+                async def emit(chunk: bytes) -> None:
+                    if cancel_event.is_set():
+                        raise asyncio.CancelledError
+                    await self._record_events(
+                        generation_id,
+                        attempt_decoder.feed(chunk),
+                    )
+
+                return emit
 
             try:
-                completion = await self.provider.generate(request, emit, cancel_event)
-                await self._record_provider_completion(
-                    generation_id,
-                    completion,
-                    purpose=generation.purpose,
-                )
-                document = decoder.finish()
-                await self._commit_success(generation_id, document, completion)
+                for attempt in range(2):
+                    request = ProviderRequest(
+                        generation_id=(
+                            generation.id if attempt == 0 else f"{generation.id}:protocol-retry"
+                        ),
+                        purpose=generation.purpose,
+                        mode=str(request_snapshot.get("mode", "translate")),
+                        snapshot=request_snapshot,
+                    )
+                    decoder = ProtocolDecoder()
+                    emit = protocol_emitter(decoder)
+
+                    try:
+                        completion = await self.provider.generate(request, emit, cancel_event)
+                        await self._record_provider_completion(
+                            generation_id,
+                            completion,
+                            purpose=generation.purpose,
+                            dedupe_scope=request.generation_id,
+                        )
+                        document = decoder.finish()
+                        await self._commit_success(generation_id, document, completion)
+                        break
+                    except ProtocolError:
+                        if attempt != 0 or not await self._prepare_protocol_retry(generation_id):
+                            raise
+                        request_snapshot = self._protocol_retry_snapshot(request_snapshot)
                 if generation.purpose == "chat" and generation.thread_id is not None:
                     await self._maybe_generate_title(generation.id, generation.thread_id)
             except ProviderError as error:
@@ -1670,6 +1902,14 @@ class GenerationManager:
                 await self._fail(generation_id, error.code)
             except ProtocolError:
                 await self._fail(generation_id, "protocol_error")
+            except StaleStateError:
+                await self._fail(generation_id, "stale_state", preserve_blocks=True)
+            except StatePersistenceError:
+                await self._fail(
+                    generation_id,
+                    "state_persistence_failed",
+                    preserve_blocks=True,
+                )
         except asyncio.CancelledError:
             await asyncio.shield(self._finish_stopped(generation_id))
         except ProviderError as error:

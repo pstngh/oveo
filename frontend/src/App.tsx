@@ -247,6 +247,9 @@ export function MessageList({ detail, generation }: { detail: ThreadDetail; gene
       {generation && ["queued", "running", "stopping"].includes(generation.status) && (
         <article className="message assistant pending"><div className="message-inner"><ResponseBlocks blocks={generation.blocks} streaming /></div></article>
       )}
+      {generation?.status === "failed" && generation.blocks.length > 0 && (
+        <article className="message assistant preserved"><div className="message-inner"><ResponseBlocks blocks={generation.blocks} /></div></article>
+      )}
       {generation && ["failed", "stopped"].includes(generation.status) && (
         <div className="generation-notice" role="status">
           <span>{generation.status === "stopped" ? "Generation stopped." : generation.error_message ?? "Oveo could not complete this response."}</span>

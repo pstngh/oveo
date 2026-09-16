@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { useState } from "react";
 import App, { canonicalPath, Composer, conversationIdFromPath, conversationPath, EmptyThread, Login, MessageList, Modal, ResponseBlocks, SidebarHeader } from "./App";
 import { api } from "./api";
-import type { ThreadDetail } from "./types";
+import type { GenerationSnapshot, ThreadDetail } from "./types";
 
 afterEach(() => {
   cleanup();
@@ -257,6 +257,37 @@ describe("conversation scrolling", () => {
     render(<MessageList detail={detail} generation={null} />);
     expect(screen.getByText("charles")).toBeInTheDocument();
     expect(screen.queryByText("yousra")).not.toBeInTheDocument();
+  });
+
+  it("keeps a valid streamed deliverable visible when canonical persistence fails", () => {
+    const detail = {
+      id: "thread-1",
+      owner_id: "user-1",
+      owner_username: "charles",
+      mode: "translate",
+      title: "Persistence failure",
+      updated_at: "2026-09-16T00:00:00Z",
+      active_generation_id: null,
+      messages: [],
+    } satisfies ThreadDetail;
+    const generation = {
+      id: "generation-1",
+      thread_id: "thread-1",
+      status: "failed",
+      blocks: [{ type: "deliverable", text: "Preserved translated text." }],
+      error_code: "state_persistence_failed",
+      error_message: "The response was generated, but its document update could not be saved.",
+      retryable: true,
+      seq: 3,
+    } satisfies GenerationSnapshot;
+
+    render(<MessageList detail={detail} generation={generation} />);
+
+    expect(screen.getByRole("region", { name: "Deliverable" })).toHaveTextContent(
+      "Preserved translated text.",
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("document update could not be saved");
+    expect(screen.queryByLabelText("Generating")).not.toBeInTheDocument();
   });
 });
 

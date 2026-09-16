@@ -24,7 +24,8 @@ Every object has exactly the allowed keys and `"v":1`.
 
 2. Emit one or more closed visible blocks. IDs are response-local, consecutive,
    and begin with `b1`. Every block has exactly one start, one or more non-empty
-   deltas, and one end:
+   deltas, substantive non-whitespace completed text, and one end. An individual
+   delta may contain only whitespace when it is part of a substantive block:
 
    `{"v":1,"event":"block_start","id":"b1","type":"conversation"}`
 
@@ -62,6 +63,13 @@ The only valid block layouts are one `conversation` block, or one or more
 No `conversation` block may appear with a deliverable layout. Each independently
 copyable alternative uses a separate deliverable block.
 
+A response that mutates canonical state must contain exactly one `deliverable`;
+multiple alternatives are necessarily unresolved and use `none`. For `establish`
+and `full`, that deliverable must exactly equal the operation's complete output.
+For `replace`, it must exactly equal the complete output after all replacements.
+For `append`, it must equal either the exact `output_addition` (the normal display)
+or the complete joined output when the user explicitly requested the whole work.
+
 ## Canonical-state schemas
 
 Every response has exactly one hidden `state` event. Use exactly one closed schema;
@@ -77,15 +85,20 @@ complete strings and `brief` is a non-empty JSON object:
 `{"v":1,"event":"state","operation":"establish","source":"complete source","output":"complete output","brief":{"scope":"complete brief"}}`
 
 Append exact additions. `base_version` is the positive integer copied from trusted
-application-managed canonical state. The application inserts its own separator:
+application-managed canonical state. Declare both deterministic separators using
+exactly one of `none`, `space`, `line`, or `paragraph`; these insert `""`, `" "`,
+`"\n"`, or `"\n\n"`, respectively. Choose deliberately to preserve paragraphs,
+list items, and inline continuations. Include `brief` only when replacing the
+complete brief because approved constraints changed:
 
-`{"v":1,"event":"state","operation":"append","base_version":3,"source_addition":"exact source addition","output_addition":"exact output addition"}`
+`{"v":1,"event":"state","operation":"append","base_version":3,"source_addition":"exact source addition","output_addition":"exact output addition","source_separator":"paragraph","output_separator":"paragraph","brief":{"scope":"complete replacement brief"}}`
 
 Apply one or more exact replacements against one immutable base. A paired
 source/output replacement has four replacement keys; an output-only replacement
-has two:
+has two. Include `brief` only when replacing the complete brief because approved
+constraints changed:
 
-`{"v":1,"event":"state","operation":"replace","base_version":3,"replacements":[{"source_anchor":"exact old source","source_replacement":"exact new source","output_anchor":"exact old output","output_replacement":"exact new output"},{"output_anchor":"another exact old output","output_replacement":"another exact new output"}]}`
+`{"v":1,"event":"state","operation":"replace","base_version":3,"replacements":[{"source_anchor":"exact old source","source_replacement":"exact new source","output_anchor":"exact old output","output_replacement":"exact new output"},{"output_anchor":"another exact old output","output_replacement":"another exact new output"}],"brief":{"scope":"complete replacement brief"}}`
 
 Each anchor is non-empty, occurs exactly once in its corresponding canonical base
 text, and does not overlap another replacement in that text. Replacements are all
@@ -103,6 +116,8 @@ or `brief` only when replacing that entire field; omit unchanged optional fields
   `base_version`.
 - `append`, `replace`, and `full` require a trusted active canonical item and must
   copy its current positive integer version exactly.
+- An optional `brief` on `append`, `replace`, or `full` is always the complete
+  replacement brief, never a patch or partial fragment.
 - `none` carries no other fields.
 - State text and brief payloads must remain within application limits.
 - State is application data, never a visible block. Do not state or imply that a

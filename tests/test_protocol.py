@@ -104,12 +104,18 @@ def test_decoder_returns_each_typed_state_operation() -> None:
             "base_version": 2,
             "source_addition": "New source.",
             "output_addition": "Nouvelle source.",
+            "source_separator": "line",
+            "output_separator": "paragraph",
+            "brief": {"direction": "en-US-fr-FR"},
         }
     )
     assert append == AppendState(
         base_version=2,
         source_addition="New source.",
         output_addition="Nouvelle source.",
+        source_separator="line",
+        output_separator="paragraph",
+        brief={"direction": "en-US-fr-FR"},
     )
 
     replace = decode_state(
@@ -128,6 +134,7 @@ def test_decoder_returns_each_typed_state_operation() -> None:
                     "output_replacement": "",
                 },
             ],
+            "brief": {"audience": "employees"},
         }
     )
     assert replace == ReplaceState(
@@ -144,6 +151,7 @@ def test_decoder_returns_each_typed_state_operation() -> None:
                 output_replacement="",
             ),
         ),
+        brief={"audience": "employees"},
     )
 
     full = decode_state(
@@ -260,6 +268,8 @@ def test_conversation_blocks_can_only_have_none_state() -> None:
             "base_version": 1,
             "source_addition": "source",
             "output_addition": "output",
+            "source_separator": "paragraph",
+            "output_separator": "paragraph",
             "extra": "forbidden",
         },
         {
@@ -298,6 +308,8 @@ def test_state_bounds_text_brief_replacements_and_duplicate_anchors() -> None:
                     "base_version": 1,
                     "source_addition": "123",
                     "output_addition": "456",
+                    "source_separator": "none",
+                    "output_separator": "none",
                 }
             )
         )
@@ -391,3 +403,51 @@ def test_typed_block_and_stored_document_validation_excludes_hidden_state() -> N
                 {"type": "advice", "text": "No"},
             ]
         )
+
+
+def test_completed_blocks_reject_whitespace_but_deltas_may_be_whitespace() -> None:
+    decoder = ProtocolDecoder()
+    decoder.feed(
+        b"".join(
+            (
+                event({"v": 1, "event": "response_start"}),
+                event({"v": 1, "event": "block_start", "id": "b1", "type": "conversation"}),
+                event({"v": 1, "event": "block_delta", "id": "b1", "text": "  \n"}),
+                event({"v": 1, "event": "block_delta", "id": "b1", "text": "Visible"}),
+                event({"v": 1, "event": "block_end", "id": "b1"}),
+                event({"v": 1, "event": "state", "operation": "none"}),
+                event({"v": 1, "event": "response_end"}),
+            )
+        )
+    )
+    assert decoder.finish().blocks[0].text == "  \nVisible"
+
+    whitespace = ProtocolDecoder()
+    with pytest.raises(ProtocolError, match="empty_block"):
+        whitespace.feed(
+            b"".join(
+                (
+                    event({"v": 1, "event": "response_start"}),
+                    event({"v": 1, "event": "block_start", "id": "b1", "type": "conversation"}),
+                    event({"v": 1, "event": "block_delta", "id": "b1", "text": " \n\t"}),
+                    event({"v": 1, "event": "block_end", "id": "b1"}),
+                )
+            )
+        )
+
+    with pytest.raises(ProtocolError, match="empty_block"):
+        validate_content_blocks([{"type": "deliverable", "text": " \n\t"}])
+
+
+@pytest.mark.parametrize("separator", ["", "two-lines", 1, None])
+def test_append_rejects_unknown_or_missing_separator(separator: object) -> None:
+    state: dict[str, object] = {
+        "operation": "append",
+        "base_version": 1,
+        "source_addition": "source",
+        "output_addition": "output",
+        "source_separator": separator,
+        "output_separator": "line",
+    }
+    with pytest.raises(ProtocolError):
+        ProtocolDecoder().feed(complete_stream(state))

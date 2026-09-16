@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Literal, cast
 
 BlockType = Literal["conversation", "deliverable", "advice"]
+AppendSeparator = Literal["none", "space", "line", "paragraph"]
 EventType = Literal[
     "response_start",
     "block_start",
@@ -53,6 +54,9 @@ class AppendState:
     base_version: int
     source_addition: str
     output_addition: str
+    source_separator: AppendSeparator
+    output_separator: AppendSeparator
+    brief: dict[str, object] | None = None
     operation: Literal["append"] = "append"
 
 
@@ -77,6 +81,7 @@ ExactReplacement = SourceOutputReplacement | OutputReplacement
 class ReplaceState:
     base_version: int
     replacements: tuple[ExactReplacement, ...]
+    brief: dict[str, object] | None = None
     operation: Literal["replace"] = "replace"
 
 
@@ -239,12 +244,12 @@ def validate_content_blocks(
             text = candidate.get("text")
             if block_type not in _BLOCK_TYPES or not isinstance(block_type, str):
                 raise ProtocolError("invalid_block_type")
-            if not isinstance(text, str) or not text:
+            if not isinstance(text, str) or not text.strip():
                 raise ProtocolError("empty_block")
             block = ContentBlock(type=cast(BlockType, block_type), text=text)
         if block.type not in _BLOCK_TYPES:
             raise ProtocolError("invalid_block_type")
-        if not block.text:
+        if not block.text.strip():
             raise ProtocolError("empty_block")
         total_chars += len(block.text)
         if total_chars > max_text_chars:
@@ -457,7 +462,11 @@ class ProtocolDecoder:
             block_id = payload.get("id")
             if self._active_id is None or block_id != self._active_id:
                 raise ProtocolError("end_without_active_block")
-            if self._active_delta_count == 0 or self._active_type is None:
+            if (
+                self._active_delta_count == 0
+                or self._active_type is None
+                or not "".join(self._active_parts).strip()
+            ):
                 raise ProtocolError("empty_block")
             block_type = self._active_type
             self._blocks.append(ContentBlock(type=block_type, text="".join(self._active_parts)))
@@ -519,9 +528,9 @@ class ProtocolDecoder:
             return EstablishState(source=source, output=output, brief=brief)
 
         if operation == "append":
-            _require_exact_keys(
+            _require_keys(
                 payload,
-                frozenset(
+                required=frozenset(
                     {
                         "v",
                         "event",
@@ -529,23 +538,37 @@ class ProtocolDecoder:
                         "base_version",
                         "source_addition",
                         "output_addition",
+                        "source_separator",
+                        "output_separator",
                     }
                 ),
+                optional=frozenset({"brief"}),
             )
             base_version = _validated_base_version(payload.get("base_version"))
             source_addition = _validated_text(payload.get("source_addition"), complete=True)
             output_addition = _validated_text(payload.get("output_addition"), complete=True)
+            source_separator = self._validated_append_separator(payload.get("source_separator"))
+            output_separator = self._validated_append_separator(payload.get("output_separator"))
+            append_brief = (
+                _validated_brief(payload.get("brief"), max_bytes=self._max_brief_bytes)
+                if "brief" in payload
+                else None
+            )
             self._validate_state_size(source_addition, output_addition)
             return AppendState(
                 base_version=base_version,
                 source_addition=source_addition,
                 output_addition=output_addition,
+                source_separator=source_separator,
+                output_separator=output_separator,
+                brief=append_brief,
             )
 
         if operation == "replace":
-            _require_exact_keys(
+            _require_keys(
                 payload,
-                frozenset({"v", "event", "operation", "base_version", "replacements"}),
+                required=frozenset({"v", "event", "operation", "base_version", "replacements"}),
+                optional=frozenset({"brief"}),
             )
             base_version = _validated_base_version(payload.get("base_version"))
             raw_replacements = payload.get("replacements")
@@ -600,9 +623,15 @@ class ProtocolDecoder:
                     )
                 )
             self._validate_state_size(*state_texts)
+            replacement_brief = (
+                _validated_brief(payload.get("brief"), max_bytes=self._max_brief_bytes)
+                if "brief" in payload
+                else None
+            )
             return ReplaceState(
                 base_version=base_version,
                 replacements=tuple(replacements),
+                brief=replacement_brief,
             )
 
         if operation == "full":
@@ -639,8 +668,20 @@ class ProtocolDecoder:
         if sum(len(value) for value in values) > self._max_state_text_chars:
             raise ProtocolError("state_too_large")
 
+    @staticmethod
+    def _validated_append_separator(value: object) -> AppendSeparator:
+        if not isinstance(value, str) or value not in {
+            "none",
+            "space",
+            "line",
+            "paragraph",
+        }:
+            raise ProtocolError("invalid_append_separator")
+        return cast(AppendSeparator, value)
+
 
 __all__ = [
+    "AppendSeparator",
     "AppendState",
     "BlockType",
     "ContentBlock",

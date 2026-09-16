@@ -125,14 +125,18 @@ def test_exactly_one_shared_rules_and_active_mode_prompt_are_loaded() -> None:
         else:
             assert "Comm internes" not in system
     assert "VERSION-CONTROLLED RESPONSE PROTOCOL" not in title[0].content
-    assert title[0].content.count("# Shared Alithya rules") == 1
-    assert title[0].content.count("# Oveo Translate mode") == 1
+    assert "VERSION-CONTROLLED ALITHYA RULES" not in title[0].content
+    assert "VERSION-CONTROLLED MODE PROMPT" not in title[0].content
+    assert "# Shared Alithya rules" not in title[0].content
+    assert "# Oveo Translate mode" not in title[0].content
     assert "purpose=title" in title[0].content
     assert "VERSION-CONTROLLED RESPONSE PROTOCOL" not in summary[0].content
-    assert summary[0].content.count("# Shared Alithya rules") == 1
-    assert summary[0].content.count("# Oveo Internal communications mode") == 1
+    assert "VERSION-CONTROLLED ALITHYA RULES" not in summary[0].content
+    assert "VERSION-CONTROLLED MODE PROMPT" not in summary[0].content
+    assert "# Shared Alithya rules" not in summary[0].content
+    assert "# Oveo Internal communications mode" not in summary[0].content
     assert "purpose=summary" in summary[0].content
-    assert "non-visible maintenance generation" in summary[0].content
+    assert "non-visible internal conversation summary" in summary[0].content
 
 
 def test_canonical_summary_and_attachment_are_preserved_exactly_as_data() -> None:

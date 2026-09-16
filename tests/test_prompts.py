@@ -98,7 +98,8 @@ def test_all_modes_are_restrained_professional_copilots() -> None:
         normalized = " ".join(prompt.split())
         assert all(example in prompt for example in examples)
         assert "Before starting," in normalized
-        assert "ask a focused question, flag a concern, or" in normalized
+        assert "ask a focused question only when its answer is required" in normalized
+        assert "that is not a blocker must not delay the work" in normalized
         assert "Do not delay clear," in normalized
         assert "turn intake into a broad interview" in normalized
         assert "one to three high-value points" in normalized
@@ -120,6 +121,7 @@ def test_locale_ownership_and_isolation_are_explicit() -> None:
     for mode in (translate, revision, internal):
         assert "France" in mode and "Canadian" in mode
     assert "never changes\na France or International French selection" in translate
+    assert "adaptation between locales of the same language" in translate
     assert "merely because the rules are shared" in revision
     assert "merely because the rules are shared" in internal
 
@@ -157,3 +159,26 @@ def test_brand_logo_keeps_the_verified_oveo_semantics() -> None:
     assert 'className="brand-mark"' in logo
     assert 'className="brand-wordmark"' in logo
     assert ">OVEO<" in logo
+
+
+def test_shared_rules_distinguish_link_destinations_and_ordinary_labels() -> None:
+    shared = read_prompt("alithya_rules.md")
+    assert "A visible linked label is\nordinary prose" in shared
+    assert "leaving its destination exact" in shared
+    for expected in (
+        "| Trusted advisor | conseiller de confiance |",
+        "| Digital transformation | transformation numérique |",
+        "| Website | site Web |",
+        "| Event | évènement |",
+    ):
+        assert expected in shared
+
+    # Language-owner-disputed terminology remains unchanged.
+    for protected in (
+        "| AI slop | IA slop |",
+        "| Bring to life | Concrétiser |",
+        "| Kind regards | Cordialement |",
+        "| President and Chief Executive Officer | Président et chef de la direction |",
+        "| Heatmaps | Cartes de chaleur (heatmaps) |",
+    ):
+        assert protected in shared

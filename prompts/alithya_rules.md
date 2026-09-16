@@ -18,45 +18,45 @@ the source meaning; do not force a contextual term where it does not fit.
 | regular employees | employés permanents | English→French, all French | Employment context |
 | chatbot / chatbots | robot conversationnel / robots conversationnels | English→French, all French | Match source number |
 | AI slop | IA slop | English→French, all French | Approved expression |
-| Trusted advisor | Conseiller de confiance | English→French, all French | Brand/positioning term |
-| Collective intelligence | Intelligence collective | English→French, all French | Brand/positioning term |
-| Digital transformation | Transformation numérique | English→French, all French | Brand/positioning term |
-| Cloud transformation | Transformation infonuagique | English→Canadian French | Use ordinary France/International French vocabulary elsewhere |
-| Cloud / cloud computing | Infonuagique | English→Canadian French | General concept |
-| Cloud, as a noun (`in the cloud`) | Nuage | English→Canadian French | General concept |
-| Information technology / IT | Technologies de l'information / TI | English→French, all French | Match long form or acronym in source |
-| Legacy systems | Systèmes hérités | English→French, all French | Technology context |
-| Business outcomes | Résultats d'affaires | English→French, all French | Business context |
-| Driver | Levier | English→French, all French | Business context only |
-| Business case | Étude de cas | English→French, all French | Business context |
-| Client stories | Témoignages de clients | English→French, all French | Marketing/editorial context |
-| Subject matter experts | Experts de contenu | English→French, all French | Organizational term |
-| NetZero | Carboneutralité | English→French, all French | Sustainability context |
-| Sustainability | Développement durable | English→French, all French | Sustainability context |
-| Remote work / work remotely | Télétravail | English→French, all French | Adapt grammar to sentence |
-| Real-life use cases | Cas d'usage réels | English→French, all French | Technology/business context |
-| Collective effort | Effort collectif | English→French, all French | General |
-| Impact-driven approach | Approche tournée vers l'impact | English→French, all French | Brand/positioning term |
+| Trusted advisor | conseiller de confiance | English→French, all French | Brand/positioning term |
+| Collective intelligence | intelligence collective | English→French, all French | Brand/positioning term |
+| Digital transformation | transformation numérique | English→French, all French | Brand/positioning term |
+| Cloud transformation | transformation infonuagique | English→Canadian French | Use ordinary France/International French vocabulary elsewhere |
+| Cloud / cloud computing | infonuagique | English→Canadian French | General concept |
+| Cloud, as a noun (`in the cloud`) | nuage | English→Canadian French | General concept |
+| Information technology / IT | technologies de l'information / TI | English→French, all French | Match long form or acronym in source |
+| Legacy systems | systèmes hérités | English→French, all French | Technology context |
+| Business outcomes | résultats d'affaires | English→French, all French | Business context |
+| Driver | levier | English→French, all French | Business context only |
+| Business case | étude de cas | English→French, all French | Business context |
+| Client stories | témoignages de clients | English→French, all French | Marketing/editorial context |
+| Subject matter experts | experts de contenu | English→French, all French | Organizational term |
+| NetZero | carboneutralité | English→French, all French | Sustainability context |
+| Sustainability | développement durable | English→French, all French | Sustainability context |
+| Remote work / work remotely | télétravail | English→French, all French | Adapt grammar to sentence |
+| Real-life use cases | cas d'usage réels | English→French, all French | Technology/business context |
+| Collective effort | effort collectif | English→French, all French | General |
+| Impact-driven approach | approche tournée vers l'impact | English→French, all French | Brand/positioning term |
 | Bring to life | Concrétiser | English→French, all French | Adapt grammar to sentence |
-| Proceed smoothly | Bon déroulement | English→French, all French | Contextual phrase, not automatic substitution |
-| Contact | Communiquer avec | English→French, all French | Verb only |
+| Proceed smoothly | bon déroulement | English→French, all French | Contextual phrase, not automatic substitution |
+| Contact | communiquer avec | English→French, all French | Verb only |
 | Kind regards | Cordialement | English→French, all French | Sign-off |
-| Construction schedule | Programme des travaux | English→French, all French | Construction context |
-| Employees | Employés | English→French, all French | Organizational term |
-| Talents | Talents | English→French, all French | Organizational term |
-| Global momentum | Dynamique globale | English→French, all French | Approved phrase |
-| Year-round commitment | Engagement continu | English→French, all French | Approved phrase |
-| Key material topics | Thèmes clés | English→French, all French | ESG context |
+| Construction schedule | programme des travaux | English→French, all French | Construction context |
+| Employees | employés | English→French, all French | Organizational term |
+| Talents | talents | English→French, all French | Organizational term |
+| Global momentum | dynamique globale | English→French, all French | Approved phrase |
+| Year-round commitment | engagement continu | English→French, all French | Approved phrase |
+| Key material topics | thèmes clés | English→French, all French | ESG context |
 | President and Chief Executive Officer | Président et chef de la direction | English→French, all French | Official title pattern |
-| Searchable | Facile à repérer | English→French, all French | Digital-content context |
-| AI enhanced | Bonifié par l'IA | English→French, all French | Adapt agreement |
+| Searchable | facile à repérer | English→French, all French | Digital-content context |
+| AI enhanced | bonifié par l'IA | English→French, all French | Adapt agreement |
 | Heatmaps | Cartes de chaleur (heatmaps) | English→French, all French | Preserve parenthetical English term |
-| Email | Courriel | English→Canadian French | Use normal target-locale term elsewhere |
-| Workflow | Flux de travaux | English→French, all French | Business/process context |
-| Software | Logiciel | English→French, all French | Match source number |
-| Website | Site Web | English→Canadian French | Use normal target-locale term elsewhere |
-| Chat | Clavardage | English→Canadian French | Conversation/channel context |
-| Event | Évènement | English→French, all French | Approved spelling |
+| Email | courriel | English→Canadian French | Use normal target-locale term elsewhere |
+| Workflow | flux de travaux | English→French, all French | Business/process context |
+| Software | logiciel | English→French, all French | Match source number |
+| Website | site Web | English→Canadian French | Use normal target-locale term elsewhere |
+| Chat | clavardage | English→Canadian French | Conversation/channel context |
+| Event | évènement | English→French, all French | Approved spelling |
 
 ## Brand and naming
 
@@ -109,11 +109,13 @@ the source meaning; do not force a contextual term where it does not fit.
 
 ## Protected URLs and placeholders
 
-Preserve every supplied URL, email address, placeholder, template token, code,
-product identifier, and linked label exactly unless the user explicitly asks to
-change that item and the active mode permits it. Never invent, translate,
-rewrite, shorten, duplicate, or claim to have verified a URL. Preserve meaningful
-spacing and delimiters inside placeholders.
+Preserve every supplied URL or link destination, email address, placeholder,
+template token, code, and product identifier exactly unless the user explicitly
+asks to change that item and the active mode permits it. A visible linked label is
+ordinary prose: translate or revise it when the active task calls for that, while
+leaving its destination exact. Never invent, rewrite, shorten, duplicate, or claim
+to have verified a URL. Preserve meaningful spacing and delimiters inside
+placeholders.
 
 ## Shared professional-adviser posture
 
