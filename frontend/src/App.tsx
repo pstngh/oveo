@@ -542,7 +542,7 @@ export default function App() {
         {(detail || draftMode) && <Composer activeGeneration={active} onSend={send} onStop={() => active ? api.stop(active.id) : Promise.resolve()} onRetry={retry} onCreateHandoff={detail ? () => void createHandoff() : undefined} />}
       </main>
       {deleteTarget && <Modal title="Delete conversation?" onClose={() => setDeleteTarget(null)}><p className="modal-copy">Delete “{deleteTarget.title}”? This permanently deletes the conversation and its attachments. This cannot be undone.</p><div className="modal-actions"><button onClick={() => setDeleteTarget(null)}>Cancel</button><button className="danger-button" onClick={removeThread}>Delete permanently</button></div></Modal>}
-      {handoff !== null && <Modal title="Prompt handoff" onClose={() => setHandoff(null)}><div className="handoff-body">{handoff.length ? <ResponseBlocks blocks={handoff.map((block) => ({ ...block, type: "deliverable" }))} /> : <div className="handoff-loading">Creating maintenance brief…</div>}</div></Modal>}
+      {handoff !== null && <Modal title="Prompt handoff" onClose={() => setHandoff(null)}><div className="handoff-body">{handoff.length ? <ResponseBlocks blocks={handoff.map((block) => ({ ...block, type: "deliverable" }))} /> : <div className="handoff-loading">Collecting user instructions…</div>}</div></Modal>}
       {globalError && <div className="toast" role="alert">{globalError}<button onClick={() => setGlobalError("")} aria-label="Dismiss"><X /></button></div>}
     </div>
   );

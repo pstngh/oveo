@@ -171,6 +171,8 @@ class OpenRouterProvider:
                 if request.purpose == "title"
                 else 2_048
                 if request.purpose == "summary"
+                else 4_096
+                if request.purpose == "prompt_handoff"
                 else 32_000
             )
             completion = await self._client.stream_chat(

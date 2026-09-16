@@ -107,6 +107,19 @@ class CompactingProvider:
         return ProviderCompletion(cost_microusd=22)
 
 
+class HandoffCaptureProvider:
+    def __init__(self) -> None:
+        self.request: ProviderRequest | None = None
+
+    async def generate(
+        self, request: ProviderRequest, emit: object, cancel_event: asyncio.Event
+    ) -> ProviderCompletion:
+        del cancel_event
+        self.request = request
+        await emit(_SUCCESS)  # type: ignore[operator]
+        return ProviderCompletion(cost_microusd=0)
+
+
 @pytest.fixture
 async def manager_database(tmp_path: Path) -> AsyncIterator[tuple[Database, Settings, User]]:
     settings = Settings(
@@ -332,6 +345,62 @@ async def test_automatic_compaction_preserves_recent_transcript_and_accounts_cos
             select(func.sum(UsageEvent.amount_microusd)).where(UsageEvent.event_type == "charge")
         )
         assert total == 33
+    await manager.shutdown()
+
+
+async def test_handoff_provider_request_contains_only_user_authored_material(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, settings, user = manager_database
+    async with database.sessions() as db:
+        thread = Thread(
+            owner_id=user.id,
+            mode="translate",
+            voice_key=None,
+            title="Existing thread",
+            context_summary="Private internal summary.",
+            summary_through_ordinal=2,
+        )
+        db.add(thread)
+        await db.flush()
+        db.add_all(
+            [
+                Message(
+                    thread_id=thread.id,
+                    ordinal=1,
+                    role="user",
+                    actor_user_id=user.id,
+                    content=[{"type": "conversation", "text": "Always keep the product name."}],
+                ),
+                Message(
+                    thread_id=thread.id,
+                    ordinal=2,
+                    role="assistant",
+                    actor_user_id=None,
+                    content=[{"type": "conversation", "text": "Private assistant reply."}],
+                ),
+            ]
+        )
+        await db.commit()
+        thread_id = thread.id
+
+    provider = HandoffCaptureProvider()
+    manager = GenerationManager(database, settings, provider)
+    generation_id = await manager.submit_handoff(
+        thread_id=thread_id,
+        requester_id=user.id,
+        client_request_id="handoff-user-only",
+    )
+    assert (await _wait_status(manager, generation_id, {"completed"}))["status"] == "completed"
+    assert provider.request is not None
+    provider_messages = provider.request.snapshot["provider_messages"]
+    serialized = str(provider_messages)
+    assert "Always keep the product name." in serialized
+    assert "Private assistant reply." not in serialized
+    assert "Private internal summary." not in serialized
+    assert "# Oveo Translate" not in serialized
+    assert "VERSION-CONTROLLED MODE PROMPT" not in serialized
+    assert "VERSION-CONTROLLED RESPONSE PROTOCOL" not in serialized
     await manager.shutdown()
 
 

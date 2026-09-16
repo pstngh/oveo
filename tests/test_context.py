@@ -210,7 +210,10 @@ def test_true_actor_labels_are_kept_for_each_user_turn() -> None:
     ]
 
 
-def test_prompt_handoff_does_not_add_a_transcript_turn() -> None:
+def test_prompt_handoff_exposes_only_user_authored_material() -> None:
+    thread = _thread()
+    thread.context_summary = "Internal summary that must not be exposed."
+    thread.summary_through_ordinal = 2
     transcript = [
         _message(
             message_id="message-1",
@@ -218,21 +221,62 @@ def test_prompt_handoff_does_not_add_a_transcript_turn() -> None:
             role="user",
             actor_user_id="yousra-id",
             text="Always retain the product name.",
-        )
+        ),
+        _message(
+            message_id="message-2",
+            ordinal=2,
+            role="assistant",
+            actor_user_id=None,
+            text="Private assistant response that must not be exposed.",
+        ),
+        _message(
+            message_id="message-3",
+            ordinal=3,
+            role="user",
+            actor_user_id="yousra-id",
+            text="Use Canadian French.",
+        ),
     ]
-    original_content = list(transcript[0].content)
+    original_content = [list(message.content) for message in transcript]
 
     messages = build_provider_messages(
-        _thread(),
+        thread,
         purpose="prompt_handoff",
         recent_messages=transcript,
         actor_labels={"yousra-id": "Yousra"},
+        attachments={
+            "message-3": AttachmentText(
+                text="User-supplied terminology instructions.",
+                word_count=3,
+            )
+        },
+        canonical_state=CanonicalWorkState(
+            source="Private canonical source.",
+            output="Private canonical output.",
+            direction=Direction.FR_TO_EN_US,
+            brief="Private canonical brief.",
+            version=1,
+            source_word_count=3,
+        ),
     )
 
-    assert "purpose=prompt_handoff" in messages[0].content
-    assert "This response is not a conversation turn" in messages[0].content
-    assert len(_payload(messages)["recent_transcript"]) == 1
-    assert transcript[0].content == original_content
+    assert "# Oveo Translate" not in messages[0].content
+    assert "VERSION-CONTROLLED MODE PROMPT" not in messages[0].content
+    assert "VERSION-CONTROLLED RESPONSE PROTOCOL" not in messages[0].content
+    assert "Private assistant response" not in messages[1].content
+    assert "Internal summary" not in messages[1].content
+    assert "Private canonical" not in messages[1].content
+    assert "Yousra" not in messages[1].content
+    assert _payload(messages) == {
+        "user_messages": [
+            {"text_parts": ["Always retain the product name."]},
+            {
+                "attachment_text": "User-supplied terminology instructions.",
+                "text_parts": ["Use Canadian French."],
+            },
+        ]
+    }
+    assert [message.content for message in transcript] == original_content
 
 
 def test_missing_true_actor_label_is_rejected() -> None:
