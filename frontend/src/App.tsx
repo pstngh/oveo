@@ -32,6 +32,25 @@ import type {
 
 const uuid = () => crypto.randomUUID();
 
+export function conversationPath(id: string) {
+  return `/conversations/${encodeURIComponent(id)}`;
+}
+
+export function conversationIdFromPath(pathname: string) {
+  const match = /^\/conversations\/([^/]+)\/?$/.exec(pathname);
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+}
+
+function updateAddress(path: string, replace = false) {
+  if (window.location.pathname === path) return;
+  window.history[replace ? "replaceState" : "pushState"](null, "", path);
+}
+
 interface WebMcpContext {
   registerTool(tool: {
     name: string;
@@ -149,9 +168,6 @@ export function MessageList({ detail, generation }: { detail: ThreadDetail; gene
       {detail.messages.map((message) => (
         <article className={`message ${message.role}`} key={message.id}>
           <div className="message-inner">
-            <div className="message-author">
-              {message.role === "assistant" ? "Oveo" : message.actor_username === "charles" && detail.owner_username !== "charles" ? "Charles" : "You"}
-            </div>
             {message.role === "assistant" ? <ResponseBlocks blocks={message.blocks} /> : (
               <>
                 {message.blocks.map((block, index) => <p className="user-text" key={index}>{block.text}</p>)}
@@ -162,7 +178,7 @@ export function MessageList({ detail, generation }: { detail: ThreadDetail; gene
         </article>
       ))}
       {generation && ["queued", "running", "stopping"].includes(generation.status) && (
-        <article className="message assistant pending"><div className="message-inner"><div className="message-author">Oveo</div><ResponseBlocks blocks={generation.blocks} streaming /></div></article>
+        <article className="message assistant pending"><div className="message-inner"><ResponseBlocks blocks={generation.blocks} streaming /></div></article>
       )}
       {generation && ["failed", "stopped"].includes(generation.status) && (
         <div className="generation-notice" role="status">
@@ -326,13 +342,43 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [owner, refreshThreads]);
 
-  const openThread = useCallback(async (id: string) => {
+  const openThread = useCallback(async (id: string, navigate = true) => {
     setDraftMode(null);
     setSidebarOpen(false);
     const loaded = await api.thread(id);
     setDetail(loaded);
     setGeneration(loaded.generation ?? null);
+    if (navigate) updateAddress(conversationPath(id));
   }, []);
+
+  useEffect(() => {
+    if (!user || accounts.length === 0) return;
+    const applyAddress = () => {
+      const id = conversationIdFromPath(window.location.pathname);
+      if (id) {
+        void openThread(id, false).catch((reason) => {
+          setGlobalError(reason instanceof Error ? reason.message : "Could not load that conversation.");
+          setDetail(undefined);
+          setGeneration(null);
+          setDraftMode(null);
+          updateAddress("/new", true);
+        });
+        return;
+      }
+      setDetail(undefined);
+      setGeneration(null);
+      setDraftMode(null);
+      setSidebarOpen(false);
+      if (window.location.pathname === "/") updateAddress("/new", true);
+    };
+    applyAddress();
+    window.addEventListener("popstate", applyAddress);
+    return () => window.removeEventListener("popstate", applyAddress);
+  }, [accounts.length, openThread, user]);
+
+  useEffect(() => {
+    document.title = detail ? `${detail.title} · Oveo` : "Oveo";
+  }, [detail]);
 
   const generationId = generation?.id;
   const generationStatus = generation?.status;
@@ -344,7 +390,7 @@ export default function App() {
       setGeneration(next);
       if (["completed", "failed", "stopped"].includes(next.status)) {
         source.close();
-        if (next.thread_id) void openThread(next.thread_id);
+        if (next.thread_id) void openThread(next.thread_id, false);
         void refreshThreads();
         void api.usage().then((result) => setUsage(result.formatted));
       }
@@ -385,6 +431,7 @@ export default function App() {
         setGeneration(null);
         setDraftMode(value.mode);
         setSidebarOpen(false);
+        updateAddress("/new");
         return { state: "ready", mode: value.mode, ownerUsername: selectedOwner.username };
       },
     }, { signal: lifecycle.signal })).catch(() => undefined);
@@ -406,6 +453,7 @@ export default function App() {
     setDetail(loaded);
     setDraftMode(null);
     setGeneration(pending);
+    updateAddress(conversationPath(result.thread_id), true);
     await refreshThreads();
   }
   async function retry() {
@@ -427,6 +475,7 @@ export default function App() {
     setDeleteOpen(false);
     setDetail(undefined);
     setGeneration(null);
+    updateAddress("/new", true);
     await refreshThreads();
   }
   async function createHandoff() {
@@ -451,6 +500,11 @@ export default function App() {
     setGeneration(null);
     setDraftMode(null);
     setSidebarOpen(false);
+    updateAddress("/new");
+  }
+  function changeOwner(id: string) {
+    setOwner(accounts.find((account) => account.id === id));
+    updateAddress("/new");
   }
 
   if (user === undefined) return <div className="app-loading"><BrandLogo /></div>;
@@ -464,7 +518,7 @@ export default function App() {
         <div className="sidebar-head"><BrandLogo compact /><button className="mobile-close icon-button" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar"><X /></button></div>
         <button className="new-button" onClick={startNewConversation}><Plus /> New</button>
         {user.role === "owner" && (
-          <label className="account-picker"><span>Viewing</span><select value={owner?.id} onChange={(e) => setOwner(accounts.find((account) => account.id === e.target.value))}>{accounts.map((account) => <option value={account.id} key={account.id}>{account.display_name}</option>)}</select></label>
+          <label className="account-picker"><span>Viewing</span><select value={owner?.id} onChange={(e) => changeOwner(e.target.value)}>{accounts.map((account) => <option value={account.id} key={account.id}>{account.display_name}</option>)}</select></label>
         )}
         <nav className="thread-list" aria-label="Conversations">
           {threads.map((thread) => (

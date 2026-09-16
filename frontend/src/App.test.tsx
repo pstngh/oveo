@@ -1,7 +1,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Composer, EmptyThread, MessageList, ResponseBlocks } from "./App";
+import { Composer, conversationIdFromPath, conversationPath, EmptyThread, MessageList, ResponseBlocks } from "./App";
 import type { ThreadDetail } from "./types";
 
 afterEach(cleanup);
@@ -92,5 +92,34 @@ describe("conversation scrolling", () => {
     expect((container.firstElementChild as HTMLDivElement).scrollTop).toBe(900);
 
     scrollHeight.mockRestore();
+  });
+
+  it("does not render speaker labels", () => {
+    const detail = {
+      id: "thread-1",
+      owner_id: "user-1",
+      owner_username: "charles",
+      mode: "translate",
+      voice_key: null,
+      title: "Compact conversation",
+      updated_at: "2026-09-16T00:00:00Z",
+      active_generation_id: null,
+      messages: [
+        { id: "message-1", role: "user", actor_username: "charles", blocks: [{ type: "conversation", text: "Hello" }], attachment: null, created_at: "2026-09-16T00:00:00Z" },
+        { id: "message-2", role: "assistant", actor_username: null, blocks: [{ type: "conversation", text: "Hi" }], attachment: null, created_at: "2026-09-16T00:00:01Z" },
+      ],
+    } satisfies ThreadDetail;
+
+    render(<MessageList detail={detail} generation={null} />);
+    expect(screen.queryByText(/^You$/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Oveo$/)).not.toBeInTheDocument();
+  });
+});
+
+describe("conversation addresses", () => {
+  it("builds and reads a visible conversation path", () => {
+    expect(conversationPath("thread-1")).toBe("/conversations/thread-1");
+    expect(conversationIdFromPath("/conversations/thread-1")).toBe("thread-1");
+    expect(conversationIdFromPath("/new")).toBeNull();
   });
 });

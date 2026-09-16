@@ -80,18 +80,17 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .icon-button.danger:hover { color: var(--danger); background: rgba(229,122,120,.12); }
 .compact-menu { display: none; }
 .conversation-area { min-height: 0; overflow: hidden; }
-.messages { height: 100%; overflow-y: auto; padding: 20px 0 30px; scroll-behavior: smooth; }
+.messages { height: 100%; overflow-y: auto; padding: 10px 0 20px; scroll-behavior: smooth; }
 .message { width: 100%; }
-.message-inner { width: min(800px, calc(100% - 48px)); margin: 0 auto; padding: 20px 0; }
-.message.user .message-inner { width: min(680px, calc(100% - 48px)); margin-right: max(24px, calc((100% - 800px) / 2)); }
-.message.user .message-inner > :not(.message-author) { width: max-content; max-width: 100%; margin-left: auto; }
-.message-author { margin-bottom: 8px; color: #bfbeba; font-size: .75rem; font-weight: 750; letter-spacing: .045em; text-transform: uppercase; }
-.message.user .message-author { text-align: right; }
-.user-text { padding: 11px 15px; border: 1px solid #393a3e; border-radius: 15px 15px 4px 15px; background: #292a2e; white-space: pre-wrap; line-height: 1.55; }
-.sent-attachment { display: flex; align-items: center; gap: 8px; padding: 9px 11px; border: 1px solid #3e3f44; border-radius: 9px; color: #d5d4d0; background: #25262a; font-size: .83rem; }
+.message-inner { width: min(820px, calc(100% - 48px)); margin: 0 auto; padding: 11px 0; }
+.message.user .message-inner { width: min(720px, calc(100% - 48px)); margin-right: max(24px, calc((100% - 820px) / 2)); }
+.message.user .message-inner > * { width: max-content; max-width: 100%; margin-left: auto; }
+.user-text { margin-top: 0; margin-bottom: 4px; padding: 8px 12px; border: 1px solid #393a3e; border-radius: 14px 14px 4px 14px; background: #292a2e; white-space: pre-wrap; line-height: 1.48; }
+.user-text:last-of-type { margin-bottom: 0; }
+.sent-attachment { display: flex; align-items: center; gap: 8px; margin-top: 6px; padding: 8px 10px; border: 1px solid #3e3f44; border-radius: 9px; color: #d5d4d0; background: #25262a; font-size: .83rem; }
 .sent-attachment svg { width: 17px; color: var(--accent); }
-.response-blocks { display: grid; gap: 17px; color: #dededb; font-size: 1rem; line-height: 1.67; }
-.response-blocks p { margin: 0 0 11px; }
+.response-blocks { display: grid; gap: 12px; color: #dededb; font-size: .98rem; line-height: 1.55; }
+.response-blocks p { margin: 0 0 8px; }
 .response-blocks p:last-child { margin-bottom: 0; }
 .response-blocks ul, .response-blocks ol { padding-left: 24px; }
 .response-blocks a { color: #e4b271; }
