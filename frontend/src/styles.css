@@ -38,9 +38,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 .app-loading, .login-page { height: 100%; display: grid; place-items: center; background: radial-gradient(circle at 50% 35%, #242529 0, var(--bg) 42%); }
 .login-card { width: min(420px, calc(100vw - 32px)); padding: 38px; border: 1px solid var(--border); border-radius: 18px; background: rgba(35, 36, 39, .96); box-shadow: 0 30px 80px rgba(0,0,0,.3); }
-.login-card .brand-logo { margin-bottom: 42px; }
-.login-card h1 { margin: 0 0 8px; font-size: 1.55rem; letter-spacing: -.025em; }
-.login-card > p { margin: 0 0 30px; color: var(--muted); }
+.login-card .brand-lockup { display: flex; width: max-content; margin: 0 auto 34px; }
 .login-card label { display: grid; gap: 8px; margin: 16px 0; color: #d8d8d5; font-size: .9rem; }
 .login-card input { height: 46px; padding: 0 13px; border: 1px solid #44454a; border-radius: 9px; color: var(--text); background: #191a1c; }
 .primary-button { width: 100%; height: 46px; margin-top: 12px; border: 0; border-radius: 9px; color: #17120c; background: #e1ad6b; font-weight: 700; cursor: pointer; }

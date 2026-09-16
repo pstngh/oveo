@@ -77,7 +77,7 @@ function Modal({ title, children, onClose }: { title: string; children: ReactNod
   );
 }
 
-function Login({ onLogin }: { onLogin: (user: SessionUser) => void }) {
+export function Login({ onLogin }: { onLogin: (user: SessionUser) => void }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -98,10 +98,8 @@ function Login({ onLogin }: { onLogin: (user: SessionUser) => void }) {
   }
   return (
     <main className="login-page">
-      <form className="login-card" onSubmit={submit}>
+      <form className="login-card" aria-label="Sign in to Oveo" onSubmit={submit}>
         <BrandLogo />
-        <h1>Welcome back</h1>
-        <p>Sign in to continue to Oveo.</p>
         <label>Username<input autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} required autoFocus /></label>
         <label>Password<input type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} required /></label>
         {error && <div className="form-error" role="alert">{error}</div>}

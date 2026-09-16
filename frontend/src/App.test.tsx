@@ -1,10 +1,21 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Composer, conversationIdFromPath, conversationPath, EmptyThread, MessageList, ResponseBlocks, SidebarHeader } from "./App";
+import { Composer, conversationIdFromPath, conversationPath, EmptyThread, Login, MessageList, ResponseBlocks, SidebarHeader } from "./App";
 import type { ThreadDetail } from "./types";
 
 afterEach(cleanup);
+
+describe("sign-in page", () => {
+  it("uses a centered brand lockup without redundant welcome copy", () => {
+    render(<Login onLogin={vi.fn()} />);
+
+    expect(screen.getByRole("form", { name: "Sign in to Oveo" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Oveo" })).toBeInTheDocument();
+    expect(screen.queryByText("Welcome back")).not.toBeInTheDocument();
+    expect(screen.queryByText("Sign in to continue to Oveo.")).not.toBeInTheDocument();
+  });
+});
 
 describe("deliverable copy", () => {
   it("copies only the exact plain deliverable text", async () => {
