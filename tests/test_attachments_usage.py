@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import io
+from pathlib import Path
 
 import pytest
 from fastapi import UploadFile
 
-from oveo.attachments import AttachmentError, count_words, validate_attachment_upload
+from oveo.attachments import (
+    AttachmentError,
+    count_words,
+    is_managed_attachment_name,
+    persist_attachment,
+    validate_attachment_upload,
+)
 from oveo.provider import parse_usage
 from oveo.usage import format_lifetime_cost
 from tests.docx_fixtures import make_docx
@@ -34,6 +41,26 @@ async def test_upload_rejects_text_files_and_byte_overflow() -> None:
     with pytest.raises(AttachmentError) as error:
         await validate_attachment_upload(oversized, max_bytes=3)
     assert error.value.status_code == 413
+
+
+def test_attachment_storage_name_cannot_escape_its_directory(tmp_path: Path) -> None:
+    attachment_id = "00000000-0000-0000-0000-000000000000"
+    safe_name = f"{attachment_id}.docx"
+    directory = tmp_path / "attachments"
+
+    assert is_managed_attachment_name(safe_name)
+    assert persist_attachment(directory, safe_name, b"safe") == directory / safe_name
+    for unsafe_name in (
+        f"../{safe_name}",
+        f"nested/{safe_name}",
+        f"{attachment_id}.DOCX",
+        "not-a-uuid.docx",
+    ):
+        assert not is_managed_attachment_name(unsafe_name)
+        with pytest.raises(ValueError, match="unsafe attachment storage name"):
+            persist_attachment(directory, unsafe_name, b"unsafe")
+
+    assert not (tmp_path / safe_name).exists()
 
 
 def test_word_count_and_precise_cost_formatting() -> None:

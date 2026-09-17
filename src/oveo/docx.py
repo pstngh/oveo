@@ -16,6 +16,7 @@ MAX_DOCX_UNCOMPRESSED_BYTES = 50_000_000
 MAX_DOCX_XML_PART_BYTES = 12_000_000
 MAX_DOCX_BLOCKS = 10_000
 MAX_COMPRESSION_RATIO = 500
+MIN_DOCX_UNCOMPRESSED_BYTES = 20_000_000
 
 _CONTENT_TYPES = "[Content_Types].xml"
 _DOCUMENT_PART = "word/document.xml"
@@ -68,6 +69,24 @@ class DocxReplacement:
 class ExtractedDocx:
     blocks: tuple[DocxBlock, ...]
     plain_text: str
+
+
+@dataclass(slots=True)
+class _ParsedPackage:
+    archive: zipfile.ZipFile
+    infos: tuple[zipfile.ZipInfo, ...]
+    root: etree._Element
+    blocks: tuple[DocxBlock, ...]
+    editable: tuple[etree._Element, ...]
+
+
+def docx_uncompressed_limit(max_upload_bytes: int) -> int:
+    """Return one consistent expansion ceiling for a configured upload limit."""
+
+    return min(
+        MAX_DOCX_UNCOMPRESSED_BYTES,
+        max(MIN_DOCX_UNCOMPRESSED_BYTES, max_upload_bytes * 20),
+    )
 
 
 def _xml(data: bytes, *, label: str) -> etree._Element:
@@ -207,6 +226,14 @@ def _text(node: etree._Element) -> str:
     return "".join(str(value) for value in node.xpath(".//w:t/text()", namespaces=_NS))
 
 
+def _reject_reserved_link_text(value: str) -> None:
+    if _RESERVED_LINK_PREFIX in value or _RESERVED_LINK_CLOSE_PREFIX in value:
+        raise DocxError(
+            "reserved_docx_text",
+            "The DOCX contains text reserved for safe hyperlink handling.",
+        )
+
+
 def _paragraph_block(
     paragraph: etree._Element,
     *,
@@ -229,11 +256,7 @@ def _paragraph_block(
             continue
         if child.tag != f"{{{_W}}}hyperlink":
             value = _text(child)
-            if _RESERVED_LINK_PREFIX in value or _RESERVED_LINK_CLOSE_PREFIX in value:
-                raise DocxError(
-                    "reserved_docx_text",
-                    "The DOCX contains text reserved for safe hyperlink handling.",
-                )
+            _reject_reserved_link_text(value)
             parts.append(value)
             continue
         display = _text(child)
@@ -241,6 +264,7 @@ def _paragraph_block(
             # Image-only links and other non-text hyperlinks remain untouched. Omitting
             # the paragraph prevents a rewrite from moving text around the protected link.
             return None, link_number
+        _reject_reserved_link_text(display)
         rel_id = child.get(f"{{{_R}}}id")
         anchor = child.get(f"{{{_W}}}anchor")
         if rel_id is None and anchor is None:
@@ -263,11 +287,7 @@ def _paragraph_block(
     return DocxBlock(id=f"p{block_number:06d}", kind=kind, text=text), link_number
 
 
-def extract_docx(
-    content: bytes,
-    *,
-    max_uncompressed_bytes: int = MAX_DOCX_UNCOMPRESSED_BYTES,
-) -> ExtractedDocx:
+def _parse_package(content: bytes, *, max_uncompressed_bytes: int) -> _ParsedPackage:
     archive, infos = _open_package(
         content,
         max_uncompressed_bytes=max_uncompressed_bytes,
@@ -279,6 +299,7 @@ def extract_docx(
         root = _xml(archive.read(_DOCUMENT_PART), label="document")
         _reject_unsupported_markup(root)
         blocks: list[DocxBlock] = []
+        editable: list[etree._Element] = []
         link_number = 0
         for paragraph in root.xpath(".//w:body//w:p", namespaces=_NS):
             block, link_number = _paragraph_block(
@@ -287,22 +308,45 @@ def extract_docx(
                 link_number=link_number,
                 hyperlink_relationships=hyperlink_relationships,
             )
-            if block is not None:
-                blocks.append(block)
-                if len(blocks) > MAX_DOCX_BLOCKS:
-                    raise DocxError(
-                        "docx_too_complex",
-                        "The DOCX contains too many editable text blocks.",
-                    )
+            if block is None:
+                continue
+            blocks.append(block)
+            editable.append(paragraph)
+            if len(blocks) > MAX_DOCX_BLOCKS:
+                raise DocxError(
+                    "docx_too_complex",
+                    "The DOCX contains too many editable text blocks.",
+                )
         if not blocks:
             raise DocxError("empty_docx", "The DOCX has no editable paragraph text.")
-        plain = plain_text_from_replacements(
-            blocks,
-            tuple(DocxReplacement(id=block.id, text=block.text) for block in blocks),
+        return _ParsedPackage(
+            archive=archive,
+            infos=infos,
+            root=root,
+            blocks=tuple(blocks),
+            editable=tuple(editable),
         )
-        return ExtractedDocx(blocks=tuple(blocks), plain_text=plain)
-    finally:
+    except BaseException:
         archive.close()
+        raise
+
+
+def extract_docx(
+    content: bytes,
+    *,
+    max_uncompressed_bytes: int = MAX_DOCX_UNCOMPRESSED_BYTES,
+) -> ExtractedDocx:
+    parsed = _parse_package(content, max_uncompressed_bytes=max_uncompressed_bytes)
+    try:
+        replacements = tuple(
+            DocxReplacement(id=block.id, text=block.text) for block in parsed.blocks
+        )
+        return ExtractedDocx(
+            blocks=parsed.blocks,
+            plain_text=_plain_text_from_validated(replacements),
+        )
+    finally:
+        parsed.archive.close()
 
 
 def _link_parts(text: str) -> tuple[list[str], list[tuple[str, str]]]:
@@ -313,8 +357,11 @@ def _link_parts(text: str) -> tuple[list[str], list[tuple[str, str]]]:
         plain = text[position : match.start()]
         if _RESERVED_LINK_PREFIX in plain or _RESERVED_LINK_CLOSE_PREFIX in plain:
             raise DocxError("invalid_docx_blocks", "A DOCX hyperlink token is malformed.")
+        display = match.group(2)
+        if _RESERVED_LINK_PREFIX in display or _RESERVED_LINK_CLOSE_PREFIX in display:
+            raise DocxError("invalid_docx_blocks", "A DOCX hyperlink token is malformed.")
         plain_parts.append(plain)
-        links.append((match.group(1), match.group(2)))
+        links.append((match.group(1), display))
         position = match.end()
     tail = text[position:]
     if _RESERVED_LINK_PREFIX in tail or _RESERVED_LINK_CLOSE_PREFIX in tail:
@@ -363,13 +410,48 @@ def validate_replacements(
     return tuple(validated)
 
 
+def docx_blocks_from_storage(value: object) -> tuple[DocxBlock, ...]:
+    """Validate and restore the immutable block map stored with an attachment."""
+
+    if not isinstance(value, list) or not value or len(value) > MAX_DOCX_BLOCKS:
+        raise DocxError("invalid_docx_blocks", "The stored DOCX block map is invalid.")
+    blocks: list[DocxBlock] = []
+    next_link_number = 1
+    for block_number, candidate in enumerate(value, start=1):
+        if not isinstance(candidate, dict) or set(candidate) != {"id", "kind", "text"}:
+            raise DocxError("invalid_docx_blocks", "The stored DOCX block map is invalid.")
+        block_id = candidate.get("id")
+        kind = candidate.get("kind")
+        text = candidate.get("text")
+        if (
+            not isinstance(block_id, str)
+            or block_id != f"p{block_number:06d}"
+            or not isinstance(kind, str)
+            or kind not in {"paragraph", "table_cell"}
+            or not isinstance(text, str)
+            or not text
+        ):
+            raise DocxError("invalid_docx_blocks", "The stored DOCX block map is invalid.")
+        _, links = _link_parts(text)
+        for link_id, _display in links:
+            if link_id != f"l{next_link_number:06d}":
+                raise DocxError("invalid_docx_blocks", "The stored DOCX block map is invalid.")
+            next_link_number += 1
+        blocks.append(DocxBlock(id=block_id, kind=kind, text=text))
+    return tuple(blocks)
+
+
 def plain_text_from_replacements(
     template_blocks: Sequence[DocxBlock],
     replacements: Sequence[DocxReplacement | Mapping[str, object]],
 ) -> str:
     validated = validate_replacements(template_blocks, replacements)
+    return _plain_text_from_validated(validated)
+
+
+def _plain_text_from_validated(replacements: Sequence[DocxReplacement]) -> str:
     paragraphs: list[str] = []
-    for replacement in validated:
+    for replacement in replacements:
         plain_parts, links = _link_parts(replacement.text)
         value = plain_parts[0]
         for index, (_, display) in enumerate(links, start=1):
@@ -445,49 +527,29 @@ def render_docx(
     *,
     max_uncompressed_bytes: int = MAX_DOCX_UNCOMPRESSED_BYTES,
 ) -> bytes:
-    extracted = extract_docx(template, max_uncompressed_bytes=max_uncompressed_bytes)
-    validated = validate_replacements(extracted.blocks, replacements)
-    archive, infos = _open_package(
-        template,
-        max_uncompressed_bytes=max_uncompressed_bytes,
-    )
+    parsed = _parse_package(template, max_uncompressed_bytes=max_uncompressed_bytes)
     try:
-        root = _xml(archive.read(_DOCUMENT_PART), label="document")
-        editable: list[etree._Element] = []
-        hyperlink_relationships = _hyperlink_relationships(
-            archive, {info.filename for info in infos}
-        )
-        link_number = 0
-        for paragraph in root.xpath(".//w:body//w:p", namespaces=_NS):
-            block, link_number = _paragraph_block(
-                paragraph,
-                block_number=len(editable) + 1,
-                link_number=link_number,
-                hyperlink_relationships=hyperlink_relationships,
-            )
-            if block is not None:
-                editable.append(paragraph)
-        if len(editable) != len(validated):
-            raise DocxError(
-                "invalid_docx_blocks",
-                "The DOCX template no longer matches its blocks.",
-            )
-        for paragraph, replacement in zip(editable, validated, strict=True):
+        validated = validate_replacements(parsed.blocks, replacements)
+        for paragraph, replacement in zip(parsed.editable, validated, strict=True):
             _patch_paragraph(paragraph, replacement)
         patched_document = etree.tostring(
-            root,
+            parsed.root,
             encoding="UTF-8",
             xml_declaration=True,
             standalone=True,
         )
         output = io.BytesIO()
         with zipfile.ZipFile(output, mode="w") as destination:
-            for info in infos:
-                data = patched_document if info.filename == _DOCUMENT_PART else archive.read(info)
+            for info in parsed.infos:
+                data = (
+                    patched_document
+                    if info.filename == _DOCUMENT_PART
+                    else parsed.archive.read(info)
+                )
                 destination.writestr(info, data)
         return output.getvalue()
     finally:
-        archive.close()
+        parsed.archive.close()
 
 
 __all__ = [
@@ -496,6 +558,8 @@ __all__ = [
     "DocxError",
     "DocxReplacement",
     "ExtractedDocx",
+    "docx_blocks_from_storage",
+    "docx_uncompressed_limit",
     "extract_docx",
     "plain_text_from_replacements",
     "render_docx",

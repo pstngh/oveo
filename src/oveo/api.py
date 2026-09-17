@@ -28,7 +28,7 @@ from oveo.auth import (
 from oveo.authorization import may_access_thread
 from oveo.config import Settings
 from oveo.db import Database
-from oveo.docx import DOCX_MEDIA_TYPE, DocxError, render_docx
+from oveo.docx import DOCX_MEDIA_TYPE, DocxError, docx_uncompressed_limit, render_docx
 from oveo.generation import GenerationError, GenerationManager
 from oveo.models import (
     Attachment,
@@ -530,10 +530,7 @@ async def download_document(
         exported = render_docx(
             template,
             version.docx_blocks,
-            max_uncompressed_bytes=min(
-                50_000_000,
-                max(20_000_000, _settings(request).max_upload_bytes * 20),
-            ),
+            max_uncompressed_bytes=docx_uncompressed_limit(_settings(request).max_upload_bytes),
         )
     except (OSError, DocxError) as exc:
         raise ApiError(

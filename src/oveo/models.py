@@ -146,6 +146,7 @@ class Attachment(Base, TimestampMixin):
         default="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         nullable=False,
     )
+    document_blocks: Mapped[list[dict[str, str]]] = mapped_column(JSON, nullable=False)
     byte_count: Mapped[int] = mapped_column(Integer, nullable=False)
     word_count: Mapped[int] = mapped_column(Integer, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)

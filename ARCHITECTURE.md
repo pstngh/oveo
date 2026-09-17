@@ -97,8 +97,10 @@ DOCX input stays inside the existing attachment directory and backup/deletion
 lifecycle. Upload validation bounds ZIP members, expanded size, compression ratio,
 and XML part size; rejects unsafe paths, encryption, macros, malformed OOXML,
 tracked changes, and complex field hyperlinks; and extracts only main-document
-paragraph and table-cell text. Headers, footers, fields that are not safely
-editable, and non-text drawing content remain untouched.
+paragraph and table-cell text. The immutable extracted block map is stored with
+the attachment so transcript reconstruction does not repeatedly parse the OOXML
+package. Headers, footers, fields that are not safely editable, and non-text
+drawing content remain untouched.
 
 The model receives application-generated block IDs and protected hyperlink tokens.
 The server requires every expected block and hyperlink exactly once and in order,

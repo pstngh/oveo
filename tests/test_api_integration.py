@@ -16,10 +16,11 @@ from pydantic import SecretStr
 from sqlalchemy import select
 from starlette.requests import Request
 
+import oveo.generation as generation_module
 from oveo.auth import change_password, hash_password, verify_password
 from oveo.config import Settings
 from oveo.db import Database
-from oveo.docx import DOCX_MEDIA_TYPE, extract_docx
+from oveo.docx import DOCX_MEDIA_TYPE, ExtractedDocx, extract_docx
 from oveo.generation import ProviderCompletion, ProviderRequest
 from oveo.main import create_app, seed_configured_accounts, validate_production_settings
 from oveo.models import Base, User
@@ -461,7 +462,9 @@ def test_charles_cannot_discover_or_access_yousra_conversations(
     assert api_client.get("/api/usage/lifetime").json() == {"formatted": "$0.000246"}
 
 
-def test_docx_upload_latest_canonical_export_and_ownership(api_client: TestClient) -> None:
+def test_docx_upload_latest_canonical_export_and_ownership(
+    api_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     provider = DocxProvider()
     api_client.app.state.generation_manager.provider = provider
     _, csrf = _login(api_client, "charles", "charles password")
@@ -491,6 +494,16 @@ def test_docx_upload_latest_canonical_export_and_ownership(api_client: TestClien
     assert '"id":"p000001"' in untrusted
     assert "source.docx" not in untrusted
 
+    extraction_calls = 0
+    original_extract = generation_module.extract_docx
+
+    def counted_extract(content: bytes, *, max_uncompressed_bytes: int) -> ExtractedDocx:
+        nonlocal extraction_calls
+        extraction_calls += 1
+        return original_extract(content, max_uncompressed_bytes=max_uncompressed_bytes)
+
+    monkeypatch.setattr(generation_module, "extract_docx", counted_extract)
+
     revised = api_client.post(
         f"/api/threads/{ids['thread_id']}/messages",
         data={
@@ -502,6 +515,9 @@ def test_docx_upload_latest_canonical_export_and_ownership(api_client: TestClien
     assert revised.status_code == 200
     second = _wait_generation(api_client, revised.json()["generation_id"])
     assert second["status"] == "completed"
+    # Snapshot reconstruction uses the stored block map. The only package parse on
+    # this revision is the canonical-template integrity check during state commit.
+    assert extraction_calls == 1
 
     downloaded = api_client.get(f"/api/threads/{ids['thread_id']}/document.docx")
     assert downloaded.status_code == 200

@@ -34,6 +34,10 @@ def test_current_schema_accepts_only_current_modes_and_work_kinds(
     connection = sqlite3.connect(database_path)
     try:
         now = "2026-09-16T12:00:00+00:00"
+        attachment_columns = {
+            row[1]: row[3] for row in connection.execute("PRAGMA table_info(attachments)")
+        }
+        assert attachment_columns["document_blocks"] == 1
         connection.execute(
             "INSERT INTO users "
             "(id, username, display_name, password_hash, credential_version, "
@@ -67,14 +71,16 @@ def test_current_schema_accepts_only_current_modes_and_work_kinds(
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 "INSERT INTO attachments "
-                "(id, message_id, storage_name, original_name, media_type, byte_count, "
-                "word_count, sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(id, message_id, storage_name, original_name, media_type, document_blocks, "
+                "byte_count, word_count, sha256, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     "attachment-1",
                     "message-1",
                     "00000000-0000-0000-0000-000000000000.docx",
                     "source.docx",
                     "text/plain",
+                    "[]",
                     1,
                     1,
                     "0" * 64,

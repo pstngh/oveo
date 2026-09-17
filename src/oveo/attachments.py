@@ -4,11 +4,14 @@ import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from uuid import UUID
 
 from fastapi import UploadFile
 
-from oveo.docx import DocxBlock, DocxError, extract_docx
+from oveo.docx import DocxBlock, DocxError, docx_uncompressed_limit, extract_docx
+
+_MANAGED_DOCX_NAME = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.docx\Z"
+)
 
 
 class AttachmentError(ValueError):
@@ -55,7 +58,7 @@ async def validate_attachment_upload(upload: UploadFile, *, max_bytes: int) -> V
     try:
         extracted = extract_docx(
             content,
-            max_uncompressed_bytes=min(50_000_000, max(20_000_000, max_bytes * 20)),
+            max_uncompressed_bytes=docx_uncompressed_limit(max_bytes),
         )
     except DocxError as exc:
         raise AttachmentError(exc.code, exc.message) from exc
@@ -70,17 +73,11 @@ async def validate_attachment_upload(upload: UploadFile, *, max_bytes: int) -> V
 
 
 def is_managed_attachment_name(name: str) -> bool:
-    path = Path(name)
-    if not path.suffix:
-        return False
-    try:
-        return str(UUID(path.stem)) == path.stem
-    except ValueError:
-        return False
+    return _MANAGED_DOCX_NAME.fullmatch(name) is not None
 
 
 def persist_attachment(directory: Path, storage_name: str, content: bytes) -> Path:
-    if Path(storage_name).suffix != ".docx" or not is_managed_attachment_name(storage_name):
+    if not is_managed_attachment_name(storage_name):
         raise ValueError("unsafe attachment storage name")
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     target = directory / storage_name

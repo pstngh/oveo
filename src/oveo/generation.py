@@ -35,9 +35,10 @@ from oveo.docx import (
     DocxError,
     DocxReplacement,
     ExtractedDocx,
+    docx_blocks_from_storage,
+    docx_uncompressed_limit,
     extract_docx,
     plain_text_from_replacements,
-    validate_replacements,
 )
 from oveo.models import (
     Attachment,
@@ -568,6 +569,8 @@ class GenerationManager:
         after_ordinal: int | None = None,
         through_ordinal: int | None = None,
     ) -> dict[str, Any]:
+        if purpose != "prompt_handoff" and thread.summary_through_ordinal is not None:
+            after_ordinal = max(after_ordinal or 0, thread.summary_through_ordinal)
         message_query = select(Message).where(Message.thread_id == thread.id)
         if after_ordinal is not None:
             message_query = message_query.where(Message.ordinal > after_ordinal)
@@ -601,13 +604,7 @@ class GenerationManager:
                     raise OSError("attachment integrity mismatch")
                 if attachment.media_type != DOCX_MEDIA_TYPE:
                     raise OSError("unsupported attachment media type")
-                extracted = extract_docx(
-                    content,
-                    max_uncompressed_bytes=min(
-                        50_000_000,
-                        max(20_000_000, self.settings.max_upload_bytes * 20),
-                    ),
-                )
+                document_blocks = docx_blocks_from_storage(attachment.document_blocks)
             except (OSError, DocxError) as exc:
                 raise GenerationError(
                     "attachment_unavailable",
@@ -615,7 +612,7 @@ class GenerationManager:
                 ) from exc
             attachments[attachment.message_id] = AttachmentDocument(
                 word_count=attachment.word_count,
-                document_blocks=extracted.blocks,
+                document_blocks=document_blocks,
             )
         canonical = await db.scalar(
             select(WorkVersion)
@@ -801,6 +798,7 @@ class GenerationManager:
                         storage_name=storage_name,
                         original_name=attachment.original_name,
                         media_type=DOCX_MEDIA_TYPE,
+                        document_blocks=[block.to_model() for block in attachment.document_blocks],
                         byte_count=attachment.byte_count,
                         word_count=attachment.word_count,
                         sha256=attachment.sha256,
@@ -1325,13 +1323,12 @@ class GenerationManager:
                 DocxReplacement(id=block.id, text=block.text) for block in state_docx_blocks
             )
             try:
-                validated = validate_replacements(template_blocks, replacements)
-                docx_output = plain_text_from_replacements(template_blocks, validated)
+                docx_output = plain_text_from_replacements(template_blocks, replacements)
             except DocxError as exc:
                 raise ProtocolError(exc.code) from exc
             if output != docx_output:
                 raise ProtocolError("state_docx_output_mismatch")
-            docx_blocks = [block.to_storage() for block in validated]
+            docx_blocks = [block.to_storage() for block in replacements]
 
         _validate_visible_state_correspondence(document, resulting_output=output)
         if not source.strip() or not output.strip() or not brief:
@@ -1375,10 +1372,7 @@ class GenerationManager:
         try:
             return extract_docx(
                 content,
-                max_uncompressed_bytes=min(
-                    50_000_000,
-                    max(20_000_000, self.settings.max_upload_bytes * 20),
-                ),
+                max_uncompressed_bytes=docx_uncompressed_limit(self.settings.max_upload_bytes),
             )
         except DocxError as exc:
             raise ProtocolError("state_docx_template_invalid") from exc
