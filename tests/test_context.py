@@ -9,10 +9,11 @@ from oveo.context import (
     TRUSTED_CONTEXT_END,
     UNTRUSTED_CONTEXT_BEGIN,
     UNTRUSTED_CONTEXT_END,
-    AttachmentText,
+    AttachmentDocument,
     ContextBuildError,
     build_provider_messages,
 )
+from oveo.docx import DocxBlock
 from oveo.models import Message, Thread, WorkVersion
 
 
@@ -165,9 +166,15 @@ def test_canonical_summary_and_attachment_are_preserved_exactly_as_data() -> Non
         recent_messages=[user_message],
         actor_labels={"yousra-id": "Yousra"},
         attachments={
-            "message-1": AttachmentText(
-                text="Pièce jointe\n  exacte <data>",
+            "message-1": AttachmentDocument(
                 word_count=4,
+                document_blocks=(
+                    DocxBlock(
+                        id="p000001",
+                        kind="paragraph",
+                        text="Pièce jointe\n  exacte <data>",
+                    ),
+                ),
             )
         },
         canonical_state=canonical,
@@ -188,7 +195,14 @@ def test_canonical_summary_and_attachment_are_preserved_exactly_as_data() -> Non
         },
     }
     assert payload["recent_transcript"][0]["attachment"] == {
-        "text": "Pièce jointe\n  exacte <data>",
+        "format": "docx",
+        "blocks": [
+            {
+                "id": "p000001",
+                "kind": "paragraph",
+                "text": "Pièce jointe\n  exacte <data>",
+            }
+        ],
         "word_count": 4,
     }
 
@@ -267,9 +281,15 @@ def test_prompt_handoff_exposes_only_user_authored_material() -> None:
         recent_messages=transcript,
         actor_labels={"yousra-id": "Yousra"},
         attachments={
-            "message-3": AttachmentText(
-                text="User-supplied terminology instructions.",
+            "message-3": AttachmentDocument(
                 word_count=3,
+                document_blocks=(
+                    DocxBlock(
+                        id="p000001",
+                        kind="paragraph",
+                        text="User-supplied terminology instructions.",
+                    ),
+                ),
             )
         },
         canonical_state=WorkVersion(
@@ -294,7 +314,13 @@ def test_prompt_handoff_exposes_only_user_authored_material() -> None:
         "user_messages": [
             {"text_parts": ["Always retain the product name."]},
             {
-                "attachment_text": "User-supplied terminology instructions.",
+                "attachment_blocks": [
+                    {
+                        "id": "p000001",
+                        "kind": "paragraph",
+                        "text": "User-supplied terminology instructions.",
+                    }
+                ],
                 "text_parts": ["Use Canadian French."],
             },
         ]

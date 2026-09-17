@@ -5,6 +5,7 @@ import pytest
 from oveo.protocol import (
     AppendState,
     ContentBlock,
+    DocxBlockReplacement,
     EstablishState,
     FullState,
     NoState,
@@ -98,6 +99,31 @@ def test_decoder_returns_each_typed_state_operation() -> None:
         brief={"direction": "en-US-fr-CA", "tone": "professional"},
     )
 
+    docx_establish = decode_state(
+        {
+            "operation": "establish",
+            "source": "Source link",
+            "output": "Sortie lien",
+            "brief": {"direction": "en-fr"},
+            "docx_blocks": [
+                {
+                    "id": "p000001",
+                    "text": "Sortie {{OVEO_LINK_l000001}}lien{{/OVEO_LINK_l000001}}",
+                }
+            ],
+        }
+    )
+    assert docx_establish == EstablishState(
+        source="Source link",
+        output="Sortie lien",
+        brief={"direction": "en-fr"},
+        docx_blocks=(
+            DocxBlockReplacement(
+                id="p000001",
+                text="Sortie {{OVEO_LINK_l000001}}lien{{/OVEO_LINK_l000001}}",
+            ),
+        ),
+    )
     append = decode_state(
         {
             "operation": "append",
@@ -169,6 +195,29 @@ def test_decoder_returns_each_typed_state_operation() -> None:
         source="Complete revised source.",
         brief={"audience": "employees"},
     )
+
+
+def test_docx_state_requires_consecutive_bounded_block_ids() -> None:
+    state = {
+        "operation": "full",
+        "base_version": 1,
+        "output": "Updated",
+        "docx_blocks": [{"id": "p000002", "text": "Updated"}],
+    }
+    with pytest.raises(ProtocolError, match="invalid_docx_blocks"):
+        ProtocolDecoder().feed(complete_stream(state))
+    with pytest.raises(ProtocolError, match="invalid_docx_blocks"):
+        ProtocolDecoder(max_docx_blocks=1).feed(
+            complete_stream(
+                {
+                    **state,
+                    "docx_blocks": [
+                        {"id": "p000001", "text": "One"},
+                        {"id": "p000002", "text": "Two"},
+                    ],
+                }
+            )
+        )
 
 
 @pytest.mark.parametrize(

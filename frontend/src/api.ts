@@ -46,6 +46,7 @@ export const api = {
   accounts: () => request<Account[]>("/api/accounts"),
   threads: () => request<ThreadSummary[]>("/api/threads"),
   thread: (id: string) => request<ThreadDetail>(`/api/threads/${id}`),
+  documentUrl: (id: string) => `/api/threads/${encodeURIComponent(id)}/document.docx`,
   rename: (id: string, title: string) =>
     request<ThreadSummary>(`/api/threads/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
   deleteThread: (id: string) => request<void>(`/api/threads/${id}`, { method: "DELETE" }),

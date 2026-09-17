@@ -4,8 +4,11 @@ import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import UUID
 
 from fastapi import UploadFile
+
+from oveo.docx import DocxBlock, DocxError, extract_docx
 
 
 class AttachmentError(ValueError):
@@ -20,10 +23,10 @@ class AttachmentError(ValueError):
 class ValidatedAttachment:
     original_name: str
     content: bytes
-    text: str
     byte_count: int
     word_count: int
     sha256: str
+    document_blocks: tuple[DocxBlock, ...]
 
 
 def count_words(text: str) -> int:
@@ -32,38 +35,52 @@ def count_words(text: str) -> int:
     return len(re.findall(r"\S+", text, flags=re.UNICODE))
 
 
-async def validate_text_upload(upload: UploadFile, *, max_bytes: int) -> ValidatedAttachment:
-    name = Path(upload.filename or "").name
-    if not name.lower().endswith(".txt"):
-        raise AttachmentError("invalid_attachment_type", "Only .txt source files are supported.")
+async def validate_attachment_upload(upload: UploadFile, *, max_bytes: int) -> ValidatedAttachment:
+    name = Path((upload.filename or "").replace("\\", "/")).name
+    suffix = Path(name).suffix.lower()
+    if suffix != ".docx":
+        raise AttachmentError(
+            "invalid_attachment_type",
+            "Only .docx source files are supported.",
+        )
 
     # Read one byte beyond the ceiling so an exact-limit file remains valid.
     content = await upload.read(max_bytes + 1)
     if len(content) > max_bytes:
         raise AttachmentError(
             "attachment_too_large",
-            f"The text file is larger than the {max_bytes:,}-byte limit.",
+            f"The source file is larger than the {max_bytes:,}-byte limit.",
             status_code=413,
         )
     try:
-        text = content.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise AttachmentError(
-            "invalid_text_encoding",
-            "The text file must use UTF-8 encoding.",
-        ) from exc
+        extracted = extract_docx(
+            content,
+            max_uncompressed_bytes=min(50_000_000, max(20_000_000, max_bytes * 20)),
+        )
+    except DocxError as exc:
+        raise AttachmentError(exc.code, exc.message) from exc
     return ValidatedAttachment(
         original_name=name,
         content=content,
-        text=text,
         byte_count=len(content),
-        word_count=count_words(text),
+        word_count=count_words(extracted.plain_text),
         sha256=hashlib.sha256(content).hexdigest(),
+        document_blocks=extracted.blocks,
     )
 
 
+def is_managed_attachment_name(name: str) -> bool:
+    path = Path(name)
+    if not path.suffix:
+        return False
+    try:
+        return str(UUID(path.stem)) == path.stem
+    except ValueError:
+        return False
+
+
 def persist_attachment(directory: Path, storage_name: str, content: bytes) -> Path:
-    if not re.fullmatch(r"[0-9a-f-]{36}\.txt", storage_name):
+    if Path(storage_name).suffix != ".docx" or not is_managed_attachment_name(storage_name):
         raise ValueError("unsafe attachment storage name")
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     target = directory / storage_name

@@ -51,12 +51,33 @@ Prompt ownership is intentionally explicit:
   protected content, and the compact professional-adviser posture.
 - [`prompts/protocol.md`](prompts/protocol.md) owns only the typed NDJSON grammar,
   block mechanics, state schemas, validation rules, and operation preconditions.
+- [`prompts/docx_protocol.md`](prompts/docx_protocol.md) is loaded only for a DOCX
+  attachment or DOCX-backed canonical version and defines the fixed block-map and
+  protected-hyperlink contract.
 
 A normal global terminology or language-rule change is one edit to
 `alithya_rules.md`, plus focused tests and deployment. It does not require a schema
 or UI change. New prompt rules apply when a future generation is composed,
 including a future turn in an existing conversation. They never rewrite an
 already-saved canonical work version.
+
+## Source attachments and DOCX export
+
+Each user message accepts one standard `.docx` file, subject to the configured
+byte and source-word limits. DOCX uploads are validated as bounded, non-encrypted,
+non-macro OOXML packages and extracted as stable paragraph and table-cell blocks.
+Tracked changes and field-code hyperlinks are rejected because they cannot be
+rewritten safely in v1.
+
+For DOCX-backed canonical work, Oveo preserves the uploaded package as the
+template and stores a complete validated block replacement map on every committed
+version. **Download DOCX** reproduces only the latest committed version by copying
+the template package and patching `word/document.xml`; styles, numbering, tables,
+images, headers, footers, relationships, margins, and section settings remain in
+the original package. Paragraph order and table/list structure cannot change in
+v1. Mixed inline formatting inside replaced ordinary text may collapse to the
+formatting of its first original run, while protected hyperlinks keep their
+original targets and may change display text.
 
 ## Quality gate
 

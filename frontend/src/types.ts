@@ -29,6 +29,7 @@ export interface AttachmentInfo {
   filename: string;
   byte_size: number;
   word_count: number;
+  media_type: string;
 }
 
 export interface Message {
@@ -43,6 +44,7 @@ export interface Message {
 export interface ThreadDetail extends ThreadSummary {
   owner_username: string;
   messages: Message[];
+  docx_exportable?: boolean;
   generation?: GenerationSnapshot | null;
 }
 

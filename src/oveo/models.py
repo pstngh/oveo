@@ -128,6 +128,11 @@ class Attachment(Base, TimestampMixin):
     __table_args__ = (
         CheckConstraint("byte_count >= 0", name="ck_attachments_byte_count"),
         CheckConstraint("word_count >= 0", name="ck_attachments_word_count"),
+        CheckConstraint(
+            "media_type = "
+            "'application/vnd.openxmlformats-officedocument.wordprocessingml.document'",
+            name="ck_attachments_docx_media_type",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -136,7 +141,11 @@ class Attachment(Base, TimestampMixin):
     )
     storage_name: Mapped[str] = mapped_column(String(80), unique=True, nullable=False)
     original_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    media_type: Mapped[str] = mapped_column(String(100), default="text/plain", nullable=False)
+    media_type: Mapped[str] = mapped_column(
+        String(100),
+        default="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        nullable=False,
+    )
     byte_count: Mapped[int] = mapped_column(Integer, nullable=False)
     word_count: Mapped[int] = mapped_column(Integer, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -226,6 +235,11 @@ class WorkVersion(Base, TimestampMixin):
             "operation IN ('establish', 'append', 'replace', 'full')",
             name="ck_work_versions_operation",
         ),
+        CheckConstraint(
+            "(docx_template_attachment_id IS NULL AND docx_blocks IS NULL) OR "
+            "(docx_template_attachment_id IS NOT NULL AND docx_blocks IS NOT NULL)",
+            name="ck_work_versions_docx_pair",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -244,6 +258,14 @@ class WorkVersion(Base, TimestampMixin):
     output_text: Mapped[str] = mapped_column(Text, nullable=False)
     source_word_count: Mapped[int] = mapped_column(Integer, nullable=False)
     brief: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    docx_template_attachment_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "attachments.id",
+            ondelete="CASCADE",
+            name="fk_work_versions_docx_template_attachment_id_attachments",
+        )
+    )
+    docx_blocks: Mapped[list[dict[str, str]] | None] = mapped_column(JSON(none_as_null=True))
 
 
 class UsageEvent(Base, TimestampMixin):

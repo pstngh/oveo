@@ -49,7 +49,7 @@ def _database(path: Path, attachment: Path) -> None:
 def test_backup_round_trip_uses_consistent_sqlite_snapshot(tmp_path: Path) -> None:
     attachments = tmp_path / "attachments"
     attachments.mkdir()
-    attachment = attachments / "synthetic.txt"
+    attachment = attachments / "synthetic.docx"
     attachment.write_text("Synthetic attachment only.\n", encoding="utf-8")
     database = tmp_path / "oveo.sqlite3"
     _database(database, attachment)
@@ -60,7 +60,7 @@ def test_backup_round_trip_uses_consistent_sqlite_snapshot(tmp_path: Path) -> No
     restored = tmp_path / "restored"
     backup_tool.restore_archive(archive, restored)
 
-    assert (restored / "attachments" / "synthetic.txt").read_text(encoding="utf-8") == (
+    assert (restored / "attachments" / "synthetic.docx").read_text(encoding="utf-8") == (
         "Synthetic attachment only.\n"
     )
     connection = sqlite3.connect(restored / "oveo.sqlite3")
@@ -71,7 +71,7 @@ def test_backup_round_trip_uses_consistent_sqlite_snapshot(tmp_path: Path) -> No
 def test_backup_rejects_attachment_digest_mismatch(tmp_path: Path) -> None:
     attachments = tmp_path / "attachments"
     attachments.mkdir()
-    attachment = attachments / "synthetic.txt"
+    attachment = attachments / "synthetic.docx"
     attachment.write_text("expected", encoding="utf-8")
     database = tmp_path / "oveo.sqlite3"
     _database(database, attachment)
@@ -84,11 +84,11 @@ def test_backup_rejects_attachment_digest_mismatch(tmp_path: Path) -> None:
 def test_backup_rejects_unreferenced_attachment_file(tmp_path: Path) -> None:
     attachments = tmp_path / "attachments"
     attachments.mkdir()
-    attachment = attachments / "synthetic.txt"
+    attachment = attachments / "synthetic.docx"
     attachment.write_text("expected", encoding="utf-8")
     database = tmp_path / "oveo.sqlite3"
     _database(database, attachment)
-    (attachments / "orphan.txt").write_text("must not be archived", encoding="utf-8")
+    (attachments / "orphan.docx").write_text("must not be archived", encoding="utf-8")
 
     with pytest.raises(backup_tool.BackupError, match="not referenced"):
         backup_tool.create_archive(database, attachments, tmp_path / "backup.tar.gz")

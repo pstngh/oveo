@@ -152,7 +152,7 @@ jobs:
             sleep 2
           done
           docker exec "$container" python -c \
-            "import sqlite3; db=sqlite3.connect('/data/oveo.sqlite3'); assert db.execute('SELECT username FROM users ORDER BY username').fetchall() == [('charles',), ('yousra',)]; assert 'role' not in {row[1] for row in db.execute('PRAGMA table_info(users)')}; assert db.execute('SELECT version_num FROM alembic_version').fetchone() == ('20260916_0002',)"
+            "import sqlite3; db=sqlite3.connect('/data/oveo.sqlite3'); assert db.execute('SELECT username FROM users ORDER BY username').fetchall() == [('charles',), ('yousra',)]; assert 'role' not in {row[1] for row in db.execute('PRAGMA table_info(users)')}; assert db.execute('SELECT version_num FROM alembic_version').fetchone() == ('20260916_0003',); assert 'ck_attachments_docx_media_type' in db.execute(\"SELECT sql FROM sqlite_master WHERE type='table' AND name='attachments'\").fetchone()[0]"
           printf 'OVEO_REHEARSED_IMAGE=%s\nOVEO_REHEARSED_COMMIT=%s\n' \
             "$IMAGE" "$GITHUB_SHA" > REHEARSAL
   deploy:

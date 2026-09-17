@@ -5,27 +5,34 @@ import io
 import pytest
 from fastapi import UploadFile
 
-from oveo.attachments import AttachmentError, count_words, validate_text_upload
+from oveo.attachments import AttachmentError, count_words, validate_attachment_upload
 from oveo.provider import parse_usage
 from oveo.usage import format_lifetime_cost
+from tests.docx_fixtures import make_docx
 
 
 @pytest.mark.asyncio
-async def test_text_upload_accepts_utf8_bom() -> None:
-    upload = UploadFile(filename="source.TXT", file=io.BytesIO(b"\xef\xbb\xbfHello world"))
-    result = await validate_text_upload(upload, max_bytes=100)
-    assert result.text == "Hello world"
-    assert result.word_count == 2
+async def test_docx_upload_is_extracted() -> None:
+    content = make_docx()
+    upload = UploadFile(filename="source.DOCX", file=io.BytesIO(content))
+    result = await validate_attachment_upload(upload, max_bytes=len(content))
+    assert result.word_count == 4
+    assert [block.text for block in result.document_blocks] == [
+        "Hello {{OVEO_LINK_l000001}}site{{/OVEO_LINK_l000001}}.",
+        "Cell text",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_text_upload_rejects_invalid_utf8_and_byte_overflow() -> None:
-    invalid = UploadFile(filename="source.txt", file=io.BytesIO(b"\xff"))
-    with pytest.raises(AttachmentError, match="UTF-8"):
-        await validate_text_upload(invalid, max_bytes=100)
-    oversized = UploadFile(filename="source.txt", file=io.BytesIO(b"1234"))
+async def test_upload_rejects_text_files_and_byte_overflow() -> None:
+    text_upload = UploadFile(filename="source.txt", file=io.BytesIO(b"legacy"))
+    with pytest.raises(AttachmentError, match=r"Only \.docx") as invalid_type:
+        await validate_attachment_upload(text_upload, max_bytes=100)
+    assert invalid_type.value.code == "invalid_attachment_type"
+
+    oversized = UploadFile(filename="source.docx", file=io.BytesIO(b"1234"))
     with pytest.raises(AttachmentError) as error:
-        await validate_text_upload(oversized, max_bytes=3)
+        await validate_attachment_upload(oversized, max_bytes=3)
     assert error.value.status_code == 413
 
 

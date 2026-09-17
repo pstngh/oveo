@@ -177,7 +177,10 @@ def create_app(
         )
         if app_settings.production:
             response.headers["Strict-Transport-Security"] = "max-age=31536000"
-        if request.url.path.startswith("/api/"):
+        if (
+            request.url.path.startswith("/api/")
+            and response.headers.get("Cache-Control") != "private, no-store"
+        ):
             response.headers["Cache-Control"] = "no-store"
         return response
 

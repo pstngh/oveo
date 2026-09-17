@@ -32,6 +32,7 @@ For an ordinary visible chat generation, the system message contains exactly:
 1. machine-generated trusted application context with canonical mode, generation
    purpose, instruction/data boundary, and explicit conflict policy;
 2. the shared technical `protocol.md`;
+   for DOCX-backed work, the conditional `docx_protocol.md` extension;
 3. exactly one active mode prompt;
 4. exactly one shared `alithya_rules.md`.
 
@@ -62,12 +63,13 @@ canonical versions.
 ## Data model and migrations
 
 - `users` and `sessions` hold identities and revocable authentication state.
-- `threads`, immutable `messages`, and one optional attachment per user message
-  form the visible conversation.
+- `threads`, immutable `messages`, and one optional `.docx` attachment
+  per user message form the visible conversation.
 - `generations` hold idempotency keys, frozen request context, status, replayable
   partial blocks, provider IDs, and safe errors.
 - `work_items` use kinds `translation`, `revision`, or `draft`; immutable
-  `work_versions` hold complete canonical source/output/brief snapshots.
+  `work_versions` hold complete canonical source/output/brief snapshots plus,
+  when applicable, a DOCX template attachment reference and block replacements.
 - `usage_events` form an append-only micro-USD ledger, survive thread deletion, and
   produce one overall lifetime-cost total visible to either authenticated account.
 
@@ -89,10 +91,27 @@ Mode prompts decide when those valid operations semantically apply. Each mode ma
 new canonical work to its corresponding work kind. Stop/failure discards partial
 assistant output but retains the user turn; retry does not duplicate it.
 
+## DOCX preservation path
+
+DOCX input stays inside the existing attachment directory and backup/deletion
+lifecycle. Upload validation bounds ZIP members, expanded size, compression ratio,
+and XML part size; rejects unsafe paths, encryption, macros, malformed OOXML,
+tracked changes, and complex field hyperlinks; and extracts only main-document
+paragraph and table-cell text. Headers, footers, fields that are not safely
+editable, and non-text drawing content remain untouched.
+
+The model receives application-generated block IDs and protected hyperlink tokens.
+The server requires every expected block and hyperlink exactly once and in order,
+derives clean canonical output from the validated map, and commits the map in the
+same transaction as the assistant message and `work_version`. Export is an
+authenticated, private/no-store GET that selects the latest active canonical
+version and patches the original OOXML package in memory. Generated exports are
+not persisted.
+
 ## Deliberate omissions
 
 Oveo has no dynamic rule-pack loader, prompt database/editor, unified-conversation
 router, Redis, worker service, queue broker, model selector, mutable-message
-branching, Office/OCR pipeline, analytics, signup/recovery flow, or linguistic
-repair scanner. These are unnecessary for this private deployment and would make
-the trust and maintenance paths less clear.
+branching, office conversion suite, OCR pipeline, analytics, signup/recovery flow,
+or linguistic repair scanner. These are unnecessary for this private deployment
+and would make the trust and maintenance paths less clear.

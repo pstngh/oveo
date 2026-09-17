@@ -69,6 +69,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .cost { font-variant-numeric: tabular-nums; color: #c4c3bf; font-size: .88rem; }
 
 .workspace { min-width: 0; min-height: 0; height: 100%; display: grid; grid-template-rows: minmax(0, 1fr) auto; overflow: hidden; position: relative; }
+.docx-download { position: absolute; z-index: 10; top: 12px; right: 18px; height: 36px; display: flex; align-items: center; gap: 7px; padding: 0 11px; border: 1px solid #4a4138; border-radius: 8px; color: #e4c499; background: rgba(41,36,31,.94); text-decoration: none; font-size: .82rem; font-weight: 650; }
+.docx-download:hover { border-color: #725d43; background: #332a22; }
+.docx-download svg { width: 15px; height: 15px; }
 .icon-button { width: 36px; height: 36px; display: inline-grid; place-items: center; padding: 0; border: 0; border-radius: 8px; background: transparent; cursor: pointer; }
 .icon-button:hover { background: #303136; }
 .icon-button svg { width: 18px; height: 18px; }
@@ -159,6 +162,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .sidebar-head { height: 48px; display: flex; align-items: center; justify-content: flex-end; padding: 0 8px; }
   .mobile-menu { position: fixed; z-index: 20; top: 12px; left: 12px; width: 40px; height: 40px; display: grid; place-items: center; padding: 0; border: 1px solid #3b3c40; border-radius: 9px; background: rgba(35,36,39,.9); }
   .mobile-menu svg { width: 19px; }
+  .docx-download { top: 14px; right: 12px; }
   .mobile-close { display: grid; }
   .workspace { height: 100%; }
   .thread-delete { opacity: 1; pointer-events: auto; }

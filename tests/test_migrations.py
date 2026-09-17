@@ -58,6 +58,29 @@ def test_current_schema_accepts_only_current_modes_and_work_kinds(
                 "VALUES (?, ?, ?, ?, ?)",
                 (f"{kind}-work", f"{thread_mode}-thread", kind, 1, now),
             )
+        connection.execute(
+            "INSERT INTO messages "
+            "(id, thread_id, ordinal, role, actor_user_id, content_schema_version, "
+            "content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("message-1", "translate-thread", 1, "user", "user-1", 1, "[]", now),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO attachments "
+                "(id, message_id, storage_name, original_name, media_type, byte_count, "
+                "word_count, sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "attachment-1",
+                    "message-1",
+                    "00000000-0000-0000-0000-000000000000.docx",
+                    "source.docx",
+                    "text/plain",
+                    1,
+                    1,
+                    "0" * 64,
+                    now,
+                ),
+            )
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 "INSERT INTO threads "
@@ -70,7 +93,7 @@ def test_current_schema_accepts_only_current_modes_and_work_kinds(
         connection.close()
 
 
-def test_role_removal_migration_preserves_accounts_and_threads(
+def test_docx_migration_clears_conversations_and_preserves_accounts_and_usage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database_path = tmp_path / "remove-role.sqlite3"
@@ -92,6 +115,88 @@ def test_role_removal_migration_preserves_accounts_and_threads(
             "VALUES (?, ?, ?, ?, ?, ?)",
             ("thread-1", "user-1", "translate", "Preserved", now, now),
         )
+        connection.execute(
+            "INSERT INTO messages "
+            "(id, thread_id, ordinal, role, actor_user_id, content_schema_version, "
+            "content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("message-1", "thread-1", 1, "user", "user-1", 1, "[]", now),
+        )
+        connection.execute(
+            "INSERT INTO attachments "
+            "(id, message_id, storage_name, original_name, media_type, byte_count, "
+            "word_count, sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "attachment-1",
+                "message-1",
+                "00000000-0000-0000-0000-000000000000.txt",
+                "legacy.txt",
+                "text/plain",
+                6,
+                1,
+                "0" * 64,
+                now,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO generations "
+            "(id, thread_id, requester_id, source_message_id, client_request_id, "
+            "purpose, status, request_snapshot, partial_blocks, stream_revision, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "generation-1",
+                "thread-1",
+                "user-1",
+                "message-1",
+                "request-1",
+                "chat",
+                "completed",
+                "{}",
+                "[]",
+                0,
+                now,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO work_items (id, thread_id, kind, active, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("work-1", "thread-1", "translation", 1, now),
+        )
+        connection.execute(
+            "INSERT INTO work_versions "
+            "(id, work_item_id, version_no, cause_message_id, operation, source_text, "
+            "output_text, source_word_count, brief, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "version-1",
+                "work-1",
+                1,
+                "message-1",
+                "establish",
+                "legacy",
+                "ancien",
+                1,
+                "{}",
+                now,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO usage_events "
+            "(id, thread_id, generation_id, requester_id, provider, dedupe_key, "
+            "event_type, purpose, amount_microusd, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "usage-1",
+                "thread-1",
+                "generation-1",
+                "user-1",
+                "openrouter",
+                "usage-1",
+                "charge",
+                "chat",
+                123,
+                now,
+            ),
+        )
         connection.commit()
     finally:
         connection.close()
@@ -105,7 +210,18 @@ def test_role_removal_migration_preserves_accounts_and_threads(
         assert connection.execute("SELECT username, display_name FROM users").fetchall() == [
             ("charles", "Charles")
         ]
-        assert connection.execute("SELECT owner_id FROM threads").fetchone() == ("user-1",)
+        for statement in (
+            "SELECT count(*) FROM threads",
+            "SELECT count(*) FROM messages",
+            "SELECT count(*) FROM attachments",
+            "SELECT count(*) FROM generations",
+            "SELECT count(*) FROM work_items",
+            "SELECT count(*) FROM work_versions",
+        ):
+            assert connection.execute(statement).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT requester_id, amount_microusd FROM usage_events"
+        ).fetchall() == [("user-1", 123)]
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         connection.close()

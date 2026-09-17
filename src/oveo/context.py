@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Final, Literal
 
 from oveo.config import get_settings
+from oveo.docx import DocxBlock
 from oveo.models import Message, Thread, WorkVersion
 from oveo.protocol import ContentBlock, ProtocolError, validate_content_blocks
 from oveo.provider import ProviderMessage
@@ -117,15 +118,15 @@ class PromptLoadError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class AttachmentText:
-    """Extracted attachment text associated with one persisted message.
+class AttachmentDocument:
+    """Extracted DOCX blocks associated with one persisted message.
 
     Filenames are intentionally excluded because they are unnecessary model context and
     may themselves contain sensitive information.
     """
 
-    text: str
     word_count: int
+    document_blocks: tuple[DocxBlock, ...]
 
     def __post_init__(self) -> None:
         if self.word_count < 0:
@@ -147,6 +148,9 @@ class PromptLoader:
 
     def protocol_prompt(self) -> str:
         return self._read_fixed_file("protocol.md")
+
+    def docx_protocol_prompt(self) -> str:
+        return self._read_fixed_file("docx_protocol.md")
 
     def alithya_rules_prompt(self) -> str:
         return self._read_fixed_file("alithya_rules.md")
@@ -186,7 +190,7 @@ def build_provider_messages(
     purpose: ContextPurpose,
     recent_messages: Sequence[Message],
     actor_labels: Mapping[str, str],
-    attachments: Mapping[str, AttachmentText] | None = None,
+    attachments: Mapping[str, AttachmentDocument] | None = None,
     canonical_state: WorkVersion | None = None,
     prompt_loader: PromptLoader | None = None,
 ) -> list[ProviderMessage]:
@@ -216,12 +220,18 @@ def build_provider_messages(
         trusted = _maintenance_system_message(purpose=purpose)
     else:
         loader = prompt_loader or PromptLoader()
+        protocol_prompt = loader.protocol_prompt() if purpose in _VISIBLE_PURPOSES else None
+        has_docx = bool(attachments) or bool(
+            canonical_state is not None and canonical_state.docx_template_attachment_id is not None
+        )
+        if protocol_prompt is not None and has_docx:
+            protocol_prompt += "\n\n" + loader.docx_protocol_prompt()
         trusted = _trusted_system_message(
             mode=mode,
             purpose=purpose,
             mode_prompt=loader.mode_prompt(mode),
             alithya_rules_prompt=loader.alithya_rules_prompt(),
-            protocol_prompt=loader.protocol_prompt() if purpose in _VISIBLE_PURPOSES else None,
+            protocol_prompt=protocol_prompt,
         )
     envelope = _untrusted_envelope(
         thread=thread,
@@ -256,7 +266,7 @@ def _user_instruction_envelope(
     thread: Thread,
     recent_messages: Sequence[Message],
     actor_labels: Mapping[str, str],
-    attachments: Mapping[str, AttachmentText],
+    attachments: Mapping[str, AttachmentDocument],
 ) -> str:
     """Serialize only verbatim user-authored material for a prompt handoff."""
 
@@ -280,7 +290,7 @@ def _user_instruction_envelope(
         }
         attachment = entry.get("attachment")
         if isinstance(attachment, dict):
-            user_entry["attachment_text"] = attachment["text"]
+            user_entry["attachment_blocks"] = attachment["blocks"]
         user_messages.append(user_entry)
 
     serialized = _safe_json({"user_messages": user_messages})
@@ -372,7 +382,7 @@ def _untrusted_envelope(
     thread: Thread,
     recent_messages: Sequence[Message],
     actor_labels: Mapping[str, str],
-    attachments: Mapping[str, AttachmentText],
+    attachments: Mapping[str, AttachmentDocument],
     canonical_state: WorkVersion | None,
 ) -> str:
     seen_ordinals: set[int] = set()
@@ -409,7 +419,7 @@ def _transcript_entry(
     message: Message,
     *,
     actor_labels: Mapping[str, str],
-    attachment: AttachmentText | None,
+    attachment: AttachmentDocument | None,
 ) -> dict[str, Any]:
     blocks: tuple[ContentBlock, ...]
     if not message.content and message.role == "user" and attachment is not None:
@@ -443,7 +453,8 @@ def _transcript_entry(
     }
     if attachment is not None:
         entry["attachment"] = {
-            "text": attachment.text,
+            "format": "docx",
+            "blocks": [block.to_model() for block in attachment.document_blocks],
             "word_count": attachment.word_count,
         }
     return entry
@@ -453,7 +464,7 @@ def _canonical_payload(state: WorkVersion | None) -> dict[str, Any] | None:
     if state is None:
         return None
     if isinstance(state, WorkVersion):
-        return {
+        payload: dict[str, Any] = {
             "application_state": {
                 "version": state.version_no,
                 "source_word_count": state.source_word_count,
@@ -465,6 +476,9 @@ def _canonical_payload(state: WorkVersion | None) -> dict[str, Any] | None:
                 "brief": state.brief,
             },
         }
+        if state.docx_template_attachment_id is not None and state.docx_blocks is not None:
+            payload["document_data"]["docx_blocks"] = state.docx_blocks
+        return payload
     raise ContextBuildError("unsupported canonical work state")
 
 
@@ -489,7 +503,7 @@ __all__ = [
     "TRUSTED_CONTEXT_END",
     "UNTRUSTED_CONTEXT_BEGIN",
     "UNTRUSTED_CONTEXT_END",
-    "AttachmentText",
+    "AttachmentDocument",
     "ContextBuildError",
     "ContextPurpose",
     "PromptLoadError",

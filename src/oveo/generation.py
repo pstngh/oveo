@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
-import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
@@ -15,16 +15,30 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from oveo.attachments import ValidatedAttachment, count_words, persist_attachment
+from oveo.attachments import (
+    ValidatedAttachment,
+    count_words,
+    is_managed_attachment_name,
+    persist_attachment,
+)
 from oveo.config import Settings
 from oveo.context import (
     HANDOFF_SENTINEL,
-    AttachmentText,
+    AttachmentDocument,
     build_handoff_merge_messages,
     build_provider_messages,
 )
 from oveo.db import Database
 from oveo.diagnostics import log_unexpected
+from oveo.docx import (
+    DOCX_MEDIA_TYPE,
+    DocxError,
+    DocxReplacement,
+    ExtractedDocx,
+    extract_docx,
+    plain_text_from_replacements,
+    validate_replacements,
+)
 from oveo.models import (
     Attachment,
     Generation,
@@ -502,7 +516,7 @@ class GenerationManager:
         for candidate in directory.iterdir():
             if (
                 not candidate.is_file()
-                or re.fullmatch(r"[0-9a-f-]{36}\.txt", candidate.name) is None
+                or not is_managed_attachment_name(candidate.name)
                 or candidate.name in referenced
             ):
                 continue
@@ -575,19 +589,33 @@ class GenerationManager:
         if through_ordinal is not None:
             attachment_query = attachment_query.where(Message.ordinal <= through_ordinal)
         attachment_rows = list((await db.execute(attachment_query)).scalars())
-        attachments: dict[str, AttachmentText] = {}
+        attachments: dict[str, AttachmentDocument] = {}
         for attachment in attachment_rows:
             path = self.settings.attachments_dir / attachment.storage_name
             try:
-                attachment_text = path.read_bytes().decode("utf-8-sig")
-            except (OSError, UnicodeDecodeError) as exc:
+                content = path.read_bytes()
+                if (
+                    len(content) != attachment.byte_count
+                    or hashlib.sha256(content).hexdigest() != attachment.sha256
+                ):
+                    raise OSError("attachment integrity mismatch")
+                if attachment.media_type != DOCX_MEDIA_TYPE:
+                    raise OSError("unsupported attachment media type")
+                extracted = extract_docx(
+                    content,
+                    max_uncompressed_bytes=min(
+                        50_000_000,
+                        max(20_000_000, self.settings.max_upload_bytes * 20),
+                    ),
+                )
+            except (OSError, DocxError) as exc:
                 raise GenerationError(
                     "attachment_unavailable",
-                    "The saved text attachment is unavailable.",
+                    "The saved source attachment is unavailable.",
                 ) from exc
-            attachments[attachment.message_id] = AttachmentText(
-                text=attachment_text,
+            attachments[attachment.message_id] = AttachmentDocument(
                 word_count=attachment.word_count,
+                document_blocks=extracted.blocks,
             )
         canonical = await db.scalar(
             select(WorkVersion)
@@ -654,7 +682,7 @@ class GenerationManager:
     ) -> Submission:
         clean_text = text.strip()
         if not clean_text and attachment is None:
-            raise GenerationError("empty_message", "Enter a message or attach a text file.")
+            raise GenerationError("empty_message", "Enter a message or attach a source file.")
         if not client_request_id or len(client_request_id) > 100:
             raise GenerationError("invalid_request_id", "The request identifier is invalid.")
 
@@ -761,7 +789,7 @@ class GenerationManager:
             await db.flush()
             if attachment is not None:
                 attachment_id = new_id()
-                storage_name = f"{attachment_id}.txt"
+                storage_name = f"{attachment_id}.docx"
                 storage_path = persist_attachment(
                     self.settings.attachments_dir, storage_name, attachment.content
                 )
@@ -772,6 +800,7 @@ class GenerationManager:
                         message_id=message.id,
                         storage_name=storage_name,
                         original_name=attachment.original_name,
+                        media_type=DOCX_MEDIA_TYPE,
                         byte_count=attachment.byte_count,
                         word_count=attachment.word_count,
                         sha256=attachment.sha256,
@@ -1185,6 +1214,21 @@ class GenerationManager:
                 .limit(1)
             )
 
+        source_attachment = None
+        if generation.source_message_id is not None:
+            source_attachment = await db.scalar(
+                select(Attachment).where(Attachment.message_id == generation.source_message_id)
+            )
+        source_docx = (
+            source_attachment
+            if source_attachment is not None and source_attachment.media_type == DOCX_MEDIA_TYPE
+            else None
+        )
+        docx_template_attachment_id: str | None = None
+        docx_blocks: list[dict[str, str]] | None = None
+        template_blocks = None
+        state_docx_blocks = getattr(state, "docx_blocks", None)
+
         if isinstance(state, EstablishState):
             if item is not None:
                 item.active = False
@@ -1205,6 +1249,16 @@ class GenerationManager:
             version_no = 1
             parent_version_id = None
             operation = "establish"
+            if source_docx is not None:
+                if state_docx_blocks is None:
+                    raise ProtocolError("state_docx_blocks_missing")
+                extracted = self._read_docx_template(source_docx)
+                if source != extracted.plain_text:
+                    raise ProtocolError("state_docx_source_mismatch")
+                docx_template_attachment_id = source_docx.id
+                template_blocks = extracted.blocks
+            elif state_docx_blocks is not None:
+                raise ProtocolError("state_docx_template_missing")
         else:
             if item is None or current is None:
                 raise ProtocolError("state_base_missing")
@@ -1216,6 +1270,27 @@ class GenerationManager:
             version_no = current.version_no + 1
             parent_version_id = current.id
             operation = state.operation
+
+            current_has_docx = current.docx_template_attachment_id is not None
+            if current_has_docx != (current.docx_blocks is not None):
+                raise ProtocolError("state_docx_base_invalid")
+            if source_docx is not None:
+                # A new uploaded Word document establishes a new immutable template;
+                # it cannot silently replace the template of an existing work item.
+                raise ProtocolError("state_docx_requires_establish")
+            if current_has_docx:
+                if isinstance(state, AppendState):
+                    raise ProtocolError("state_docx_append_unsupported")
+                if state_docx_blocks is None:
+                    raise ProtocolError("state_docx_blocks_missing")
+                template_attachment = await db.get(Attachment, current.docx_template_attachment_id)
+                if template_attachment is None:
+                    raise ProtocolError("state_docx_template_missing")
+                extracted = self._read_docx_template(template_attachment)
+                docx_template_attachment_id = template_attachment.id
+                template_blocks = extracted.blocks
+            elif state_docx_blocks is not None:
+                raise ProtocolError("state_docx_template_missing")
 
             if isinstance(state, AppendState):
                 source = _append_text(source, state.source_addition, state.source_separator)
@@ -1244,6 +1319,20 @@ class GenerationManager:
             else:  # pragma: no cover - kept defensive for future protocol variants
                 raise ProtocolError("invalid_state_operation")
 
+        if template_blocks is not None:
+            assert state_docx_blocks is not None
+            replacements = tuple(
+                DocxReplacement(id=block.id, text=block.text) for block in state_docx_blocks
+            )
+            try:
+                validated = validate_replacements(template_blocks, replacements)
+                docx_output = plain_text_from_replacements(template_blocks, validated)
+            except DocxError as exc:
+                raise ProtocolError(exc.code) from exc
+            if output != docx_output:
+                raise ProtocolError("state_docx_output_mismatch")
+            docx_blocks = [block.to_storage() for block in validated]
+
         _validate_visible_state_correspondence(document, resulting_output=output)
         if not source.strip() or not output.strip() or not brief:
             raise ProtocolError("invalid_canonical_state")
@@ -1261,9 +1350,38 @@ class GenerationManager:
                 output_text=output,
                 source_word_count=source_word_count,
                 brief=brief,
+                docx_template_attachment_id=docx_template_attachment_id,
+                docx_blocks=docx_blocks,
             )
         )
         await db.flush()
+
+    def _read_docx_template(self, attachment: Attachment) -> ExtractedDocx:
+        if attachment.media_type != DOCX_MEDIA_TYPE:
+            raise ProtocolError("state_docx_template_invalid")
+        root = self.settings.attachments_dir.resolve()
+        path = (root / attachment.storage_name).resolve()
+        if path.parent != root:
+            raise ProtocolError("state_docx_template_invalid")
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise ProtocolError("state_docx_template_missing") from exc
+        if (
+            len(content) != attachment.byte_count
+            or hashlib.sha256(content).hexdigest() != attachment.sha256
+        ):
+            raise ProtocolError("state_docx_template_invalid")
+        try:
+            return extract_docx(
+                content,
+                max_uncompressed_bytes=min(
+                    50_000_000,
+                    max(20_000_000, self.settings.max_upload_bytes * 20),
+                ),
+            )
+        except DocxError as exc:
+            raise ProtocolError("state_docx_template_invalid") from exc
 
     async def _record_provider_completion(
         self,

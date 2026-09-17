@@ -42,10 +42,17 @@ class NoState:
 
 
 @dataclass(frozen=True, slots=True)
+class DocxBlockReplacement:
+    id: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class EstablishState:
     source: str
     output: str
     brief: dict[str, object]
+    docx_blocks: tuple[DocxBlockReplacement, ...] | None = None
     operation: Literal["establish"] = "establish"
 
 
@@ -82,6 +89,7 @@ class ReplaceState:
     base_version: int
     replacements: tuple[ExactReplacement, ...]
     brief: dict[str, object] | None = None
+    docx_blocks: tuple[DocxBlockReplacement, ...] | None = None
     operation: Literal["replace"] = "replace"
 
 
@@ -91,6 +99,7 @@ class FullState:
     output: str
     source: str | None
     brief: dict[str, object] | None
+    docx_blocks: tuple[DocxBlockReplacement, ...] | None = None
     operation: Literal["full"] = "full"
 
 
@@ -306,6 +315,7 @@ class ProtocolDecoder:
         max_state_text_chars: int = 4_000_000,
         max_brief_bytes: int = 65_536,
         max_replacements: int = 64,
+        max_docx_blocks: int = 10_000,
     ) -> None:
         if (
             max_line_bytes < 1
@@ -314,6 +324,7 @@ class ProtocolDecoder:
             or max_state_text_chars < 1
             or max_brief_bytes < 1
             or max_replacements < 1
+            or max_docx_blocks < 1
         ):
             raise ValueError("protocol limits must be positive")
         self._utf8 = codecs.getincrementaldecoder("utf-8")("strict")
@@ -324,6 +335,7 @@ class ProtocolDecoder:
         self._max_state_text_chars = max_state_text_chars
         self._max_brief_bytes = max_brief_bytes
         self._max_replacements = max_replacements
+        self._max_docx_blocks = max_docx_blocks
         self._started = False
         self._completed = False
         self._state_seen = False
@@ -517,15 +529,30 @@ class ProtocolDecoder:
             return NoState()
 
         if operation == "establish":
-            _require_exact_keys(
+            _require_keys(
                 payload,
-                frozenset({"v", "event", "operation", "source", "output", "brief"}),
+                required=frozenset({"v", "event", "operation", "source", "output", "brief"}),
+                optional=frozenset({"docx_blocks"}),
             )
             source = _validated_text(payload.get("source"), complete=True)
             output = _validated_text(payload.get("output"), complete=True)
             brief = _validated_brief(payload.get("brief"), max_bytes=self._max_brief_bytes)
-            self._validate_state_size(source, output)
-            return EstablishState(source=source, output=output, brief=brief)
+            docx_blocks = (
+                self._validated_docx_blocks(payload.get("docx_blocks"))
+                if "docx_blocks" in payload
+                else None
+            )
+            self._validate_state_size(
+                source,
+                output,
+                *(block.text for block in docx_blocks or ()),
+            )
+            return EstablishState(
+                source=source,
+                output=output,
+                brief=brief,
+                docx_blocks=docx_blocks,
+            )
 
         if operation == "append":
             _require_keys(
@@ -568,7 +595,7 @@ class ProtocolDecoder:
             _require_keys(
                 payload,
                 required=frozenset({"v", "event", "operation", "base_version", "replacements"}),
-                optional=frozenset({"brief"}),
+                optional=frozenset({"brief", "docx_blocks"}),
             )
             base_version = _validated_base_version(payload.get("base_version"))
             raw_replacements = payload.get("replacements")
@@ -622,23 +649,32 @@ class ProtocolDecoder:
                         output_replacement=output_replacement,
                     )
                 )
-            self._validate_state_size(*state_texts)
             replacement_brief = (
                 _validated_brief(payload.get("brief"), max_bytes=self._max_brief_bytes)
                 if "brief" in payload
                 else None
             )
+            docx_blocks = (
+                self._validated_docx_blocks(payload.get("docx_blocks"))
+                if "docx_blocks" in payload
+                else None
+            )
+            self._validate_state_size(
+                *state_texts,
+                *(block.text for block in docx_blocks or ()),
+            )
             return ReplaceState(
                 base_version=base_version,
                 replacements=tuple(replacements),
                 brief=replacement_brief,
+                docx_blocks=docx_blocks,
             )
 
         if operation == "full":
             _require_keys(
                 payload,
                 required=frozenset({"v", "event", "operation", "base_version", "output"}),
-                optional=frozenset({"source", "brief"}),
+                optional=frozenset({"source", "brief", "docx_blocks"}),
             )
             base_version = _validated_base_version(payload.get("base_version"))
             output = _validated_text(payload.get("output"), complete=True)
@@ -651,15 +687,22 @@ class ProtocolDecoder:
                 if "brief" in payload
                 else None
             )
+            docx_blocks = (
+                self._validated_docx_blocks(payload.get("docx_blocks"))
+                if "docx_blocks" in payload
+                else None
+            )
             self._validate_state_size(
                 output,
                 *(value for value in (full_source,) if value is not None),
+                *(block.text for block in docx_blocks or ()),
             )
             return FullState(
                 base_version=base_version,
                 output=output,
                 source=full_source,
                 brief=full_brief,
+                docx_blocks=docx_blocks,
             )
 
         raise ProtocolError("invalid_state_operation")
@@ -667,6 +710,21 @@ class ProtocolDecoder:
     def _validate_state_size(self, *values: str) -> None:
         if sum(len(value) for value in values) > self._max_state_text_chars:
             raise ProtocolError("state_too_large")
+
+    def _validated_docx_blocks(self, value: object) -> tuple[DocxBlockReplacement, ...] | None:
+        if not isinstance(value, list) or not value or len(value) > self._max_docx_blocks:
+            raise ProtocolError("invalid_docx_blocks")
+        blocks: list[DocxBlockReplacement] = []
+        for index, candidate in enumerate(value, start=1):
+            if not isinstance(candidate, dict):
+                raise ProtocolError("invalid_docx_blocks")
+            _require_exact_keys(candidate, frozenset({"id", "text"}))
+            block_id = candidate.get("id")
+            text = candidate.get("text")
+            if block_id != f"p{index:06d}" or not isinstance(text, str):
+                raise ProtocolError("invalid_docx_blocks")
+            blocks.append(DocxBlockReplacement(id=block_id, text=text))
+        return tuple(blocks)
 
     @staticmethod
     def _validated_append_separator(value: object) -> AppendSeparator:
@@ -685,6 +743,7 @@ __all__ = [
     "AppendState",
     "BlockType",
     "ContentBlock",
+    "DocxBlockReplacement",
     "EstablishState",
     "ExactReplacement",
     "FullState",

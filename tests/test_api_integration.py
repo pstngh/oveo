@@ -19,9 +19,11 @@ from starlette.requests import Request
 from oveo.auth import change_password, hash_password, verify_password
 from oveo.config import Settings
 from oveo.db import Database
+from oveo.docx import DOCX_MEDIA_TYPE, extract_docx
 from oveo.generation import ProviderCompletion, ProviderRequest
 from oveo.main import create_app, seed_configured_accounts, validate_production_settings
 from oveo.models import Base, User
+from tests.docx_fixtures import make_docx
 
 _SUCCESS = (
     b'{"v":1,"event":"response_start"}\n'
@@ -47,6 +49,64 @@ class ImmediateProvider:
         return ProviderCompletion(
             provider_request_id=f"provider-api-{self.calls}", cost_microusd=123
         )
+
+
+def _docx_protocol_response(*, second_version: bool) -> bytes:
+    protected_link = "{{OVEO_LINK_l000001}}portail{{/OVEO_LINK_l000001}}"
+    if second_version:
+        output = "Salut portail.\n\nCellule révisée"
+        state: dict[str, object] = {
+            "v": 1,
+            "event": "state",
+            "operation": "full",
+            "base_version": 1,
+            "output": output,
+            "docx_blocks": [
+                {"id": "p000001", "text": f"Salut {protected_link}."},
+                {"id": "p000002", "text": "Cellule révisée"},
+            ],
+        }
+    else:
+        output = "Bonjour portail!\n\nTexte de cellule"
+        state = {
+            "v": 1,
+            "event": "state",
+            "operation": "establish",
+            "source": "Hello site.\n\nCell text",
+            "output": output,
+            "brief": {"direction": "en-US-fr-CA"},
+            "docx_blocks": [
+                {"id": "p000001", "text": f"Bonjour {protected_link}!"},
+                {"id": "p000002", "text": "Texte de cellule"},
+            ],
+        }
+    events = [
+        {"v": 1, "event": "response_start"},
+        {"v": 1, "event": "block_start", "id": "b1", "type": "deliverable"},
+        {"v": 1, "event": "block_delta", "id": "b1", "text": output},
+        {"v": 1, "event": "block_end", "id": "b1"},
+        state,
+        {"v": 1, "event": "response_end"},
+    ]
+    return ("\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n").encode()
+
+
+class DocxProvider:
+    def __init__(self) -> None:
+        self.chat_requests: list[ProviderRequest] = []
+
+    async def generate(
+        self, request: ProviderRequest, emit: object, cancel_event: asyncio.Event
+    ) -> ProviderCompletion:
+        del cancel_event
+        if request.purpose == "title":
+            await emit(b"DOCX Translation")  # type: ignore[operator]
+        else:
+            self.chat_requests.append(request)
+            await emit(  # type: ignore[operator]
+                _docx_protocol_response(second_version=len(self.chat_requests) == 2)
+            )
+        return ProviderCompletion(cost_microusd=1)
 
 
 async def _prepare_database(database: Database) -> None:
@@ -294,8 +354,8 @@ def test_csrf_authorization_security_headers_and_deletion(api_client: TestClient
             "client_request_id": "two-files",
         },
         files=[
-            ("attachment", ("one.txt", b"one", "text/plain")),
-            ("attachment", ("two.txt", b"two", "text/plain")),
+            ("attachment", ("one.docx", b"one", DOCX_MEDIA_TYPE)),
+            ("attachment", ("two.docx", b"two", DOCX_MEDIA_TYPE)),
         ],
         headers=headers,
     )
@@ -310,7 +370,7 @@ def test_csrf_authorization_security_headers_and_deletion(api_client: TestClient
             "text": "",
             "client_request_id": "delete-me",
         },
-        files={"attachment": ("source.txt", b"Synthetic attachment", "text/plain")},
+        files={"attachment": ("source.docx", make_docx(), DOCX_MEDIA_TYPE)},
         headers=headers,
     )
     ids = submitted.json()
@@ -328,7 +388,6 @@ def test_csrf_authorization_security_headers_and_deletion(api_client: TestClient
         ).status_code
         == 204
     )
-
     _, csrf = _login(api_client, "charles", "charles password")
     response = api_client.delete(
         f"/api/threads/{ids['thread_id']}",
@@ -400,6 +459,97 @@ def test_charles_cannot_discover_or_access_yousra_conversations(
     )
     # Cost is shared operational metadata; conversation content remains private.
     assert api_client.get("/api/usage/lifetime").json() == {"formatted": "$0.000246"}
+
+
+def test_docx_upload_latest_canonical_export_and_ownership(api_client: TestClient) -> None:
+    provider = DocxProvider()
+    api_client.app.state.generation_manager.provider = provider
+    _, csrf = _login(api_client, "charles", "charles password")
+    headers = {"X-CSRF-Token": csrf, "Origin": "http://testserver"}
+
+    submitted = api_client.post(
+        "/api/threads",
+        data={
+            "mode": "translate",
+            "text": "Translate the attached Word document.",
+            "client_request_id": "docx-establish",
+        },
+        files={"attachment": ("source.docx", make_docx(), DOCX_MEDIA_TYPE)},
+        headers=headers,
+    )
+    assert submitted.status_code == 200
+    ids = submitted.json()
+    first = _wait_generation(api_client, ids["generation_id"])
+    assert first["status"] == "completed"
+
+    detail = api_client.get(f"/api/threads/{ids['thread_id']}").json()
+    assert detail["docx_exportable"] is True
+    assert detail["messages"][0]["attachment"]["media_type"] == DOCX_MEDIA_TYPE
+    trusted = provider.chat_requests[0].snapshot["provider_messages"][0]["content"]
+    untrusted = provider.chat_requests[0].snapshot["provider_messages"][1]["content"]
+    assert "DOCX protocol extension" in trusted
+    assert '"id":"p000001"' in untrusted
+    assert "source.docx" not in untrusted
+
+    revised = api_client.post(
+        f"/api/threads/{ids['thread_id']}/messages",
+        data={
+            "text": "Use a warmer greeting and revise the table cell.",
+            "client_request_id": "docx-version-2",
+        },
+        headers=headers,
+    )
+    assert revised.status_code == 200
+    second = _wait_generation(api_client, revised.json()["generation_id"])
+    assert second["status"] == "completed"
+
+    downloaded = api_client.get(f"/api/threads/{ids['thread_id']}/document.docx")
+    assert downloaded.status_code == 200
+    assert downloaded.headers["cache-control"] == "private, no-store"
+    assert downloaded.headers["content-type"].startswith(DOCX_MEDIA_TYPE)
+    assert "attachment;" in downloaded.headers["content-disposition"]
+    assert extract_docx(downloaded.content).plain_text == ("Salut portail.\n\nCellule révisée")
+
+    assert api_client.post("/api/auth/logout", headers=headers).status_code == 204
+    _, other_csrf = _login(api_client, "yousra", "yousra password")
+    forbidden = api_client.get(f"/api/threads/{ids['thread_id']}/document.docx")
+    assert forbidden.status_code == 404
+    assert forbidden.json()["code"] == "thread_not_found"
+    assert (
+        api_client.post(
+            "/api/auth/logout",
+            headers={"X-CSRF-Token": other_csrf, "Origin": "http://testserver"},
+        ).status_code
+        == 204
+    )
+    assert list(api_client.app.state.settings.attachments_dir.glob("*.docx"))
+    _, owner_csrf = _login(api_client, "charles", "charles password")
+    deleted = api_client.delete(
+        f"/api/threads/{ids['thread_id']}",
+        headers={"X-CSRF-Token": owner_csrf, "Origin": "http://testserver"},
+    )
+    assert deleted.status_code == 204
+    assert not list(api_client.app.state.settings.attachments_dir.glob("*.docx"))
+
+
+def test_docx_export_returns_conflict_without_committed_docx(api_client: TestClient) -> None:
+    _, csrf = _login(api_client, "charles", "charles password")
+    submitted = api_client.post(
+        "/api/threads",
+        data={
+            "mode": "revision",
+            "text": "Review this plain text.",
+            "client_request_id": "plain-no-docx",
+        },
+        headers={"X-CSRF-Token": csrf, "Origin": "http://testserver"},
+    )
+    ids = submitted.json()
+    _wait_generation(api_client, ids["generation_id"])
+
+    response = api_client.get(f"/api/threads/{ids['thread_id']}/document.docx")
+    assert response.status_code == 409
+    assert response.json()["code"] == "docx_export_unavailable"
+    assert response.headers["cache-control"] == "no-store"
 
 
 async def test_seed_only_missing_accounts_preserves_admin_reset(tmp_path: Path) -> None:

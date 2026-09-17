@@ -1,6 +1,7 @@
 import {
   Check,
   Copy,
+  Download,
   FileText,
   FilePenLine,
   Languages,
@@ -282,16 +283,9 @@ export function Composer({
   function acceptFile(file?: File) {
     if (!file) return;
     if (attachment) return setError("Remove the current attachment before adding another.");
-    if (!file.name.toLowerCase().endsWith(".txt")) return setError("Only .txt files are supported.");
+    if (!/\.docx$/i.test(file.name)) return setError("Only .docx files are supported.");
     setAttachment(file);
     setError("");
-  }
-  function pasted(event: React.ClipboardEvent<HTMLTextAreaElement>) {
-    const pastedText = event.clipboardData.getData("text/plain");
-    if (pastedText.length < 4000) return;
-    event.preventDefault();
-    if (attachment) return setError("Remove the current attachment before pasting another source.");
-    acceptFile(new File([pastedText], "Pasted text.txt", { type: "text/plain;charset=utf-8" }));
   }
   async function send() {
     if ((!text.trim() && !attachment) || busy || generating) return;
@@ -324,15 +318,14 @@ export function Composer({
           placeholder="Message"
           value={text}
           onChange={(event) => setText(event.target.value)}
-          onPaste={pasted}
           onKeyDown={keyDown}
           rows={3}
           disabled={Boolean(generating)}
         />
         <div className="composer-actions">
           {onCreateHandoff && <button className="icon-button handoff-button" onClick={onCreateHandoff} disabled={Boolean(generating)} aria-label="Create prompt handoff" title="Create prompt handoff"><Sparkles /></button>}
-          <button className="icon-button attach" onClick={() => fileRef.current?.click()} disabled={Boolean(generating)} aria-label="Attach a text file"><Paperclip /></button>
-          <input ref={fileRef} className="file-input" type="file" accept=".txt,text/plain" onChange={(e) => acceptFile(e.target.files?.[0])} />
+          <button className="icon-button attach" onClick={() => fileRef.current?.click()} disabled={Boolean(generating)} aria-label="Attach a DOCX file"><Paperclip /></button>
+          <input ref={fileRef} className="file-input" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={(e) => acceptFile(e.target.files?.[0])} />
           {generating ? (
             <button className="send-button stop" onClick={onStop} aria-label="Stop generation"><Square /></button>
           ) : (
@@ -601,6 +594,11 @@ export default function App() {
         <footer className="sidebar-footer"><span className="cost">{usage}</span><button className="icon-button" onClick={logout} aria-label="Sign out"><LogOut /></button></footer>
       </aside>
       <main className="workspace">
+        {detail?.docx_exportable && (
+          <a className="docx-download" href={api.documentUrl(detail.id)}>
+            <Download aria-hidden="true" /> Download DOCX
+          </a>
+        )}
         <section className="conversation-area">
           {detail ? <MessageList detail={detail} generation={active} /> : <EmptyThread mode={draftMode} onSelect={setDraftMode} />}
         </section>

@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useState } from "react";
@@ -45,6 +45,43 @@ describe("authenticated bootstrap", () => {
 
     expect(await screen.findByText("$1.23")).toHaveClass("cost");
     expect(screen.queryByText(/overall/i)).not.toBeInTheDocument();
+  });
+
+  it("shows a DOCX download only for an exportable canonical document", async () => {
+    window.history.replaceState(null, "", "/conversations/thread-1");
+    vi.spyOn(api, "me").mockResolvedValue({
+      id: "user-1",
+      username: "charles",
+      display_name: "Charles",
+      csrf_token: "csrf",
+    });
+    vi.spyOn(api, "threads").mockResolvedValue([{
+      id: "thread-1",
+      owner_id: "user-1",
+      mode: "translate",
+      title: "Word translation",
+      updated_at: "2026-09-16T00:00:00Z",
+      active_generation_id: null,
+    }]);
+    vi.spyOn(api, "thread").mockResolvedValue({
+      id: "thread-1",
+      owner_id: "user-1",
+      owner_username: "charles",
+      mode: "translate",
+      title: "Word translation",
+      updated_at: "2026-09-16T00:00:00Z",
+      active_generation_id: null,
+      docx_exportable: true,
+      messages: [],
+    });
+    vi.spyOn(api, "usage").mockResolvedValue({ formatted: "$0.00" });
+
+    render(<App />);
+
+    expect(await screen.findByRole("link", { name: "Download DOCX" })).toHaveAttribute(
+      "href",
+      "/api/threads/thread-1/document.docx",
+    );
   });
 });
 
@@ -131,7 +168,7 @@ describe("composer attachments", () => {
     expect(onCreateHandoff).toHaveBeenCalledOnce();
   });
 
-  it("turns a 4,000-character paste into a synthetic attachment and preserves typed instruction text", async () => {
+  it("keeps a 4,000-character paste in the message", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn().mockResolvedValue(undefined);
     render(<Composer activeGeneration={null} onSend={onSend} onStop={vi.fn()} onRetry={vi.fn()} />);
@@ -139,25 +176,46 @@ describe("composer attachments", () => {
     await user.type(textbox, "Translate this carefully: ");
     textbox.focus();
     await user.paste("x".repeat(4000));
-    expect(screen.getByText("Pasted text.txt")).toBeInTheDocument();
-    expect(textbox).toHaveValue("Translate this carefully: ");
+    expect(textbox).toHaveValue(`Translate this carefully: ${"x".repeat(4000)}`);
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    expect(onSend).toHaveBeenCalledWith(
-      "Translate this carefully: ",
-      expect.objectContaining({ name: "Pasted text.txt" }),
-    );
+    expect(onSend).toHaveBeenCalledWith(`Translate this carefully: ${"x".repeat(4000)}`, undefined);
   });
 
   it("rejects a second source attachment without replacing the first", async () => {
     const user = userEvent.setup();
     render(<Composer activeGeneration={null} onSend={vi.fn()} onStop={vi.fn()} onRetry={vi.fn()} />);
     const input = document.querySelector('input[type="file"]') as HTMLInputElement;
-    await user.upload(input, new File(["first"], "first.txt", { type: "text/plain" }));
-    const textbox = screen.getByRole("textbox", { name: "Message" });
-    textbox.focus();
-    await user.paste("y".repeat(4000));
+    await user.upload(input, new File(["first"], "first.docx", { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }));
+    await user.upload(input, new File(["second"], "second.docx", { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }));
     expect(screen.getByRole("alert")).toHaveTextContent("Remove the current attachment");
-    expect(screen.getByText("first.txt")).toBeInTheDocument();
+    expect(screen.getByText("first.docx")).toBeInTheDocument();
+  });
+
+  it("rejects a text file upload", () => {
+    render(<Composer activeGeneration={null} onSend={vi.fn()} onStop={vi.fn()} onRetry={vi.fn()} />);
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+
+    fireEvent.change(input, {
+      target: { files: [new File(["legacy"], "source.txt", { type: "text/plain" })] },
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Only .docx files are supported.");
+  });
+
+  it("accepts a DOCX source through the existing single-attachment control", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    render(<Composer activeGeneration={null} onSend={onSend} onStop={vi.fn()} onRetry={vi.fn()} />);
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    const file = new File(["synthetic package"], "source.docx", {
+      type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+
+    await user.upload(input, file);
+    expect(screen.getByText("source.docx")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(onSend).toHaveBeenCalledWith("", file);
   });
 });
 

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import re
 from collections.abc import AsyncIterator
-from typing import Annotated, Any, Literal
+from pathlib import Path
+from typing import Annotated, Any, Literal, cast
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
@@ -10,7 +14,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from oveo.attachments import AttachmentError, validate_text_upload
+from oveo.attachments import AttachmentError, validate_attachment_upload
 from oveo.auth import (
     InvalidCredentials,
     LoginThrottled,
@@ -24,8 +28,17 @@ from oveo.auth import (
 from oveo.authorization import may_access_thread
 from oveo.config import Settings
 from oveo.db import Database
+from oveo.docx import DOCX_MEDIA_TYPE, DocxError, render_docx
 from oveo.generation import GenerationError, GenerationManager
-from oveo.models import Attachment, Generation, Message, Thread, User
+from oveo.models import (
+    Attachment,
+    Generation,
+    Message,
+    Thread,
+    User,
+    WorkItem,
+    WorkVersion,
+)
 from oveo.usage import format_lifetime_cost, lifetime_total
 
 router = APIRouter()
@@ -269,6 +282,19 @@ def _message_blocks(message: Message) -> list[dict[str, str]]:
     ]
 
 
+async def _latest_work_version(db: AsyncSession, thread_id: str) -> WorkVersion | None:
+    return cast(
+        WorkVersion | None,
+        await db.scalar(
+            select(WorkVersion)
+            .join(WorkItem, WorkVersion.work_item_id == WorkItem.id)
+            .where(WorkItem.thread_id == thread_id, WorkItem.active.is_(True))
+            .order_by(WorkVersion.version_no.desc())
+            .limit(1)
+        ),
+    )
+
+
 @router.get("/api/threads/{thread_id}")
 async def thread_detail(
     thread_id: str, request: Request, principal: Principal, db: Db
@@ -314,6 +340,7 @@ async def thread_detail(
                         "filename": attachment.original_name,
                         "byte_size": attachment.byte_count,
                         "word_count": attachment.word_count,
+                        "media_type": attachment.media_type,
                     }
                     if attachment is not None
                     else None
@@ -330,14 +357,26 @@ async def thread_detail(
     generation_snapshot = None
     if latest_generation is not None and latest_generation.status != "completed":
         generation_snapshot = await _manager(request).get_snapshot(latest_generation.id)
-    return {**summary, "messages": serialized_messages, "generation": generation_snapshot}
+    latest_version = await _latest_work_version(db, thread.id)
+    return {
+        **summary,
+        "messages": serialized_messages,
+        "generation": generation_snapshot,
+        "docx_exportable": bool(
+            latest_version is not None
+            and latest_version.docx_template_attachment_id is not None
+            and latest_version.docx_blocks is not None
+        ),
+    }
 
 
 async def _validated_upload(request: Request, attachment: UploadFile | None) -> Any:
     if attachment is None:
         return None
     try:
-        return await validate_text_upload(attachment, max_bytes=_settings(request).max_upload_bytes)
+        return await validate_attachment_upload(
+            attachment, max_bytes=_settings(request).max_upload_bytes
+        )
     except AttachmentError as exc:
         raise ApiError(exc.status_code, exc.code, exc.message) from exc
     finally:
@@ -452,6 +491,73 @@ async def delete_thread(thread_id: str, request: Request, principal: CsrfPrincip
                 # The database deletion is authoritative. Startup's conservative orphan
                 # sweep retries generated files that could not be removed immediately.
                 pass
+
+
+@router.get("/api/threads/{thread_id}/document.docx")
+async def download_document(
+    thread_id: str, request: Request, principal: Principal, db: Db
+) -> Response:
+    thread = _require_thread(principal, await db.get(Thread, thread_id))
+    version = await _latest_work_version(db, thread.id)
+    if (
+        version is None
+        or version.docx_template_attachment_id is None
+        or version.docx_blocks is None
+    ):
+        raise ApiError(
+            409,
+            "docx_export_unavailable",
+            "This conversation has no committed DOCX document to download.",
+        )
+    attachment = await db.get(Attachment, version.docx_template_attachment_id)
+    if attachment is None or attachment.media_type != DOCX_MEDIA_TYPE:
+        raise ApiError(
+            409,
+            "docx_export_unavailable",
+            "The DOCX template for this document is unavailable.",
+        )
+    attachment_root = _settings(request).attachments_dir.resolve()
+    template_path = (attachment_root / attachment.storage_name).resolve()
+    if template_path.parent != attachment_root:
+        raise ApiError(409, "docx_export_unavailable", "The DOCX template is unavailable.")
+    try:
+        template = template_path.read_bytes()
+        if (
+            len(template) != attachment.byte_count
+            or hashlib.sha256(template).hexdigest() != attachment.sha256
+        ):
+            raise OSError("attachment integrity mismatch")
+        exported = render_docx(
+            template,
+            version.docx_blocks,
+            max_uncompressed_bytes=min(
+                50_000_000,
+                max(20_000_000, _settings(request).max_upload_bytes * 20),
+            ),
+        )
+    except (OSError, DocxError) as exc:
+        raise ApiError(
+            409,
+            "docx_export_unavailable",
+            "The committed DOCX document could not be reproduced safely.",
+        ) from exc
+
+    stem = Path(attachment.original_name).stem.strip() or "document"
+    ascii_stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-._") or "document"
+    fallback = f"{ascii_stem[:120]}-oveo.docx"
+    unicode_name = f"{stem[:120]}-oveo.docx"
+    disposition = (
+        f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(unicode_name, safe='')}"
+    )
+    return Response(
+        content=exported,
+        media_type=DOCX_MEDIA_TYPE,
+        headers={
+            "Cache-Control": "private, no-store",
+            "Pragma": "no-cache",
+            "Content-Disposition": disposition,
+        },
+    )
 
 
 @router.get("/api/generations/{generation_id}")

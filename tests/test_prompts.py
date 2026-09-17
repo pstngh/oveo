@@ -16,6 +16,7 @@ def test_prompt_directory_has_one_shared_rules_file_and_three_modes() -> None:
         "revision.md",
         "internal_communications.md",
         "protocol.md",
+        "docx_protocol.md",
     }
 
 
