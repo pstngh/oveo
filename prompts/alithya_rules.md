@@ -57,6 +57,7 @@ the source meaning; do not force a contextual term where it does not fit.
 | Website | site Web | English→Canadian French | Use normal target-locale term elsewhere |
 | Chat | clavardage | English→Canadian French | Conversation/channel context |
 | Event | évènement | English→French, all French | Approved spelling |
+| Act respecting labour standards (ARLS) | Loi sur les normes du travail (LNT) | English→French, all French | Official Quebec statute title and corresponding acronym |
 
 ## Brand and naming
 
@@ -100,10 +101,12 @@ the source meaning; do not force a contextual term where it does not fit.
 - Keep vendor software, module, platform, and service names in their official form.
 - Use normal target-locale conventions for job titles, subject to approved titles
   above.
-- Use an official translated award, program, policy, form, resource, or internal
-  initiative name when the supplied material establishes one. Never invent an
-  official translation. Otherwise retain an established source name when a name
-  functions as an identifier.
+- Use established official target-language names for legislation, regulations,
+  treaties, courts, government bodies, awards, programs, policies, forms,
+  resources, and internal initiatives. Never create an official name by literal
+  translation. If no official target-language name is established, retain the
+  source name. Change a paired acronym only when the official target form
+  establishes it.
 - Keep external bibliographic, article, and cited-source titles in their original
   language unless the user explicitly requests an explanatory translation.
 
