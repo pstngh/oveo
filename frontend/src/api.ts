@@ -1,4 +1,4 @@
-import type { Account, GenerationSnapshot, SessionUser, ThreadDetail, ThreadSummary } from "./types";
+import type { Account, AttachmentRole, GenerationSnapshot, SessionUser, ThreadDetail, ThreadSummary } from "./types";
 
 let csrfToken = "";
 
@@ -55,13 +55,17 @@ export const api = {
     mode?: string;
     text: string;
     attachment?: File;
+    attachmentRole?: AttachmentRole;
     clientRequestId: string;
   }) => {
     const form = new FormData();
     form.set("text", args.text);
     form.set("client_request_id", args.clientRequestId);
     if (args.mode) form.set("mode", args.mode);
-    if (args.attachment) form.set("attachment", args.attachment);
+    if (args.attachment) {
+      form.set("attachment", args.attachment);
+      form.set("attachment_role", args.attachmentRole ?? "source");
+    }
     const path = args.threadId ? `/api/threads/${args.threadId}/messages` : "/api/threads";
     return request<{ thread_id: string; generation_id: string }>(path, { method: "POST", body: form });
   },

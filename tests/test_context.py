@@ -138,6 +138,8 @@ def test_exactly_one_shared_rules_and_active_mode_prompt_are_loaded() -> None:
     assert "# Oveo Internal communications mode" not in summary[0].content
     assert "purpose=summary" in summary[0].content
     assert "non-visible internal conversation summary" in summary[0].content
+    assert "exact attested wording choices" in summary[0].content
+    assert "never infer one" in summary[0].content
 
 
 def test_canonical_summary_and_attachment_are_preserved_exactly_as_data() -> None:
@@ -182,6 +184,7 @@ def test_canonical_summary_and_attachment_are_preserved_exactly_as_data() -> Non
 
     payload = _payload(messages)
     assert payload["context_summary"] == thread.context_summary
+    assert payload["active_reference_document"] is None
     assert payload["active_canonical_work"] == {
         "application_state": {
             "last_operation": "full",
@@ -196,6 +199,7 @@ def test_canonical_summary_and_attachment_are_preserved_exactly_as_data() -> Non
     }
     assert payload["recent_transcript"][0]["attachment"] == {
         "format": "docx",
+        "role": "source",
         "blocks": [
             {
                 "id": "p000001",
@@ -314,18 +318,165 @@ def test_prompt_handoff_exposes_only_user_authored_material() -> None:
         "user_messages": [
             {"text_parts": ["Always retain the product name."]},
             {
-                "attachment_blocks": [
-                    {
-                        "id": "p000001",
-                        "kind": "paragraph",
-                        "text": "User-supplied terminology instructions.",
-                    }
-                ],
+                "attachment": {
+                    "role": "source",
+                    "blocks": [
+                        {
+                            "id": "p000001",
+                            "kind": "paragraph",
+                            "text": "User-supplied terminology instructions.",
+                        }
+                    ],
+                },
                 "text_parts": ["Use Canadian French."],
             },
         ]
     }
     assert [message.content for message in transcript] == original_content
+
+
+def test_reference_document_is_active_precedent_without_enabling_docx_mutation() -> None:
+    thread = _thread(mode="revision")
+    thread.context_summary = "The earlier exchange was compacted."
+    thread.summary_through_ordinal = 8
+    reference = AttachmentDocument(
+        word_count=13,
+        role="reference",
+        document_blocks=(
+            DocxBlock(
+                id="p000001",
+                kind="paragraph",
+                text="Qui est admissible aux vacances illimitées?",
+            ),
+            DocxBlock(
+                id="p000002",
+                kind="paragraph",
+                text="Cette politique s'applique aux employés permanents.",
+            ),
+            DocxBlock(
+                id="p000003",
+                kind="paragraph",
+                text="La politique exclut les employés temporaires.",
+            ),
+        ),
+    )
+    current = _message(
+        message_id="message-9",
+        ordinal=9,
+        role="user",
+        actor_user_id="yousra-id",
+        text=(
+            "Révise « Portée et admissibilité ». La présente politique s'applique aux "
+            "employés permanents. Sont exclus de la présente politique les employés "
+            "temporaires."
+        ),
+    )
+
+    messages = build_provider_messages(
+        thread,
+        purpose="chat",
+        recent_messages=[current],
+        actor_labels={"yousra-id": "Yousra"},
+        active_reference_document=reference,
+    )
+
+    system = messages[0].content
+    payload = _payload(messages)
+    assert "Reference-document authority and consistency" in system
+    assert "DOCX protocol extension" not in system
+    assert payload["active_reference_document"] == {
+        "format": "docx",
+        "role": "reference",
+        "blocks": [block.to_model() for block in reference.document_blocks],
+        "word_count": 13,
+    }
+    assert payload["recent_transcript"][0]["content"][0]["text"].startswith(
+        "Révise « Portée et admissibilité »"
+    )
+
+
+def test_translation_history_question_receives_attested_canonical_and_prior_wording() -> None:
+    canonical = WorkVersion(
+        work_item_id="work-1",
+        version_no=3,
+        operation="replace",
+        source_text="Contact us by email through the website.",
+        output_text="Communiquez avec nous par courriel à partir du site Web.",
+        source_word_count=7,
+        brief={"direction": "en-US-fr-CA", "locale": "fr-CA"},
+    )
+    transcript = [
+        _message(
+            message_id="message-1",
+            ordinal=1,
+            role="assistant",
+            actor_user_id=None,
+            text="Communiquez avec nous par courriel à partir du site Web.",
+        ),
+        _message(
+            message_id="message-2",
+            ordinal=2,
+            role="user",
+            actor_user_id="yousra-id",
+            text="In this version, which word did you use for email?",
+        ),
+    ]
+
+    messages = build_provider_messages(
+        _thread(mode="translate"),
+        purpose="chat",
+        recent_messages=transcript,
+        actor_labels={"yousra-id": "Yousra"},
+        canonical_state=canonical,
+    )
+
+    payload = _payload(messages)
+    assert "Ground every claim about earlier wording" in messages[0].content
+    assert payload["active_canonical_work"]["document_data"]["output"] == (
+        "Communiquez avec nous par courriel à partir du site Web."
+    )
+    assert payload["recent_transcript"][0]["content"][0]["text"] == canonical.output_text
+    assert payload["recent_transcript"][1]["content"][0]["text"].endswith("for email?")
+
+
+def test_only_source_attachments_enable_the_docx_protocol() -> None:
+    source = AttachmentDocument(
+        word_count=2,
+        role="source",
+        document_blocks=(DocxBlock(id="p000001", kind="paragraph", text="Source text"),),
+    )
+    user_message = _message(
+        message_id="message-1",
+        ordinal=1,
+        role="user",
+        actor_user_id="yousra-id",
+        text="Translate the source document.",
+    )
+
+    messages = build_provider_messages(
+        _thread(),
+        purpose="chat",
+        recent_messages=[user_message],
+        actor_labels={"yousra-id": "Yousra"},
+        attachments={"message-1": source},
+    )
+
+    assert "DOCX protocol extension" in messages[0].content
+    assert _payload(messages)["recent_transcript"][0]["attachment"]["role"] == "source"
+
+
+def test_active_reference_requires_an_explicit_reference_role() -> None:
+    with pytest.raises(ContextBuildError, match="reference role"):
+        build_provider_messages(
+            _thread(mode="revision"),
+            purpose="chat",
+            recent_messages=[],
+            actor_labels={},
+            active_reference_document=AttachmentDocument(
+                word_count=1,
+                document_blocks=(DocxBlock(id="p000001", kind="paragraph", text="Source"),),
+            ),
+        )
 
 
 def test_missing_true_actor_label_is_rejected() -> None:

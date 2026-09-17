@@ -38,6 +38,7 @@ def test_current_schema_accepts_only_current_modes_and_work_kinds(
             row[1]: row[3] for row in connection.execute("PRAGMA table_info(attachments)")
         }
         assert attachment_columns["document_blocks"] == 1
+        assert attachment_columns["role"] == 1
         connection.execute(
             "INSERT INTO users "
             "(id, username, display_name, password_hash, credential_version, "
@@ -80,6 +81,26 @@ def test_current_schema_accepts_only_current_modes_and_work_kinds(
                     "00000000-0000-0000-0000-000000000000.docx",
                     "source.docx",
                     "text/plain",
+                    "[]",
+                    1,
+                    1,
+                    "0" * 64,
+                    now,
+                ),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO attachments "
+                "(id, message_id, storage_name, original_name, role, media_type, "
+                "document_blocks, byte_count, word_count, sha256, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "attachment-2",
+                    "message-1",
+                    "00000000-0000-0000-0000-000000000001.docx",
+                    "reference.docx",
+                    "unsupported",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     "[]",
                     1,
                     1,
@@ -228,6 +249,95 @@ def test_docx_migration_clears_conversations_and_preserves_accounts_and_usage(
         assert connection.execute(
             "SELECT requester_id, amount_microusd FROM usage_events"
         ).fetchall() == [("user-1", 123)]
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        connection.close()
+
+
+def test_attachment_role_migration_preserves_existing_docx_canonical_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "attachment-role.sqlite3"
+    config = _config(database_path, monkeypatch)
+    command.upgrade(config, "20260917_0004")
+
+    connection = sqlite3.connect(database_path)
+    try:
+        now = "2026-09-17T12:00:00+00:00"
+        media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        connection.execute(
+            "INSERT INTO users "
+            "(id, username, display_name, password_hash, credential_version, "
+            "failed_login_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("user-1", "charles", "Charles", "synthetic", 1, 0, now),
+        )
+        connection.execute(
+            "INSERT INTO threads "
+            "(id, owner_id, mode, title, updated_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("thread-1", "user-1", "translate", "Existing DOCX", now, now),
+        )
+        connection.execute(
+            "INSERT INTO messages "
+            "(id, thread_id, ordinal, role, actor_user_id, content_schema_version, "
+            "content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("message-1", "thread-1", 1, "user", "user-1", 1, "[]", now),
+        )
+        connection.execute(
+            "INSERT INTO attachments "
+            "(id, message_id, storage_name, original_name, media_type, document_blocks, "
+            "byte_count, word_count, sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "attachment-1",
+                "message-1",
+                "00000000-0000-0000-0000-000000000000.docx",
+                "source.docx",
+                media_type,
+                '[{"id":"p000001","kind":"paragraph","text":"Hello"}]',
+                100,
+                1,
+                "0" * 64,
+                now,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO work_items (id, thread_id, kind, active, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("work-1", "thread-1", "translation", 1, now),
+        )
+        connection.execute(
+            "INSERT INTO work_versions "
+            "(id, work_item_id, version_no, cause_message_id, operation, source_text, "
+            "output_text, source_word_count, brief, docx_template_attachment_id, "
+            "docx_blocks, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "version-1",
+                "work-1",
+                1,
+                "message-1",
+                "establish",
+                "Hello",
+                "Bonjour",
+                1,
+                '{"direction":"en-US-fr-CA"}',
+                "attachment-1",
+                '[{"id":"p000001","text":"Bonjour"}]',
+                now,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    command.upgrade(config, "head")
+
+    connection = sqlite3.connect(database_path)
+    try:
+        assert connection.execute("SELECT role FROM attachments").fetchall() == [("source",)]
+        assert connection.execute(
+            "SELECT docx_template_attachment_id FROM work_versions"
+        ).fetchall() == [("attachment-1",)]
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         connection.close()

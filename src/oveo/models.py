@@ -129,6 +129,10 @@ class Attachment(Base, TimestampMixin):
         CheckConstraint("byte_count >= 0", name="ck_attachments_byte_count"),
         CheckConstraint("word_count >= 0", name="ck_attachments_word_count"),
         CheckConstraint(
+            "role IN ('source', 'reference')",
+            name="ck_attachments_role",
+        ),
+        CheckConstraint(
             "media_type = "
             "'application/vnd.openxmlformats-officedocument.wordprocessingml.document'",
             name="ck_attachments_docx_media_type",
@@ -141,6 +145,9 @@ class Attachment(Base, TimestampMixin):
     )
     storage_name: Mapped[str] = mapped_column(String(80), unique=True, nullable=False)
     original_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(
+        String(16), default="source", server_default="source", nullable=False
+    )
     media_type: Mapped[str] = mapped_column(
         String(100),
         default="application/vnd.openxmlformats-officedocument.wordprocessingml.document",

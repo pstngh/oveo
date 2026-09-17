@@ -23,6 +23,7 @@ import remarkGfm from "remark-gfm";
 import { api, ApiError, setCsrfToken } from "./api";
 import BrandLogo from "./BrandLogo";
 import type {
+  AttachmentRole,
   ContentBlock,
   GenerationSnapshot,
   Mode,
@@ -238,7 +239,7 @@ export function MessageList({ detail, generation }: { detail: ThreadDetail; gene
               <>
                 {message.actor_username && message.actor_username !== detail.owner_username && <div className="message-author">{message.actor_username}</div>}
                 {message.blocks.map((block, index) => <p className="user-text" key={index}>{block.text}</p>)}
-                {message.attachment && <div className="sent-attachment"><FileText /> <span>{message.attachment.filename}</span></div>}
+                {message.attachment && <div className="sent-attachment"><FileText /> <span>{message.attachment.filename}</span><small>{message.attachment.role === "reference" ? "Reference" : "Source"}</small></div>}
               </>
             )}
           </div>
@@ -267,13 +268,14 @@ export function Composer({
   onCreateHandoff,
 }: {
   activeGeneration: GenerationSnapshot | null;
-  onSend: (text: string, attachment?: File) => Promise<void>;
+  onSend: (text: string, attachment?: File, attachmentRole?: AttachmentRole) => Promise<void>;
   onStop: () => Promise<void>;
   onRetry: () => Promise<void>;
   onCreateHandoff?: () => void;
 }) {
   const [text, setText] = useState("");
   const [attachment, setAttachment] = useState<File>();
+  const [attachmentRole, setAttachmentRole] = useState<AttachmentRole>("source");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -285,6 +287,7 @@ export function Composer({
     if (attachment) return setError("Remove the current attachment before adding another.");
     if (!/\.docx$/i.test(file.name)) return setError("Only .docx files are supported.");
     setAttachment(file);
+    setAttachmentRole("source");
     setError("");
   }
   async function send() {
@@ -292,9 +295,11 @@ export function Composer({
     setBusy(true);
     setError("");
     try {
-      await onSend(text, attachment);
+      if (attachment) await onSend(text, attachment, attachmentRole);
+      else await onSend(text);
       setText("");
       setAttachment(undefined);
+      setAttachmentRole("source");
       if (fileRef.current) fileRef.current.value = "";
     } catch (reason) {
       setError(reason instanceof ApiError ? reason.message : "Message could not be sent.");
@@ -312,7 +317,7 @@ export function Composer({
     <div className="composer-wrap">
       {retryable && <button className="retry-button" onClick={onRetry}><RotateCcw /> Retry</button>}
       <div className="composer">
-        {attachment && <div className="attachment-chip"><FileText /><span>{attachment.name}</span><button onClick={() => setAttachment(undefined)} aria-label="Remove attachment"><X /></button></div>}
+        {attachment && <div className="attachment-chip"><FileText /><span>{attachment.name}</span><select aria-label="Use attachment as" value={attachmentRole} onChange={(event) => setAttachmentRole(event.target.value as AttachmentRole)}><option value="source">Source document</option><option value="reference">Style reference</option></select><button onClick={() => { setAttachment(undefined); setAttachmentRole("source"); }} aria-label="Remove attachment"><X /></button></div>}
         <textarea
           aria-label="Message"
           placeholder="Message"
@@ -507,13 +512,14 @@ export default function App() {
     return () => lifecycle.abort();
   }, [user]);
 
-  async function send(text: string, attachment?: File) {
+  async function send(text: string, attachment?: File, attachmentRole?: AttachmentRole) {
     if (!user) return;
     const result = await api.submit({
       threadId: detail?.id,
       mode: detail ? undefined : draftMode ?? undefined,
       text,
       attachment,
+      attachmentRole,
       clientRequestId: uuid(),
     });
     const [loaded, pending] = await Promise.all([api.thread(result.thread_id), api.generation(result.generation_id)]);

@@ -1121,7 +1121,7 @@ async def test_automatic_compaction_preserves_recent_transcript_and_accounts_cos
 ) -> None:
     database, base_settings, user = manager_database
     settings = base_settings.model_copy(
-        update={"context_compaction_tokens": 10_000, "context_recent_messages": 4}
+        update={"context_compaction_tokens": 10_500, "context_recent_messages": 4}
     )
     async with database.sessions() as db:
         thread = Thread(
@@ -1178,7 +1178,7 @@ async def test_malformed_summary_is_retried_once_without_killing_user_turn(
 ) -> None:
     database, base_settings, user = manager_database
     settings = base_settings.model_copy(
-        update={"context_compaction_tokens": 10_000, "context_recent_messages": 4}
+        update={"context_compaction_tokens": 10_500, "context_recent_messages": 4}
     )
     async with database.sessions() as db:
         thread = Thread(owner_id=user.id, mode="translate", title="Existing thread")

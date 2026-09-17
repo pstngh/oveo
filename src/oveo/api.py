@@ -43,6 +43,7 @@ from oveo.usage import format_lifetime_cost, lifetime_total
 
 router = APIRouter()
 ThreadModeInput = Literal["translate", "revision", "internal_comms"]
+AttachmentRoleInput = Literal["source", "reference"]
 
 
 class ApiError(Exception):
@@ -338,6 +339,7 @@ async def thread_detail(
                 "attachment": (
                     {
                         "filename": attachment.original_name,
+                        "role": attachment.role,
                         "byte_size": attachment.byte_count,
                         "word_count": attachment.word_count,
                         "media_type": attachment.media_type,
@@ -394,7 +396,7 @@ async def _reject_multiple_attachments(request: Request) -> None:
     raise ApiError(
         422,
         "multiple_attachments",
-        "Only one source attachment is allowed per message.",
+        "Only one DOCX attachment is allowed per message.",
     )
 
 
@@ -408,6 +410,7 @@ async def create_thread(
     owner_id: Annotated[str, Form()] = "",
     mode: Annotated[ThreadModeInput | None, Form()] = None,
     attachment: Annotated[UploadFile | None, File()] = None,
+    attachment_role: Annotated[AttachmentRoleInput, Form()] = "source",
 ) -> dict[str, str]:
     if owner_id and owner_id != principal.user.id:
         raise ApiError(403, "forbidden", "You cannot create a conversation for that account.")
@@ -419,6 +422,7 @@ async def create_thread(
             client_request_id=client_request_id,
             text=text,
             attachment=validated,
+            attachment_role=attachment_role,
             owner_id=principal.user.id,
             mode=mode,
         )
@@ -436,6 +440,7 @@ async def submit_message(
     text: Annotated[str, Form()] = "",
     client_request_id: Annotated[str, Form()] = "",
     attachment: Annotated[UploadFile | None, File()] = None,
+    attachment_role: Annotated[AttachmentRoleInput, Form()] = "source",
 ) -> dict[str, str]:
     _require_thread(principal, await db.get(Thread, thread_id))
     await _reject_multiple_attachments(request)
@@ -446,6 +451,7 @@ async def submit_message(
             client_request_id=client_request_id,
             text=text,
             attachment=validated,
+            attachment_role=attachment_role,
             thread_id=thread_id,
         )
     except GenerationError as exc:

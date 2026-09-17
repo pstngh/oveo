@@ -76,6 +76,46 @@ def test_revision_redirects_translation_and_new_internal_drafting() -> None:
     assert "Comm internes" not in prompt
 
 
+def test_revision_uses_relevant_references_as_active_style_authority() -> None:
+    prompt = read_prompt("revision.md")
+    normalized = " ".join(prompt.split())
+    for expected in (
+        "active authority for style and terminology",
+        "sentence patterns",
+        "heading forms",
+        "list conventions",
+        "reuse the reference's wording exactly",
+        "closest natural analogue",
+        "never the canonical `source` or `output`",
+    ):
+        assert expected in normalized
+    assert "Do not copy unrelated facts" in prompt
+
+
+def test_translate_reuses_grounded_precedent_without_inventing_history() -> None:
+    prompt = read_prompt("translate.md")
+    normalized = " ".join(prompt.split())
+    for expected in (
+        "active canonical translation",
+        "prior conversation deliverables",
+        "reuse its target wording exactly",
+        "Ground every claim about earlier wording",
+        "exact attested choice",
+        "Never invent, guess, or imply access",
+        "A `reference` attachment is precedent only",
+    ):
+        assert expected in normalized
+
+
+def test_docx_protocol_excludes_reference_blocks_from_working_document_state() -> None:
+    prompt = read_prompt("docx_protocol.md")
+    normalized = " ".join(prompt.split())
+    assert "A `source` attachment" in prompt
+    assert "never use their block set as the returned replacement map" in normalized
+    assert "overlapping ID strings" in normalized
+    assert "make their text canonical source or output" in normalized
+
+
 def test_internal_communications_redirects_external_editing_but_refines_own_draft() -> None:
     prompt = read_prompt("internal_communications.md")
     assert "`Comm internes`" in prompt

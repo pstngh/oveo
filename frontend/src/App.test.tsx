@@ -178,10 +178,10 @@ describe("composer attachments", () => {
     await user.paste("x".repeat(4000));
     expect(textbox).toHaveValue(`Translate this carefully: ${"x".repeat(4000)}`);
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    expect(onSend).toHaveBeenCalledWith(`Translate this carefully: ${"x".repeat(4000)}`, undefined);
+    expect(onSend).toHaveBeenCalledWith(`Translate this carefully: ${"x".repeat(4000)}`);
   });
 
-  it("rejects a second source attachment without replacing the first", async () => {
+  it("rejects a second attachment without replacing the first", async () => {
     const user = userEvent.setup();
     render(<Composer activeGeneration={null} onSend={vi.fn()} onStop={vi.fn()} onRetry={vi.fn()} />);
     const input = document.querySelector('input[type="file"]') as HTMLInputElement;
@@ -202,7 +202,7 @@ describe("composer attachments", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Only .docx files are supported.");
   });
 
-  it("accepts a DOCX source through the existing single-attachment control", async () => {
+  it("accepts a DOCX source through the single-attachment control", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn().mockResolvedValue(undefined);
     render(<Composer activeGeneration={null} onSend={onSend} onStop={vi.fn()} onRetry={vi.fn()} />);
@@ -215,7 +215,24 @@ describe("composer attachments", () => {
     expect(screen.getByText("source.docx")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Send message" }));
 
-    expect(onSend).toHaveBeenCalledWith("", file);
+    expect(onSend).toHaveBeenCalledWith("", file, "source");
+  });
+
+  it("can mark a DOCX as a style reference", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    render(<Composer activeGeneration={null} onSend={onSend} onStop={vi.fn()} onRetry={vi.fn()} />);
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    const file = new File(["synthetic package"], "policy.docx", {
+      type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+
+    await user.upload(input, file);
+    await user.selectOptions(screen.getByRole("combobox", { name: "Use attachment as" }), "reference");
+    expect(screen.getByRole("combobox", { name: "Use attachment as" })).toHaveValue("reference");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(onSend).toHaveBeenCalledWith("", file, "reference");
   });
 });
 

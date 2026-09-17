@@ -63,11 +63,13 @@ already-saved canonical work version.
 
 ## Source attachments and DOCX export
 
-Each user message accepts one standard `.docx` file, subject to the configured
-byte and source-word limits. DOCX uploads are validated as bounded, non-encrypted,
-non-macro OOXML packages and extracted as stable paragraph and table-cell blocks.
-Tracked changes and field-code hyperlinks are rejected because they cannot be
-rewritten safely in v1.
+Each user message accepts one standard `.docx` file, selected as either the source
+document to transform or a style reference, subject to the configured byte and
+word limits. DOCX uploads are validated as bounded, non-encrypted, non-macro OOXML
+packages and extracted as stable paragraph and table-cell blocks. Tracked changes
+and field-code hyperlinks are rejected because they cannot be rewritten safely in
+v1. The latest style reference remains available after conversation compaction but
+never becomes the canonical document or export template.
 
 For DOCX-backed canonical work, Oveo preserves the uploaded package as the
 template and stores a complete validated block replacement map on every committed

@@ -25,6 +25,7 @@ from oveo.config import Settings
 from oveo.context import (
     HANDOFF_SENTINEL,
     AttachmentDocument,
+    AttachmentRole,
     build_handoff_merge_messages,
     build_provider_messages,
 )
@@ -587,6 +588,8 @@ class GenerationManager:
             .join(Message, Attachment.message_id == Message.id)
             .where(Message.thread_id == thread.id)
         )
+        if purpose != "prompt_handoff":
+            attachment_query = attachment_query.where(Attachment.role == "source")
         if after_ordinal is not None:
             attachment_query = attachment_query.where(Message.ordinal > after_ordinal)
         if through_ordinal is not None:
@@ -594,26 +597,21 @@ class GenerationManager:
         attachment_rows = list((await db.execute(attachment_query)).scalars())
         attachments: dict[str, AttachmentDocument] = {}
         for attachment in attachment_rows:
-            path = self.settings.attachments_dir / attachment.storage_name
-            try:
-                content = path.read_bytes()
-                if (
-                    len(content) != attachment.byte_count
-                    or hashlib.sha256(content).hexdigest() != attachment.sha256
-                ):
-                    raise OSError("attachment integrity mismatch")
-                if attachment.media_type != DOCX_MEDIA_TYPE:
-                    raise OSError("unsupported attachment media type")
-                document_blocks = docx_blocks_from_storage(attachment.document_blocks)
-            except (OSError, DocxError) as exc:
-                raise GenerationError(
-                    "attachment_unavailable",
-                    "The saved source attachment is unavailable.",
-                ) from exc
-            attachments[attachment.message_id] = AttachmentDocument(
-                word_count=attachment.word_count,
-                document_blocks=document_blocks,
+            attachments[attachment.message_id] = self._attachment_document(attachment)
+        active_reference_document = None
+        if purpose == "chat":
+            active_reference = await db.scalar(
+                select(Attachment)
+                .join(Message, Attachment.message_id == Message.id)
+                .where(
+                    Message.thread_id == thread.id,
+                    Attachment.role == "reference",
+                )
+                .order_by(Message.ordinal.desc())
+                .limit(1)
             )
+            if active_reference is not None:
+                active_reference_document = self._attachment_document(active_reference)
         canonical = await db.scalar(
             select(WorkVersion)
             .join(WorkItem, WorkVersion.work_item_id == WorkItem.id)
@@ -627,6 +625,7 @@ class GenerationManager:
             recent_messages=messages,
             actor_labels=actors,
             attachments=attachments,
+            active_reference_document=active_reference_document,
             canonical_state=canonical,
         )
         return {
@@ -637,6 +636,31 @@ class GenerationManager:
             ],
         }
 
+    def _attachment_document(self, attachment: Attachment) -> AttachmentDocument:
+        path = self.settings.attachments_dir / attachment.storage_name
+        try:
+            content = path.read_bytes()
+            if (
+                len(content) != attachment.byte_count
+                or hashlib.sha256(content).hexdigest() != attachment.sha256
+            ):
+                raise OSError("attachment integrity mismatch")
+            if attachment.media_type != DOCX_MEDIA_TYPE:
+                raise OSError("unsupported attachment media type")
+            document_blocks = docx_blocks_from_storage(attachment.document_blocks)
+            if attachment.role not in {"source", "reference"}:
+                raise OSError("unsupported attachment role")
+        except (OSError, DocxError) as exc:
+            raise GenerationError(
+                "attachment_unavailable",
+                "The saved attachment is unavailable.",
+            ) from exc
+        return AttachmentDocument(
+            word_count=attachment.word_count,
+            document_blocks=document_blocks,
+            role=cast(AttachmentRole, attachment.role),
+        )
+
     async def submit_turn(
         self,
         *,
@@ -644,6 +668,7 @@ class GenerationManager:
         client_request_id: str,
         text: str,
         attachment: ValidatedAttachment | None,
+        attachment_role: AttachmentRole = "source",
         thread_id: str | None = None,
         owner_id: str | None = None,
         mode: str | None = None,
@@ -655,6 +680,7 @@ class GenerationManager:
                 client_request_id=client_request_id,
                 text=text,
                 attachment=attachment,
+                attachment_role=attachment_role,
                 thread_id=thread_id,
                 owner_id=owner_id,
                 mode=mode,
@@ -672,6 +698,7 @@ class GenerationManager:
         client_request_id: str,
         text: str,
         attachment: ValidatedAttachment | None,
+        attachment_role: AttachmentRole,
         thread_id: str | None,
         owner_id: str | None,
         mode: str | None,
@@ -679,7 +706,14 @@ class GenerationManager:
     ) -> Submission:
         clean_text = text.strip()
         if not clean_text and attachment is None:
-            raise GenerationError("empty_message", "Enter a message or attach a source file.")
+            raise GenerationError("empty_message", "Enter a message or attach a DOCX file.")
+        if attachment_role not in {"source", "reference"}:
+            raise GenerationError("invalid_attachment_role", "Choose how to use the attachment.")
+        if attachment is None and attachment_role != "source":
+            raise GenerationError(
+                "invalid_attachment_role",
+                "An attachment role requires an attachment.",
+            )
         if not client_request_id or len(client_request_id) > 100:
             raise GenerationError("invalid_request_id", "The request identifier is invalid.")
 
@@ -750,9 +784,11 @@ class GenerationManager:
                 .order_by(WorkVersion.version_no.desc())
                 .limit(1)
             )
-            added_words = attachment.word_count if attachment is not None else 0
-            if attachment is None:
-                added_words = count_words(clean_text)
+            added_words = (
+                attachment.word_count
+                if attachment is not None and attachment_role == "source"
+                else count_words(clean_text)
+            )
             measured_words = int(latest_words or 0) + added_words
             if measured_words > self.settings.max_source_words:
                 raise GenerationError(
@@ -797,6 +833,7 @@ class GenerationManager:
                         message_id=message.id,
                         storage_name=storage_name,
                         original_name=attachment.original_name,
+                        role=attachment_role,
                         media_type=DOCX_MEDIA_TYPE,
                         document_blocks=[block.to_model() for block in attachment.document_blocks],
                         byte_count=attachment.byte_count,
@@ -1219,7 +1256,9 @@ class GenerationManager:
             )
         source_docx = (
             source_attachment
-            if source_attachment is not None and source_attachment.media_type == DOCX_MEDIA_TYPE
+            if source_attachment is not None
+            and source_attachment.role == "source"
+            and source_attachment.media_type == DOCX_MEDIA_TYPE
             else None
         )
         docx_template_attachment_id: str | None = None

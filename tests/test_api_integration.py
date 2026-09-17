@@ -110,6 +110,43 @@ class DocxProvider:
         return ProviderCompletion(cost_microusd=1)
 
 
+class ReferenceProvider:
+    def __init__(self) -> None:
+        self.chat_requests: list[ProviderRequest] = []
+
+    async def generate(
+        self, request: ProviderRequest, emit: object, cancel_event: asyncio.Event
+    ) -> ProviderCompletion:
+        del cancel_event
+        if request.purpose == "title":
+            await emit(b"Policy Revision")  # type: ignore[operator]
+            return ProviderCompletion(cost_microusd=1)
+        self.chat_requests.append(request)
+        if len(self.chat_requests) == 1:
+            source = "La présente politique s'applique aux employés permanents."
+            output = "Cette politique s'applique aux employés permanents."
+            events = [
+                {"v": 1, "event": "response_start"},
+                {"v": 1, "event": "block_start", "id": "b1", "type": "deliverable"},
+                {"v": 1, "event": "block_delta", "id": "b1", "text": output},
+                {"v": 1, "event": "block_end", "id": "b1"},
+                {
+                    "v": 1,
+                    "event": "state",
+                    "operation": "establish",
+                    "source": source,
+                    "output": output,
+                    "brief": {"depth": "revision", "locale": "fr-CA"},
+                },
+                {"v": 1, "event": "response_end"},
+            ]
+            payload = "\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n"
+            await emit(payload.encode())  # type: ignore[operator]
+        else:
+            await emit(_SUCCESS)  # type: ignore[operator]
+        return ProviderCompletion(cost_microusd=1)
+
+
 async def _prepare_database(database: Database) -> None:
     async with database.engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
@@ -488,6 +525,7 @@ def test_docx_upload_latest_canonical_export_and_ownership(
     detail = api_client.get(f"/api/threads/{ids['thread_id']}").json()
     assert detail["docx_exportable"] is True
     assert detail["messages"][0]["attachment"]["media_type"] == DOCX_MEDIA_TYPE
+    assert detail["messages"][0]["attachment"]["role"] == "source"
     trusted = provider.chat_requests[0].snapshot["provider_messages"][0]["content"]
     untrusted = provider.chat_requests[0].snapshot["provider_messages"][1]["content"]
     assert "DOCX protocol extension" in trusted
@@ -546,6 +584,56 @@ def test_docx_upload_latest_canonical_export_and_ownership(
     )
     assert deleted.status_code == 204
     assert not list(api_client.app.state.settings.attachments_dir.glob("*.docx"))
+
+
+def test_reference_docx_guides_plain_text_without_becoming_the_template(
+    api_client: TestClient,
+) -> None:
+    provider = ReferenceProvider()
+    api_client.app.state.generation_manager.provider = provider
+    _, csrf = _login(api_client, "charles", "charles password")
+    headers = {"X-CSRF-Token": csrf, "Origin": "http://testserver"}
+
+    submitted = api_client.post(
+        "/api/threads",
+        data={
+            "mode": "revision",
+            "text": "La présente politique s'applique aux employés permanents.",
+            "client_request_id": "reference-establish",
+            "attachment_role": "reference",
+        },
+        files={"attachment": ("policy-reference.docx", make_docx(), DOCX_MEDIA_TYPE)},
+        headers=headers,
+    )
+    assert submitted.status_code == 200
+    ids = submitted.json()
+    completed = _wait_generation(api_client, ids["generation_id"])
+    assert completed["status"] == "completed"
+
+    detail = api_client.get(f"/api/threads/{ids['thread_id']}").json()
+    assert detail["docx_exportable"] is False
+    assert detail["messages"][0]["attachment"]["role"] == "reference"
+    trusted = provider.chat_requests[0].snapshot["provider_messages"][0]["content"]
+    untrusted = provider.chat_requests[0].snapshot["provider_messages"][1]["content"]
+    assert "Reference-document authority and consistency" in trusted
+    assert "DOCX protocol extension" not in trusted
+    assert '"active_reference_document"' in untrusted
+    assert '"role":"reference"' in untrusted
+    assert "policy-reference.docx" not in untrusted
+
+    follow_up = api_client.post(
+        f"/api/threads/{ids['thread_id']}/messages",
+        data={
+            "text": "Which reference remains active?",
+            "client_request_id": "reference-follow-up",
+        },
+        headers=headers,
+    )
+    assert follow_up.status_code == 200
+    assert _wait_generation(api_client, follow_up.json()["generation_id"])["status"] == "completed"
+    follow_up_untrusted = provider.chat_requests[1].snapshot["provider_messages"][1]["content"]
+    assert '"active_reference_document"' in follow_up_untrusted
+    assert '"role":"reference"' in follow_up_untrusted
 
 
 def test_docx_export_returns_conflict_without_committed_docx(api_client: TestClient) -> None:

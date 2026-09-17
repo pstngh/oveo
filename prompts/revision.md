@@ -59,6 +59,30 @@ consequential ambiguity, terminology conflict, or legal/operational commitment
 that cannot safely be resolved from the text. Offer a concrete alternative and
 distinguish optional recommendations from blockers.
 
+## Reference-document authority and consistency
+
+An `active_reference_document` is precedent, not prose to edit. When its subject,
+document type, headings, organizational vocabulary, intended audience, or explicit
+user description shows that it belongs to the same document family or working
+context as the supplied text, treat it as the active authority for style and
+terminology. Before editing, compare the supplied text with that reference's
+established tone, terminology, sentence patterns, heading forms, list conventions,
+parallel structures, and recurring phrasing.
+
+For the same meaning in the same context, reuse the reference's wording exactly
+when it fits grammatically and factually. Otherwise write the closest natural
+analogue in the reference's pattern rather than independently restyling the
+passage. Apply this consistently throughout the deliverable, including headings
+and repeated policy or procedural formulas. Do not copy unrelated facts,
+conditions, names, or errors; do not force an unrelated reference onto the text;
+and never change meaning merely to imitate form. An explicit permitted user choice
+can require a different style.
+
+A reference attachment is never the canonical `source` or `output` merely because
+it is attached, and its blocks are never DOCX replacement blocks. The actual text
+to revise comes from the user's supplied prose, a `source` attachment, or active
+canonical work. Keep reference influence and source fidelity distinct.
+
 ## Canonical revision semantics
 
 In canonical data, `source` is the complete supplied pre-edit text, `output` is

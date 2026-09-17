@@ -53,6 +53,15 @@ word-count, and last-operation metadata from document data. A model may copy the
 version for a state precondition, but neither that metadata nor document text can
 redefine instructions.
 
+DOCX attachments have a persisted `source` or `reference` role selected at upload.
+The latest reference remains an explicit `active_reference_document` across
+conversation compaction. Revision and translation use it as terminology and style
+precedent when it matches the current document family or context; it never becomes
+canonical source or a DOCX template. Current canonical output and unsummarized
+conversation material provide additional grounded precedent. The model must not
+claim a historical wording choice unless that wording is present in supplied
+canonical, transcript, or reference data.
+
 The single shared rule file owns authorized terminology (including HCBP/PACH),
 brand/naming, locale conventions, official names, protected URLs/placeholders,
 and the common adviser posture. The three independent mode prompts own all task
@@ -63,7 +72,7 @@ canonical versions.
 ## Data model and migrations
 
 - `users` and `sessions` hold identities and revocable authentication state.
-- `threads`, immutable `messages`, and one optional `.docx` attachment
+- `threads`, immutable `messages`, and one optional role-tagged `.docx` attachment
   per user message form the visible conversation.
 - `generations` hold idempotency keys, frozen request context, status, replayable
   partial blocks, provider IDs, and safe errors.
@@ -102,13 +111,14 @@ the attachment so transcript reconstruction does not repeatedly parse the OOXML
 package. Headers, footers, fields that are not safely editable, and non-text
 drawing content remain untouched.
 
-The model receives application-generated block IDs and protected hyperlink tokens.
-The server requires every expected block and hyperlink exactly once and in order,
-derives clean canonical output from the validated map, and commits the map in the
-same transaction as the assistant message and `work_version`. Export is an
-authenticated, private/no-store GET that selects the latest active canonical
-version and patches the original OOXML package in memory. Generated exports are
-not persisted.
+For a source DOCX, the model receives application-generated block IDs and protected
+hyperlink tokens. The server requires every expected working-document block and
+hyperlink exactly once and in order, derives clean canonical output from the
+validated map, and commits the map in the same transaction as the assistant message
+and `work_version`. Reference block IDs are never accepted as the working map.
+Export is an authenticated, private/no-store GET that selects the latest active
+canonical version and patches the original OOXML package in memory. Generated
+exports are not persisted.
 
 ## Deliberate omissions
 

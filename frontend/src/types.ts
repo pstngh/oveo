@@ -1,5 +1,6 @@
 export type Mode = "translate" | "revision" | "internal_comms";
 export type BlockType = "conversation" | "deliverable" | "advice";
+export type AttachmentRole = "source" | "reference";
 
 export interface ContentBlock {
   type: BlockType;
@@ -27,6 +28,7 @@ export interface ThreadSummary {
 
 export interface AttachmentInfo {
   filename: string;
+  role: AttachmentRole;
   byte_size: number;
   word_count: number;
   media_type: string;

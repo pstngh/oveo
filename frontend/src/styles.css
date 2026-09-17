@@ -87,6 +87,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .user-text:last-of-type { margin-bottom: 0; }
 .sent-attachment { display: flex; align-items: center; gap: 8px; margin-top: 6px; padding: 8px 10px; border: 1px solid #3e3f44; border-radius: 9px; color: #d5d4d0; background: #25262a; font-size: .83rem; }
 .sent-attachment svg { width: 17px; color: var(--accent); }
+.sent-attachment small { color: var(--muted); font-size: .72rem; text-transform: uppercase; }
 .response-blocks { display: grid; gap: 12px; color: #dededb; font-size: .98rem; line-height: 1.55; }
 .response-blocks p { margin: 0 0 8px; }
 .response-blocks p:last-child { margin-bottom: 0; }
@@ -119,6 +120,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .file-input { display: none; }
 .attachment-chip { grid-column: 1 / -1; width: max-content; max-width: 100%; display: flex; align-items: center; gap: 7px; padding: 7px 9px; border: 1px solid #48494e; border-radius: 8px; background: #303136; font-size: .8rem; }
 .attachment-chip > svg { width: 16px; color: var(--accent); }
+.attachment-chip select { max-width: 140px; padding: 3px 24px 3px 6px; border: 1px solid #55565b; border-radius: 6px; color: #dddcd8; background: #25262a; font: inherit; }
 .attachment-chip button { width: 22px; height: 22px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 50%; background: transparent; cursor: pointer; }
 .attachment-chip button:hover { background: #45464b; }
 .attachment-chip button svg { width: 13px; }

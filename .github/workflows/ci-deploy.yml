@@ -152,7 +152,7 @@ jobs:
             sleep 2
           done
           docker exec "$container" python -c \
-            "import sqlite3; db=sqlite3.connect('/data/oveo.sqlite3'); assert db.execute('SELECT username FROM users ORDER BY username').fetchall() == [('charles',), ('yousra',)]; assert 'role' not in {row[1] for row in db.execute('PRAGMA table_info(users)')}; assert db.execute('SELECT version_num FROM alembic_version').fetchone() == ('20260917_0004',); attachment_columns={row[1]: row[3] for row in db.execute('PRAGMA table_info(attachments)')}; assert attachment_columns['document_blocks'] == 1; assert 'ck_attachments_docx_media_type' in db.execute(\"SELECT sql FROM sqlite_master WHERE type='table' AND name='attachments'\").fetchone()[0]"
+            "import sqlite3; db=sqlite3.connect('/data/oveo.sqlite3'); assert db.execute('SELECT username FROM users ORDER BY username').fetchall() == [('charles',), ('yousra',)]; assert 'role' not in {row[1] for row in db.execute('PRAGMA table_info(users)')}; assert db.execute('SELECT version_num FROM alembic_version').fetchone() == ('20260917_0005',); attachment_columns={row[1]: row[3] for row in db.execute('PRAGMA table_info(attachments)')}; assert attachment_columns['document_blocks'] == 1; assert attachment_columns['role'] == 1; attachment_schema=db.execute(\"SELECT sql FROM sqlite_master WHERE type='table' AND name='attachments'\").fetchone()[0]; assert 'ck_attachments_docx_media_type' in attachment_schema; assert 'ck_attachments_role' in attachment_schema"
           printf 'OVEO_REHEARSED_IMAGE=%s\nOVEO_REHEARSED_COMMIT=%s\n' \
             "$IMAGE" "$GITHUB_SHA" > REHEARSAL
   deploy:
