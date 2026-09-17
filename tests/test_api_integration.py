@@ -398,7 +398,8 @@ def test_charles_cannot_discover_or_access_yousra_conversations(
         ).status_code
         == 403
     )
-    assert api_client.get("/api/usage/lifetime").json() == {"formatted": "$0.00"}
+    # Cost is shared operational metadata; conversation content remains private.
+    assert api_client.get("/api/usage/lifetime").json() == {"formatted": "$0.000246"}
 
 
 async def test_seed_only_missing_accounts_preserves_admin_reset(tmp_path: Path) -> None:

@@ -68,7 +68,8 @@ canonical versions.
   partial blocks, provider IDs, and safe errors.
 - `work_items` use kinds `translation`, `revision`, or `draft`; immutable
   `work_versions` hold complete canonical source/output/brief snapshots.
-- `usage_events` form an append-only micro-USD ledger and survive thread deletion.
+- `usage_events` form an append-only micro-USD ledger, survive thread deletion, and
+  produce one overall lifetime-cost total visible to either authenticated account.
 
 SQLite foreign keys, check/unique constraints, and partial unique indexes protect
 invariants. Connections enable WAL, foreign keys, normal synchronous mode, and a

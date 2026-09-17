@@ -101,7 +101,9 @@ IP is retained only as a secondary operations check, not as the user-facing URL.
 ## Privacy and diagnostics
 
 Charles and Yousra are equal accounts with strictly separate conversation,
-generation, attachment, and usage views. Neither account can access the other's data.
+generation, and attachment views. Neither account can access the other's conversation
+data. The sidebar lifetime-cost figure is intentionally one overall Oveo total shown to
+both accounts.
 Requests for another account's conversation are returned as not found so record
 identifiers cannot be used for discovery.
 

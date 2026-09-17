@@ -29,6 +29,25 @@ describe("authenticated bootstrap", () => {
     expect(await screen.findByRole("heading", { name: "What would you like to do?" })).toBeInTheDocument();
     expect(screen.queryByRole("form", { name: "Sign in to Oveo" })).not.toBeInTheDocument();
   });
+
+  it("labels the shared lifetime cost as overall usage", async () => {
+    window.history.replaceState(null, "", "/new");
+    vi.spyOn(api, "me").mockResolvedValue({
+      id: "user-1",
+      username: "charles",
+      display_name: "Charles",
+      csrf_token: "csrf",
+    });
+    vi.spyOn(api, "threads").mockResolvedValue([]);
+    vi.spyOn(api, "usage").mockResolvedValue({ formatted: "$1.23" });
+
+    render(<App />);
+
+    expect(await screen.findByText("Overall $1.23")).toHaveAttribute(
+      "title",
+      "Overall Oveo usage",
+    );
+  });
 });
 
 describe("modal keyboard behavior", () => {

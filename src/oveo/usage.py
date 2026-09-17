@@ -57,11 +57,9 @@ async def append_usage_event(
     return event
 
 
-async def lifetime_total(db: AsyncSession, *, requester_id: str | None = None) -> int:
+async def lifetime_total(db: AsyncSession) -> int:
     query = select(func.coalesce(func.sum(UsageEvent.amount_microusd), 0)).where(
         UsageEvent.event_type.in_(("charge", "adjustment"))
     )
-    if requester_id is not None:
-        query = query.where(UsageEvent.requester_id == requester_id)
     total = await db.scalar(query)
     return int(total or 0)

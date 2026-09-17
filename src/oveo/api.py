@@ -530,10 +530,10 @@ async def prompt_handoff(
 
 @router.get("/api/usage/lifetime")
 async def usage_lifetime(request: Request, principal: Principal, db: Db) -> dict[str, str]:
-    del request
-    return {
-        "formatted": format_lifetime_cost(await lifetime_total(db, requester_id=principal.user.id))
-    }
+    # Authentication remains required, but the displayed spend is intentionally the
+    # shared Oveo total rather than an account-specific conversation attribute.
+    del request, principal
+    return {"formatted": format_lifetime_cost(await lifetime_total(db))}
 
 
 @router.get("/health/live")
