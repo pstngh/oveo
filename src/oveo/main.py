@@ -76,11 +76,11 @@ async def seed_configured_accounts(database: Database, settings: Settings) -> No
     """Create missing permanent accounts without overwriting an admin-reset password."""
 
     configured = (
-        ("charles", "Charles", "owner", settings.charles_password_hash),
-        ("yousra", "Yousra", "user", settings.yousra_password_hash),
+        ("charles", "Charles", settings.charles_password_hash),
+        ("yousra", "Yousra", settings.yousra_password_hash),
     )
     async with database.sessions() as db:
-        for username, display_name, role, secret_hash in configured:
+        for username, display_name, secret_hash in configured:
             encoded = (
                 _validated_argon2id_hash(secret_hash.get_secret_value(), username=username)
                 if secret_hash is not None
@@ -94,15 +94,13 @@ async def seed_configured_accounts(database: Database, settings: Settings) -> No
                     User(
                         username=username,
                         display_name=display_name,
-                        role=role,
                         password_hash=encoded,
                     )
                 )
             else:
-                # Role/display metadata are configuration-owned. The hash is deliberately
-                # left alone so `oveo-admin reset-password` survives a service restart.
+                # Display metadata is configuration-owned. The hash is deliberately left
+                # alone so `oveo-admin reset-password` survives a service restart.
                 user.display_name = display_name
-                user.role = role
         await db.commit()
 
 

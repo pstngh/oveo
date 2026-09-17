@@ -32,13 +32,11 @@ async def add_user(
     db: AsyncSession,
     username: str,
     *,
-    role: str = "user",
     password: str = "correct horse battery staple",  # noqa: S107 - synthetic test value
 ) -> User:
     user = User(
         username=username,
         display_name=username.title(),
-        role=role,
         password_hash=hash_password(password),
     )
     db.add(user)

@@ -311,7 +311,6 @@ async def manager_database(tmp_path: Path) -> AsyncIterator[tuple[Database, Sett
         user = User(
             username="charles",
             display_name="Charles",
-            role="owner",
             password_hash=hash_password("test password"),
         )
         db.add(user)

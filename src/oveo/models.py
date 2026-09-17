@@ -43,7 +43,6 @@ class TimestampMixin:
 class User(Base, TimestampMixin):
     __tablename__ = "users"
     __table_args__ = (
-        CheckConstraint("role IN ('owner', 'user')", name="ck_users_role"),
         CheckConstraint("credential_version >= 1", name="ck_users_credential_version"),
         CheckConstraint("failed_login_count >= 0", name="ck_users_failed_login_count"),
     )
@@ -51,7 +50,6 @@ class User(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     display_name: Mapped[str] = mapped_column(String(100), nullable=False)
-    role: Mapped[str] = mapped_column(String(16), nullable=False)
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     credential_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     failed_login_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

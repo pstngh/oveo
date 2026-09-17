@@ -19,7 +19,6 @@ describe("authenticated bootstrap", () => {
       id: "user-1",
       username: "charles",
       display_name: "Charles",
-      role: "owner",
       csrf_token: "csrf",
     });
     vi.spyOn(api, "threads").mockResolvedValue([]);

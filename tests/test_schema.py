@@ -25,7 +25,7 @@ async def test_sqlite_pragmas_are_enabled(database: Database) -> None:
 async def test_one_active_generation_per_thread_and_request_idempotency(
     db: AsyncSession,
 ) -> None:
-    user = await add_user(db, "charles", role="owner")
+    user = await add_user(db, "charles")
     thread = Thread(owner_id=user.id, mode="translate")
     db.add(thread)
     await db.flush()
@@ -98,7 +98,7 @@ async def test_only_one_active_work_item_per_thread(db: AsyncSession) -> None:
 
 
 async def test_thread_delete_cascades_content_but_preserves_usage(db: AsyncSession) -> None:
-    user = await add_user(db, "charles", role="owner")
+    user = await add_user(db, "charles")
     thread = Thread(owner_id=user.id, mode="translate")
     db.add(thread)
     await db.flush()

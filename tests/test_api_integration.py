@@ -58,13 +58,11 @@ async def _prepare_database(database: Database) -> None:
                 User(
                     username="charles",
                     display_name="Charles",
-                    role="owner",
                     password_hash=hash_password("charles password"),
                 ),
                 User(
                     username="yousra",
                     display_name="Yousra",
-                    role="user",
                     password_hash=hash_password("yousra password"),
                 ),
             ]
@@ -370,7 +368,6 @@ def test_charles_cannot_discover_or_access_yousra_conversations(
             "id": charles_id,
             "username": "charles",
             "display_name": "Charles",
-            "role": "owner",
         }
     ]
     assert api_client.get("/api/threads").json() == []
@@ -431,10 +428,7 @@ async def test_seed_only_missing_accounts_preserves_admin_reset(tmp_path: Path) 
     await seed_configured_accounts(database, settings)
     async with database.sessions() as db:
         users = list((await db.execute(select(User).order_by(User.username))).scalars())
-        assert [(user.username, user.role) for user in users] == [
-            ("charles", "owner"),
-            ("yousra", "user"),
-        ]
+        assert [user.username for user in users] == ["charles", "yousra"]
         assert verify_password(users[0].password_hash, "admin reset password")
     assert database.engine.sync_engine.hide_parameters
     await database.dispose()

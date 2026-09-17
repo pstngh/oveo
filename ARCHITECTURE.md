@@ -10,8 +10,9 @@ private attachment directory.
 Authentication uses opaque random cookies whose SHA-256 hashes are stored in
 `sessions`. Sessions have a fixed deadline and credential version. Unsafe requests
 require a per-session CSRF token and same-origin validation. Every thread route
-resolves ownership on the server; the owner selector changes scope, never identity.
-The true sending actor remains stored on every user message.
+scopes ownership to the authenticated account on the server. There are no account
+roles or cross-account selectors. The true sending actor remains stored on every
+user message.
 
 Operational logs exclude prompt, message, attachment, provider-payload, credential,
 cookie, and authorization-header content.

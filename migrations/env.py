@@ -14,7 +14,7 @@ from oveo.models import Base
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 database_url = os.environ.get("OVEO_DATABASE_URL") or Settings().database_url
 config.set_main_option("sqlalchemy.url", database_url)

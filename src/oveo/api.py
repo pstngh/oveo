@@ -108,7 +108,6 @@ def _account(user: User) -> dict[str, str]:
         "id": user.id,
         "username": user.username,
         "display_name": user.display_name,
-        "role": user.role,
     }
 
 
@@ -544,10 +543,7 @@ async def health_live() -> dict[str, str]:
 
 @router.get("/health/ready")
 async def health_ready(db: Db) -> dict[str, str]:
-    accounts = {
-        username: role
-        for username, role in (await db.execute(select(User.username, User.role))).all()
-    }
-    if accounts != {"charles": "owner", "yousra": "user"}:
+    accounts = set((await db.execute(select(User.username))).scalars())
+    if accounts != {"charles", "yousra"}:
         raise ApiError(503, "accounts_not_ready", "Required accounts are not configured.")
     return {"status": "ready"}

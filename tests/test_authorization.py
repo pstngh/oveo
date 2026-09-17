@@ -7,8 +7,8 @@ from oveo.models import Thread
 from tests.conftest import add_user
 
 
-async def test_thread_scope_is_private_even_from_owner_role(db: AsyncSession) -> None:
-    charles = await add_user(db, "charles", role="owner")
+async def test_thread_scope_is_private_to_its_account(db: AsyncSession) -> None:
+    charles = await add_user(db, "charles")
     yousra = await add_user(db, "yousra")
     outsider = await add_user(db, "outsider")
     thread = Thread(owner_id=yousra.id, mode="translate")

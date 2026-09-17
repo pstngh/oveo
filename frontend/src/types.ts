@@ -10,7 +10,6 @@ export interface Account {
   id: string;
   username: "charles" | "yousra";
   display_name: string;
-  role: "owner" | "user";
 }
 
 export interface SessionUser extends Account {

@@ -79,7 +79,7 @@ current modes and work kinds, and runs an Alembic schema drift check.
 ## Configuration and runtime
 
 All settings use the `OVEO_` prefix. See `.env.example`. Production requires the
-two role-mapped Argon2id hashes, the OpenRouter key,
+two account-specific Argon2id hashes, the OpenRouter key,
 `OVEO_ENVIRONMENT=production`, the trusted public origin/host, secure cookies,
 persistent data paths, and the fixed `openai/gpt-5.6-luna` privacy-eligible routing.
 
@@ -100,8 +100,8 @@ IP is retained only as a secondary operations check, not as the user-facing URL.
 
 ## Privacy and diagnostics
 
-Charles and Yousra have strictly separate conversation, generation, attachment,
-and usage views. The `owner` role does not grant Charles access to Yousra's data.
+Charles and Yousra are equal accounts with strictly separate conversation,
+generation, attachment, and usage views. Neither account can access the other's data.
 Requests for another account's conversation are returned as not found so record
 identifiers cannot be used for discovery.
 

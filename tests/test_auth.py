@@ -33,7 +33,7 @@ async def test_session_is_absolute_csrf_bound_and_credential_versioned(
     db: AsyncSession,
 ) -> None:
     now = datetime(2026, 9, 16, 12, tzinfo=UTC)
-    user = await add_user(db, "charles", role="owner")
+    user = await add_user(db, "charles")
     issued = await create_session(db, user=user, session_days=30, now=now)
     await db.commit()
 
