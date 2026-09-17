@@ -4,9 +4,44 @@ Oveo runs at `https://oveo.duckdns.org` as one container bound to `127.0.0.1:800
 
 ## Verified production host
 
-The production target is `87.106.103.162` (`my-vps`, Debian 13, amd64, one vCPU), with `oveo.duckdns.org` as the public application host. At the pre-cutover inventory it had 854 MiB RAM, 2 GiB swap, and 2.3 GiB free on a 9.7 GiB root filesystem. Root and `debian` key authentication were verified with the locally configured Ionos key. Caddy owns public ports 80/443; preserve `/etc/caddy/Caddyfile` and `/var/lib/caddy`. The host has no UFW/firewalld INPUT policy, so loopback binding is mandatory.
+The production target is `87.106.103.162` (`my-vps`, Debian 13, amd64, one vCPU), with `oveo.duckdns.org` as the public application host. At the pre-cutover inventory it had 854 MiB RAM, 2 GiB swap, and 2.3 GiB free on a 9.7 GiB root filesystem. Root and `debian` key authentication were verified with the locally configured Ionos key. Caddy owns public ports 80/443; preserve `/etc/caddy/Caddyfile` and `/var/lib/caddy`. The host firewall allows only SSH, HTTP, HTTPS, HTTP/3, established traffic, loopback, ICMP, and DHCP input. Loopback binding remains mandatory for the application and Caddy administration ports.
 
-Unrelated resources must never be touched: the `noku-bot` Compose project, its images, network, volumes, `/opt/noku-bot`, `/opt/noku-bot-backups`, `fortebot.service`, `/home/debian/fortebot`, and all shared Caddy, Docker, containerd, SSH, and system-timer state.
+Application deployments must never touch unrelated resources: the `noku-bot` Compose project, its images, network, volumes, `/opt/noku-bot`, `/opt/noku-bot-backups`, `fortebot.service`, `/home/debian/fortebot`, and all shared Caddy, Docker, containerd, SSH, firewall, Fail2Ban, resolver, and system-timer state.
+
+## Host security baseline
+
+The host security configuration is maintained separately from application
+deployment. The exact reviewed files are mirrored in `deploy/host-hardening/`:
+
+- `/etc/ssh/sshd_config.d/00-hardening.conf` makes SSH public-key-only, retains
+  key-based root access for protected CI deployment, restricts logins to
+  `root` and `debian`, and disables forwarding.
+- `/etc/host-firewall.nft` and `host-firewall.service` manage only the dedicated
+  `inet host_firewall` table. Never use `nft flush ruleset`; Docker owns its
+  separate iptables-nft tables.
+- `/etc/systemd/resolved.conf.d/10-disable-multicast-name-resolution.conf`
+  disables public LLMNR and mDNS listeners.
+- `/etc/fail2ban/jail.d/sshd.local` enables the systemd-backed SSH jail with an
+  independent nftables chain.
+
+Verify the baseline without printing keys or secrets:
+
+```bash
+sshd -t
+sshd -T | grep -E '^(authenticationmethods|passwordauthentication|kbdinteractiveauthentication|permitrootlogin|allowusers) '
+systemctl is-active ssh host-firewall.service fail2ban systemd-resolved docker caddy
+systemctl is-enabled host-firewall.service fail2ban
+nft list table inet host_firewall
+fail2ban-client status sshd
+resolvectl status
+ss -lntup
+```
+
+Keep the firewall's explicit DHCP allowances while the public `ens6` interface
+uses DHCP. Apply Docker package upgrades only in a maintenance window because
+they can restart the shared daemon and every hosted container. When
+`/run/reboot-required` exists, reboot in that window and re-run the checks above
+plus all public service health checks.
 
 ## One-time host bootstrap
 

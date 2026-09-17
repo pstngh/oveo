@@ -1,0 +1,20 @@
+table inet host_firewall {
+    chain input {
+        type filter hook input priority -10; policy drop;
+
+        ct state invalid counter drop
+        ct state established,related counter accept
+        iifname "lo" counter accept
+
+        # Keep network diagnostics and IPv6 neighbor discovery working.
+        meta l4proto { icmp, ipv6-icmp } counter accept
+
+        # The public interface receives its IPv4 configuration through DHCP.
+        iifname "ens6" udp sport 67 udp dport 68 counter accept
+        iifname "ens6" udp sport 547 udp dport 546 counter accept
+
+        # SSH administration, Caddy HTTP/HTTPS, and HTTP/3.
+        tcp dport { 22, 80, 443 } counter accept
+        udp dport 443 counter accept
+    }
+}
