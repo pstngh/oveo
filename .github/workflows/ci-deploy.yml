@@ -54,6 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DOCKER_CONFIG: /tmp/oveo-docker-config
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     permissions:
@@ -154,28 +155,6 @@ jobs:
             "import sqlite3; db=sqlite3.connect('/data/oveo.sqlite3'); assert db.execute('SELECT username FROM users ORDER BY username').fetchall() == [('charles',), ('yousra',)]; assert 'role' not in {row[1] for row in db.execute('PRAGMA table_info(users)')}; assert db.execute('SELECT version_num FROM alembic_version').fetchone() == ('20260916_0002',)"
           printf 'OVEO_REHEARSED_IMAGE=%s\nOVEO_REHEARSED_COMMIT=%s\n' \
             "$IMAGE" "$GITHUB_SHA" > REHEARSAL
-      - name: Package checksummed host operations bundle
-        env:
-          IMAGE: ghcr.io/pstngh/oveo@${{ steps.build.outputs.digest }}
-        run: |
-          printf '%s\n' "$IMAGE" > IMAGE
-          tar --create --gzip --file "oveo-host-${GITHUB_SHA}.tar.gz" \
-            compose.yml OPERATIONS.md IMAGE REHEARSAL deploy/install-host.sh \
-            deploy/oveo-deploy.sh \
-            deploy/oveo-backup.sh deploy/oveo-restore.sh deploy/backup_tool.py \
-            deploy/validate_staging.py \
-            deploy/runtime.env.example deploy/backup.env.example deploy/systemd
-          sha256sum "oveo-host-${GITHUB_SHA}.tar.gz" \
-            > "oveo-host-${GITHUB_SHA}.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: oveo-host-${{ github.sha }}
-          if-no-files-found: error
-          retention-days: 14
-          path: |
-            oveo-host-${{ github.sha }}.tar.gz
-            oveo-host-${{ github.sha }}.tar.gz.sha256
-
   deploy:
     if: >-
       github.ref == 'refs/heads/main' &&
@@ -192,11 +171,23 @@ jobs:
       group: oveo-production
       cancel-in-progress: false
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: oveo-host-${{ github.sha }}
-      - name: Verify host bundle
-        run: sha256sum --check "oveo-host-${GITHUB_SHA}.tar.gz.sha256"
+      - uses: actions/checkout@v4
+      - name: Package and verify host bundle
+        env:
+          IMAGE: ghcr.io/pstngh/oveo@${{ needs.publish.outputs.digest }}
+        run: |
+          printf '%s\n' "$IMAGE" > IMAGE
+          printf 'OVEO_REHEARSED_IMAGE=%s\nOVEO_REHEARSED_COMMIT=%s\n' \
+            "$IMAGE" "$GITHUB_SHA" > REHEARSAL
+          tar --create --gzip --file "oveo-host-${GITHUB_SHA}.tar.gz" \
+            compose.yml OPERATIONS.md IMAGE REHEARSAL deploy/install-host.sh \
+            deploy/oveo-deploy.sh \
+            deploy/oveo-backup.sh deploy/oveo-restore.sh deploy/backup_tool.py \
+            deploy/validate_staging.py \
+            deploy/runtime.env.example deploy/backup.env.example deploy/systemd
+          sha256sum "oveo-host-${GITHUB_SHA}.tar.gz" \
+            > "oveo-host-${GITHUB_SHA}.tar.gz.sha256"
+          sha256sum --check "oveo-host-${GITHUB_SHA}.tar.gz.sha256"
       - name: Prepare pinned SSH access
         env:
           VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
