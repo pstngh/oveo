@@ -188,16 +188,9 @@ def test_shared_rules_distinguish_link_destinations_and_ordinary_labels() -> Non
 def test_official_public_names_use_established_translations_without_invention() -> None:
     shared = read_prompt("alithya_rules.md")
     assert (
-        "| Act respecting labour standards (ARLS) | Loi sur les normes du travail (LNT) |"
-        in shared
+        "| Act respecting labour standards (ARLS) | Loi sur les normes du travail (LNT) |" in shared
     )
     assert "Use established official target-language names for legislation" in shared
-    assert (
-        "Never create an official name by literal\n  translation"
-        in shared
-    )
-    assert (
-        "If no official target-language name is established, retain the\n  source name"
-        in shared
-    )
+    assert "Never create an official name by literal\n  translation" in shared
+    assert "If no official target-language name is established, retain the\n  source name" in shared
     assert "Change a paired acronym only when the official target form" in shared
