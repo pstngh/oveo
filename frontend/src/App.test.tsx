@@ -30,7 +30,7 @@ describe("authenticated bootstrap", () => {
     expect(screen.queryByRole("form", { name: "Sign in to Oveo" })).not.toBeInTheDocument();
   });
 
-  it("labels the shared lifetime cost as overall usage", async () => {
+  it("shows the shared lifetime cost without a label", async () => {
     window.history.replaceState(null, "", "/new");
     vi.spyOn(api, "me").mockResolvedValue({
       id: "user-1",
@@ -43,10 +43,8 @@ describe("authenticated bootstrap", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("Overall $1.23")).toHaveAttribute(
-      "title",
-      "Overall Oveo usage",
-    );
+    expect(await screen.findByText("$1.23")).toHaveClass("cost");
+    expect(screen.queryByText(/overall/i)).not.toBeInTheDocument();
   });
 });
 

@@ -598,7 +598,7 @@ export default function App() {
             </div>
           ))}
         </nav>
-        <footer className="sidebar-footer"><span className="cost" title="Overall Oveo usage">Overall {usage}</span><button className="icon-button" onClick={logout} aria-label="Sign out"><LogOut /></button></footer>
+        <footer className="sidebar-footer"><span className="cost">{usage}</span><button className="icon-button" onClick={logout} aria-label="Sign out"><LogOut /></button></footer>
       </aside>
       <main className="workspace">
         <section className="conversation-area">
