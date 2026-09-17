@@ -321,8 +321,8 @@ def test_csrf_authorization_security_headers_and_deletion(api_client: TestClient
     assert api_client.post("/api/auth/logout", headers=headers).status_code == 204
     _, yousra_csrf = _login(api_client, "yousra", "yousra password")
     forbidden = api_client.get(f"/api/threads/{ids['thread_id']}")
-    assert forbidden.status_code == 403
-    assert forbidden.json()["code"] == "forbidden"
+    assert forbidden.status_code == 404
+    assert forbidden.json()["code"] == "thread_not_found"
     assert (
         api_client.post(
             "/api/auth/logout",
@@ -340,6 +340,68 @@ def test_csrf_authorization_security_headers_and_deletion(api_client: TestClient
     health = api_client.get("/health/live")
     assert health.headers["x-content-type-options"] == "nosniff"
     assert api_client.get("/api/usage/lifetime").headers["cache-control"] == "no-store"
+
+
+def test_charles_cannot_discover_or_access_yousra_conversations(
+    api_client: TestClient,
+) -> None:
+    yousra_id, yousra_csrf = _login(api_client, "yousra", "yousra password")
+    yousra_headers = {"X-CSRF-Token": yousra_csrf, "Origin": "http://testserver"}
+    submitted = api_client.post(
+        "/api/threads",
+        data={
+            "mode": "revision",
+            "text": "Private Yousra text.",
+            "client_request_id": "yousra-private-thread",
+        },
+        headers=yousra_headers,
+    )
+    assert submitted.status_code == 200
+    ids = submitted.json()
+    _wait_generation(api_client, ids["generation_id"])
+    _wait_title(api_client, ids["thread_id"])
+    assert api_client.get("/api/usage/lifetime").json() == {"formatted": "$0.000246"}
+    assert api_client.post("/api/auth/logout", headers=yousra_headers).status_code == 204
+
+    charles_id, charles_csrf = _login(api_client, "charles", "charles password")
+    charles_headers = {"X-CSRF-Token": charles_csrf, "Origin": "http://testserver"}
+    assert api_client.get("/api/accounts").json() == [
+        {
+            "id": charles_id,
+            "username": "charles",
+            "display_name": "Charles",
+            "role": "owner",
+        }
+    ]
+    assert api_client.get("/api/threads").json() == []
+    assert api_client.get(f"/api/threads?owner_id={yousra_id}").status_code == 403
+
+    thread_response = api_client.get(f"/api/threads/{ids['thread_id']}")
+    assert thread_response.status_code == 404
+    assert thread_response.json()["code"] == "thread_not_found"
+    generation_response = api_client.get(f"/api/generations/{ids['generation_id']}")
+    assert generation_response.status_code == 404
+    assert generation_response.json()["code"] == "thread_not_found"
+    message_response = api_client.post(
+        f"/api/threads/{ids['thread_id']}/messages",
+        data={"text": "Cross-account attempt", "client_request_id": "blocked-message"},
+        headers=charles_headers,
+    )
+    assert message_response.status_code == 404
+    assert (
+        api_client.post(
+            "/api/threads",
+            data={
+                "owner_id": yousra_id,
+                "mode": "translate",
+                "text": "Cross-account attempt",
+                "client_request_id": "blocked-create",
+            },
+            headers=charles_headers,
+        ).status_code
+        == 403
+    )
+    assert api_client.get("/api/usage/lifetime").json() == {"formatted": "$0.00"}
 
 
 async def test_seed_only_missing_accounts_preserves_admin_reset(tmp_path: Path) -> None:

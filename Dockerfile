@@ -36,6 +36,7 @@ ENV PYTHONUNBUFFERED=1 \
     OVEO_DATA_DIR=/data \
     OVEO_DATABASE_URL=sqlite+aiosqlite:////data/oveo.sqlite3 \
     OVEO_ATTACHMENTS_DIR=/data/attachments \
+    OVEO_ERROR_LOG_PATH=/data/logs/oveo-errors.log \
     OVEO_FRONTEND_DIR=/app/frontend \
     OVEO_PROMPTS_DIR=/app/prompts \
     TIKTOKEN_CACHE_DIR=/app/tiktoken-cache

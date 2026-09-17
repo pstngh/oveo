@@ -116,7 +116,9 @@ def _require_thread(principal: SessionPrincipal, thread: Thread | None) -> Threa
     if thread is None:
         raise ApiError(404, "thread_not_found", "Conversation not found.")
     if not may_access_thread(principal.user, thread):
-        raise ApiError(403, "forbidden", "You cannot access this conversation.")
+        # Match the missing-record response so conversation IDs cannot be used to
+        # discover another account's records.
+        raise ApiError(404, "thread_not_found", "Conversation not found.")
     return thread
 
 
@@ -129,8 +131,8 @@ async def _require_generation(
     if generation.thread_id is not None:
         thread = await db.get(Thread, generation.thread_id)
         _require_thread(principal, thread)
-    elif generation.requester_id != principal.user.id and principal.user.role != "owner":
-        raise ApiError(403, "forbidden", "You cannot access this generation.")
+    elif generation.requester_id != principal.user.id:
+        raise ApiError(404, "generation_not_found", "Generation not found.")
     return generation
 
 
@@ -216,15 +218,8 @@ async def me(request: Request, principal: Principal) -> dict[str, str]:
 
 
 @router.get("/api/accounts")
-async def accounts(principal: Principal, db: Db) -> list[dict[str, str]]:
-    if principal.user.role != "owner":
-        return [_account(principal.user)]
-    users = (
-        await db.execute(
-            select(User).where(User.username.in_(("charles", "yousra"))).order_by(User.username)
-        )
-    ).scalars()
-    return [_account(user) for user in users]
+async def accounts(principal: Principal) -> list[dict[str, str]]:
+    return [_account(principal.user)]
 
 
 async def _thread_summary(db: AsyncSession, thread: Thread) -> dict[str, Any]:
@@ -250,15 +245,16 @@ async def _thread_summary(db: AsyncSession, thread: Thread) -> dict[str, Any]:
 
 
 @router.get("/api/threads")
-async def list_threads(owner_id: str, principal: Principal, db: Db) -> list[dict[str, Any]]:
-    if principal.user.role != "owner" and owner_id != principal.user.id:
+async def list_threads(
+    principal: Principal, db: Db, owner_id: str | None = None
+) -> list[dict[str, Any]]:
+    if owner_id is not None and owner_id != principal.user.id:
         raise ApiError(403, "forbidden", "You cannot view that account.")
-    owner = await db.get(User, owner_id)
-    if owner is None:
-        raise ApiError(404, "account_not_found", "Account not found.")
     threads = (
         await db.execute(
-            select(Thread).where(Thread.owner_id == owner_id).order_by(Thread.updated_at.desc())
+            select(Thread)
+            .where(Thread.owner_id == principal.user.id)
+            .order_by(Thread.updated_at.desc())
         )
     ).scalars()
     return [await _thread_summary(db, thread) for thread in threads]
@@ -375,10 +371,7 @@ async def create_thread(
     mode: Annotated[ThreadModeInput | None, Form()] = None,
     attachment: Annotated[UploadFile | None, File()] = None,
 ) -> dict[str, str]:
-    owner = await db.get(User, owner_id)
-    if owner is None:
-        raise ApiError(404, "account_not_found", "Account not found.")
-    if principal.user.role != "owner" and owner.id != principal.user.id:
+    if owner_id and owner_id != principal.user.id:
         raise ApiError(403, "forbidden", "You cannot create a conversation for that account.")
     await _reject_multiple_attachments(request)
     validated = await _validated_upload(request, attachment)
@@ -388,7 +381,7 @@ async def create_thread(
             client_request_id=client_request_id,
             text=text,
             attachment=validated,
-            owner_id=owner.id,
+            owner_id=principal.user.id,
             mode=mode,
         )
     except GenerationError as exc:
@@ -538,8 +531,10 @@ async def prompt_handoff(
 
 @router.get("/api/usage/lifetime")
 async def usage_lifetime(request: Request, principal: Principal, db: Db) -> dict[str, str]:
-    del request, principal
-    return {"formatted": format_lifetime_cost(await lifetime_total(db))}
+    del request
+    return {
+        "formatted": format_lifetime_cost(await lifetime_total(db, requester_id=principal.user.id))
+    }
 
 
 @router.get("/health/live")

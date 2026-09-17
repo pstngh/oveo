@@ -28,7 +28,8 @@ done
 
 install -d -m 0755 /opt/oveo /usr/local/lib/oveo
 install -d -m 0700 /etc/oveo /var/backups/oveo
-install -d -m 0700 -o 10001 -g 10001 /var/lib/oveo /var/lib/oveo/attachments
+install -d -m 0700 -o 10001 -g 10001 \
+  /var/lib/oveo /var/lib/oveo/attachments /var/lib/oveo/logs
 install -m 0644 "$root/compose.yml" /opt/oveo/compose.yml
 install -m 0755 "$root/deploy/oveo-deploy.sh" /usr/local/sbin/oveo-deploy
 install -m 0755 "$root/deploy/oveo-backup.sh" /usr/local/sbin/oveo-backup

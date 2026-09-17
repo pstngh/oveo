@@ -44,14 +44,13 @@ export const api = {
     request<SessionUser>("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<void>("/api/auth/logout", { method: "POST" }),
   accounts: () => request<Account[]>("/api/accounts"),
-  threads: (ownerId: string) => request<ThreadSummary[]>(`/api/threads?owner_id=${encodeURIComponent(ownerId)}`),
+  threads: () => request<ThreadSummary[]>("/api/threads"),
   thread: (id: string) => request<ThreadDetail>(`/api/threads/${id}`),
   rename: (id: string, title: string) =>
     request<ThreadSummary>(`/api/threads/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
   deleteThread: (id: string) => request<void>(`/api/threads/${id}`, { method: "DELETE" }),
   submit: async (args: {
     threadId?: string;
-    ownerId?: string;
     mode?: string;
     text: string;
     attachment?: File;
@@ -60,7 +59,6 @@ export const api = {
     const form = new FormData();
     form.set("text", args.text);
     form.set("client_request_id", args.clientRequestId);
-    if (args.ownerId) form.set("owner_id", args.ownerId);
     if (args.mode) form.set("mode", args.mode);
     if (args.attachment) form.set("attachment", args.attachment);
     const path = args.threadId ? `/api/threads/${args.threadId}/messages` : "/api/threads";

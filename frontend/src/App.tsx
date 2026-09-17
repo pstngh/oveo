@@ -22,7 +22,6 @@ import remarkGfm from "remark-gfm";
 import { api, ApiError, setCsrfToken } from "./api";
 import BrandLogo from "./BrandLogo";
 import type {
-  Account,
   ContentBlock,
   GenerationSnapshot,
   Mode,
@@ -373,8 +372,6 @@ export function SidebarHeader({ onClose }: { onClose: () => void }) {
 
 export default function App() {
   const [user, setUser] = useState<SessionUser | null | undefined>(undefined);
-  const [accounts, setAccounts] = useState<Account[]>([]);
-  const [owner, setOwner] = useState<Account>();
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [detail, setDetail] = useState<ThreadDetail>();
   const [draftMode, setDraftMode] = useState<Mode | null>(null);
@@ -384,7 +381,6 @@ export default function App() {
   const [handoff, setHandoff] = useState<ContentBlock[] | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [globalError, setGlobalError] = useState("");
-  const preserveDraftOnOwnerChange = useRef(false);
 
   const refreshUsage = useCallback(() => {
     void api.usage().then((total) => setUsage(total.formatted)).catch(() => undefined);
@@ -393,10 +389,7 @@ export default function App() {
     try {
       const current = await api.me();
       if (current.csrf_token) setCsrfToken(current.csrf_token);
-      const availableAccounts = await api.accounts();
       setUser(current);
-      setAccounts(availableAccounts);
-      setOwner(availableAccounts.find((a) => a.id === current.id) ?? availableAccounts[0]);
       refreshUsage();
     } catch {
       setUser(null);
@@ -417,20 +410,19 @@ export default function App() {
   }, [user]);
 
   const refreshThreads = useCallback(async () => {
-    if (!owner) return;
-    try { setThreads(await api.threads(owner.id)); } catch (reason) { setGlobalError(reason instanceof Error ? reason.message : "Could not load conversations."); }
-  }, [owner]);
+    if (!user) return;
+    try { setThreads(await api.threads()); } catch (reason) { setGlobalError(reason instanceof Error ? reason.message : "Could not load conversations."); }
+  }, [user]);
   useEffect(() => {
     setDetail(undefined);
-    if (preserveDraftOnOwnerChange.current) preserveDraftOnOwnerChange.current = false;
-    else setDraftMode(null);
+    setDraftMode(null);
     void refreshThreads();
-  }, [owner, refreshThreads]);
+  }, [refreshThreads]);
   useEffect(() => {
-    if (!owner) return;
+    if (!user) return;
     const timer = window.setInterval(() => void refreshThreads(), 5000);
     return () => window.clearInterval(timer);
-  }, [owner, refreshThreads]);
+  }, [user, refreshThreads]);
 
   const openThread = useCallback(async (id: string, navigate = true) => {
     setDraftMode(null);
@@ -442,7 +434,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!user || accounts.length === 0) return;
+    if (!user) return;
     const applyAddress = () => {
       const path = canonicalPath(window.location.pathname, true);
       updateAddress(path, true);
@@ -465,7 +457,7 @@ export default function App() {
     applyAddress();
     window.addEventListener("popstate", applyAddress);
     return () => window.removeEventListener("popstate", applyAddress);
-  }, [accounts.length, openThread, user]);
+  }, [openThread, user]);
 
   useEffect(() => {
     document.title = detail ? `${detail.title} · Oveo` : "Oveo";
@@ -493,7 +485,7 @@ export default function App() {
 
   useEffect(() => {
     const context = (document as Document & { modelContext?: WebMcpContext }).modelContext;
-    if (!context?.registerTool || !user || !owner) return;
+    if (!context?.registerTool || !user) return;
     const lifecycle = new AbortController();
     void Promise.resolve(context.registerTool({
       name: "start_oveo_conversation",
@@ -503,37 +495,29 @@ export default function App() {
         type: "object",
         properties: {
           mode: { type: "string", enum: ["translate", "revision", "internal_comms"] },
-          ownerUsername: { type: "string", enum: accounts.map((account) => account.username) },
         },
         required: ["mode"],
         additionalProperties: false,
       },
       annotations: { readOnlyHint: false, untrustedContentHint: false },
       async execute(input) {
-        const value = input as { mode?: unknown; ownerUsername?: unknown };
+        const value = input as { mode?: unknown };
         if (value.mode !== "translate" && value.mode !== "revision" && value.mode !== "internal_comms") throw new Error("Invalid mode.");
-        const selectedOwner = value.ownerUsername === undefined
-          ? owner
-          : accounts.find((account) => account.username === value.ownerUsername);
-        if (!selectedOwner) throw new Error("That account is not available.");
-        if (selectedOwner.id !== owner.id) preserveDraftOnOwnerChange.current = true;
-        setOwner(selectedOwner);
         setDetail(undefined);
         setGeneration(null);
         setDraftMode(value.mode);
         setSidebarOpen(false);
         updateAddress("/new");
-        return { state: "ready", mode: value.mode, ownerUsername: selectedOwner.username };
+        return { state: "ready", mode: value.mode, ownerUsername: user.username };
       },
     }, { signal: lifecycle.signal })).catch(() => undefined);
     return () => lifecycle.abort();
-  }, [accounts, owner, user]);
+  }, [user]);
 
   async function send(text: string, attachment?: File) {
-    if (!owner) return;
+    if (!user) return;
     const result = await api.submit({
       threadId: detail?.id,
-      ownerId: detail ? undefined : owner.id,
       mode: detail ? undefined : draftMode ?? undefined,
       text,
       attachment,
@@ -593,11 +577,6 @@ export default function App() {
     setSidebarOpen(false);
     updateAddress("/new");
   }
-  function changeOwner(id: string) {
-    setOwner(accounts.find((account) => account.id === id));
-    updateAddress("/new");
-  }
-
   if (user === undefined) return <div className="app-loading"><BrandLogo /></div>;
   if (!user) return <Login onLogin={() => void bootstrap()} />;
   const active = generation && generation.thread_id === detail?.id ? generation : null;
@@ -608,9 +587,6 @@ export default function App() {
       <aside className={sidebarOpen ? "sidebar open" : "sidebar"}>
         <SidebarHeader onClose={() => setSidebarOpen(false)} />
         <button className="new-button" onClick={startNewConversation}><Plus /> New</button>
-        {user.role === "owner" && (
-          <label className="account-picker"><span>Viewing</span><select value={owner?.id} onChange={(e) => changeOwner(e.target.value)}>{accounts.map((account) => <option value={account.id} key={account.id}>{account.display_name}</option>)}</select></label>
-        )}
         <nav className="thread-list" aria-label="Conversations">
           {threads.map((thread) => (
             <div className={detail?.id === thread.id ? "thread-row selected" : "thread-row"} key={thread.id}>

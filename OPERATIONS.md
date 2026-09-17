@@ -103,3 +103,17 @@ After successful application-level verification, remove only the exact timestamp
 ## Incidents
 
 Inspect container state and content-free logs with `docker compose ... ps` and `docker compose ... logs --since 30m app`. Do not log or paste prompts, messages, attachment contents, cookies, provider bodies, or secrets. Disk recovery must target only exact superseded Oveo digest references and documented timestamped restore directories. Never run `docker system prune`, `docker image prune`, `docker volume prune`, or a global builder prune on this shared VPS.
+
+Persistent application errors are available on the host at
+`/var/lib/oveo/logs/oveo-errors.log` and in the container at
+`/data/logs/oveo-errors.log`. Search an error ID returned by the UI without
+printing conversation data:
+
+```bash
+grep -F 'error_id=PASTE_ERROR_ID' /var/lib/oveo/logs/oveo-errors.log*
+tail -n 200 /var/lib/oveo/logs/oveo-errors.log
+```
+
+The files are mode `0600`, rotate at 5 MB, and retain five prior files. They are
+operational diagnostics and are intentionally excluded from encrypted content
+backups.

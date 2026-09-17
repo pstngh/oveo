@@ -98,5 +98,24 @@ disconnects do not cancel them. See [ARCHITECTURE.md](ARCHITECTURE.md) and
 The production application origin is `https://oveo.duckdns.org`. The direct VPS
 IP is retained only as a secondary operations check, not as the user-facing URL.
 
+## Privacy and diagnostics
+
+Charles and Yousra have strictly separate conversation, generation, attachment,
+and usage views. The `owner` role does not grant Charles access to Yousra's data.
+Requests for another account's conversation are returned as not found so record
+identifiers cannot be used for discovery.
+
+Browser traffic is encrypted in transit with HTTPS, passwords are stored as
+Argon2id hashes, session and CSRF tokens are stored as hashes, and nightly backups
+are encrypted with `age`. The live SQLite database and attachment files are not
+application-level encrypted at rest; they rely on private host permissions and
+server access controls.
+
+Content-free error diagnostics are written to
+`/data/logs/oveo-errors.log` in production. The private log rotates at 5 MB and
+retains five previous files. It contains error identifiers, codes, components,
+and code locations, never prompts, chat text, attachments, cookies, or provider
+bodies.
+
 Never commit `.env`, credentials, live databases, attachments, backup identities,
 or decrypted backups.

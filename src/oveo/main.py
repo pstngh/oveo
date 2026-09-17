@@ -25,6 +25,7 @@ from oveo.generation import (
     OpenRouterProvider,
     UnavailableProvider,
 )
+from oveo.logging_config import install_error_file_handler, remove_error_file_handler
 from oveo.models import User
 from oveo.provider import warm_tokenizer
 
@@ -124,21 +125,30 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        validate_production_settings(app_settings)
         app_settings.ensure_directories()
-        # Tokenizer initialization performs synchronous cache I/O. Finish it before the
-        # server reports readiness so the first generation cannot stall every request.
-        await asyncio.to_thread(warm_tokenizer)
-        await seed_configured_accounts(app_database, app_settings)
-        await manager.reconcile_orphans()
-        await manager.sweep_orphan_attachments()
-        manager.reconcile_later()
+        error_handler = install_error_file_handler(
+            app_settings.resolved_error_log_path,
+            max_bytes=app_settings.error_log_max_bytes,
+            backup_count=app_settings.error_log_backup_count,
+        )
         try:
+            validate_production_settings(app_settings)
+            # Tokenizer initialization performs synchronous cache I/O. Finish it before the
+            # server reports readiness so the first generation cannot stall every request.
+            await asyncio.to_thread(warm_tokenizer)
+            await seed_configured_accounts(app_database, app_settings)
+            await manager.reconcile_orphans()
+            await manager.sweep_orphan_attachments()
+            manager.reconcile_later()
             yield
+        except Exception as error:
+            log_unexpected(_LOGGER, error, area="lifespan")
+            raise
         finally:
             await manager.shutdown()
             if owns_database:
                 await app_database.dispose()
+            remove_error_file_handler(error_handler)
 
     app = FastAPI(
         title="Oveo",

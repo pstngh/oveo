@@ -669,6 +669,13 @@ class GenerationManager:
             if existing is not None:
                 if existing.thread_id is None:
                     raise GenerationError("invalid_generation", "The saved request is invalid.")
+                existing_owner = await db.scalar(
+                    select(Thread.owner_id).where(Thread.id == existing.thread_id)
+                )
+                if existing_owner != requester_id:
+                    raise GenerationError(
+                        "thread_not_found", "Conversation not found.", status_code=404
+                    )
                 return Submission(existing.thread_id, existing.id)
 
             if thread_id is None:
@@ -678,6 +685,10 @@ class GenerationManager:
                     "internal_comms",
                 }:
                     raise GenerationError("invalid_thread", "Choose a conversation mode.")
+                if owner_id != requester_id:
+                    raise GenerationError(
+                        "thread_not_found", "Conversation not found.", status_code=404
+                    )
                 thread = Thread(
                     id=new_id(),
                     owner_id=owner_id,
@@ -689,6 +700,10 @@ class GenerationManager:
             else:
                 existing_thread = await db.get(Thread, thread_id)
                 if existing_thread is None:
+                    raise GenerationError(
+                        "thread_not_found", "Conversation not found.", status_code=404
+                    )
+                if existing_thread.owner_id != requester_id:
                     raise GenerationError(
                         "thread_not_found", "Conversation not found.", status_code=404
                     )
@@ -810,9 +825,20 @@ class GenerationManager:
                 )
             )
             if existing is not None:
+                existing_owner = await db.scalar(
+                    select(Thread.owner_id).where(Thread.id == existing.thread_id)
+                )
+                if existing_owner != requester_id:
+                    raise GenerationError(
+                        "thread_not_found", "Conversation not found.", status_code=404
+                    )
                 return existing.id
             thread = await db.get(Thread, thread_id)
             if thread is None:
+                raise GenerationError(
+                    "thread_not_found", "Conversation not found.", status_code=404
+                )
+            if thread.owner_id != requester_id:
                 raise GenerationError(
                     "thread_not_found", "Conversation not found.", status_code=404
                 )
@@ -858,6 +884,15 @@ class GenerationManager:
                 )
             )
             if existing is not None:
+                existing_owner = await db.scalar(
+                    select(Thread.owner_id).where(Thread.id == existing.thread_id)
+                )
+                if existing_owner != requester_id:
+                    raise GenerationError(
+                        "generation_not_retryable",
+                        "This generation cannot be retried.",
+                        status_code=409,
+                    )
                 return existing.id
             original = await db.get(Generation, generation_id)
             if original is None or original.status not in {"failed", "stopped"}:
@@ -876,6 +911,12 @@ class GenerationManager:
             if thread is None:
                 raise GenerationError(
                     "thread_not_found", "Conversation not found.", status_code=404
+                )
+            if thread.owner_id != requester_id:
+                raise GenerationError(
+                    "generation_not_retryable",
+                    "This generation cannot be retried.",
+                    status_code=409,
                 )
             request_snapshot = await self._request_snapshot(
                 db,
@@ -1832,16 +1873,24 @@ class GenerationManager:
         *,
         preserve_blocks: bool = False,
     ) -> None:
+        recorded_code: str | None = None
         async with self.database.sessions() as db:
             generation = await db.get(Generation, generation_id)
             if generation is not None and generation.status in _ACTIVE:
                 generation.status = "failed"
                 if not preserve_blocks:
                     generation.partial_blocks = []
-                generation.error_code = code if code in _ERROR_MESSAGES else "provider_error"
+                recorded_code = code if code in _ERROR_MESSAGES else "provider_error"
+                generation.error_code = recorded_code
                 generation.finished_at = utc_now()
                 generation.stream_revision += 1
                 await db.commit()
+        if recorded_code is not None:
+            _LOGGER.error(
+                "generation_failed generation_id=%s error_code=%s",
+                generation_id,
+                recorded_code,
+            )
         await self._notify(generation_id)
 
     async def _run(self, generation_id: str, cancel_event: asyncio.Event) -> None:

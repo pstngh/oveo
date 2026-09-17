@@ -22,12 +22,6 @@ describe("authenticated bootstrap", () => {
       role: "owner",
       csrf_token: "csrf",
     });
-    vi.spyOn(api, "accounts").mockResolvedValue([{
-      id: "user-1",
-      username: "charles",
-      display_name: "Charles",
-      role: "owner",
-    }]);
     vi.spyOn(api, "threads").mockResolvedValue([]);
     vi.spyOn(api, "usage").mockRejectedValue(new Error("metadata unavailable"));
 

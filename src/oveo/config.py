@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     data_dir: Path = Path("data")
     database_url: str = "sqlite+aiosqlite:///data/oveo.sqlite3"
     attachments_dir: Path = Path("data/attachments")
+    error_log_path: Path | None = None
+    error_log_max_bytes: int = Field(default=5_000_000, ge=100_000, le=100_000_000)
+    error_log_backup_count: int = Field(default=5, ge=1, le=20)
     frontend_dir: Path = Path("frontend/dist")
     prompts_dir: Path = Path("prompts")
     secure_cookies: bool = True
@@ -52,9 +55,14 @@ class Settings(BaseSettings):
     def production(self) -> bool:
         return self.environment.lower() == "production"
 
+    @property
+    def resolved_error_log_path(self) -> Path:
+        return self.error_log_path or self.data_dir / "logs" / "oveo-errors.log"
+
     def ensure_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.attachments_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.resolved_error_log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 
 @lru_cache
