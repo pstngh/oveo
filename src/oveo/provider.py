@@ -250,6 +250,7 @@ class OpenRouterClient:
             "stream": True,
             "stream_options": {"include_usage": True},
             "max_completion_tokens": max_completion_tokens,
+            "reasoning_effort": "medium",
             "provider": dict(_PROVIDER_ROUTING),
         }
 
