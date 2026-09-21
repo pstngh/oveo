@@ -1961,22 +1961,17 @@ class GenerationManager:
             raise error from exc
 
     async def _prepare_protocol_retry(self, generation_id: str) -> bool:
-        """Reset only an attempt that has not exposed substantive visible content."""
+        """Discard one uncommitted attempt so the model can regenerate it strictly."""
 
         async with self.database.sessions() as db:
             generation = await db.get(Generation, generation_id)
             if generation is None or generation.status != "running":
                 return False
-            blocks = (
-                generation.partial_blocks if isinstance(generation.partial_blocks, list) else []
-            )
-            if any(
-                isinstance(block, dict)
-                and isinstance(block.get("text"), str)
-                and cast(str, block["text"]).strip()
-                for block in blocks
-            ):
-                return False
+            # Partial blocks are explicitly draft streaming state. A response that fails
+            # protocol validation was never committed as an assistant message, so reset
+            # that draft before the single bounded retry even when text had started to
+            # stream. This avoids turning a repairable late state/terminal-event mistake
+            # into a user-visible hard failure.
             generation.partial_blocks = []
             generation.stream_revision += 1
             await append_usage_event(
@@ -2087,7 +2082,13 @@ class GenerationManager:
                         document = decoder.finish()
                         await self._commit_success(generation_id, document, completion)
                         break
-                    except ProtocolError:
+                    except ProtocolError as error:
+                        _LOGGER.error(
+                            "protocol_attempt_failed generation_id=%s attempt=%s protocol_code=%s",
+                            generation_id,
+                            attempt + 1,
+                            error.code,
+                        )
                         if attempt != 0 or not await self._prepare_protocol_retry(generation_id):
                             raise
                         request_snapshot = self._protocol_retry_snapshot(request_snapshot)

@@ -269,6 +269,7 @@ describe("new conversation mode selection", () => {
 
     expect(screen.getByRole("heading", { name: "What would you like to revise?" })).toBeInTheDocument();
     expect(screen.getByText(/proofread, copyedit, revise, or rewrite/)).toBeInTheDocument();
+    expect(screen.getByText(/include both the original and translated text/)).toBeInTheDocument();
   });
 });
 

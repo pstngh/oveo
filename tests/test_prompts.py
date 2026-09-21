@@ -65,13 +65,23 @@ def test_translate_intake_is_narrow_and_does_not_inherit_internal_voice() -> Non
     assert "Comm internes" not in prompt
 
 
-def test_revision_redirects_translation_and_new_internal_drafting() -> None:
+def test_revision_reviews_existing_translations_and_redirects_new_translation() -> None:
     prompt = read_prompt("revision.md")
     for depth in ("proofread", "review/copyedit", "revision", "rewrite"):
         assert f"`{depth}`" in prompt
-    assert "asks to translate, refuse briefly and redirect to Translate" in prompt
-    assert "redirect to Internal communications" in prompt
-    assert "Do not translate" in prompt
+    normalized = " ".join(prompt.split())
+    for expected in (
+        "supplies both a source-language original and its existing translation",
+        "compare the entire pair and return the corrected target text",
+        "source text without supplying an existing target draft",
+        "use the supplied original as the authority for meaning",
+        "complete supplied comparison pair",
+        "complete revised target text",
+    ):
+        assert expected in normalized
+    assert "redirect to Translate" in normalized
+    assert "redirect to Internal communications" in normalized
+    assert "Do not create missing translated passages" in prompt
     assert "same-language locale adaptation" in prompt
     assert "Comm internes" not in prompt
 

@@ -43,7 +43,7 @@ const MODE_COPY: Record<Mode, { label: string; heading: string; guidance: string
   revision: {
     label: "Revision",
     heading: "What would you like to revise?",
-    guidance: "Share the existing text and, when it matters, the depth you want: proofread, copyedit, revise, or rewrite.",
+    guidance: "Share the existing text and, when it matters, the depth you want: proofread, copyedit, revise, or rewrite. To review an existing translation, include both the original and translated text.",
   },
   internal_comms: {
     label: "Communications",

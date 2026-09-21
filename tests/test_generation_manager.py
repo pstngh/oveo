@@ -704,19 +704,16 @@ async def test_mutation_rejects_multiple_or_mismatched_visible_deliverables(
     visible: str | list[str],
 ) -> None:
     database, settings, user = manager_database
-    provider = ScriptedProvider(
-        [
-            _response_stream(
-                visible,
-                {
-                    "operation": "establish",
-                    "source": "Source",
-                    "output": "Option une",
-                    "brief": {"direction": "en-US-fr-CA"},
-                },
-            )
-        ]
+    invalid_response = _response_stream(
+        visible,
+        {
+            "operation": "establish",
+            "source": "Source",
+            "output": "Option une",
+            "brief": {"direction": "en-US-fr-CA"},
+        },
     )
+    provider = ScriptedProvider([invalid_response, invalid_response])
     manager = GenerationManager(database, settings, provider)
     async with database.sessions() as db:
         thread = Thread(owner_id=user.id, mode="translate", title="Existing conversation")
@@ -737,7 +734,7 @@ async def test_mutation_rejects_multiple_or_mismatched_visible_deliverables(
     async with database.sessions() as db:
         assert await db.scalar(select(func.count()).select_from(WorkVersion)) == 0
         assert await db.scalar(select(func.count()).select_from(Message)) == 1
-    assert len(provider.requests) == 1
+    assert len(provider.requests) == 2
     await manager.shutdown()
 
 
@@ -828,11 +825,27 @@ async def test_state_application_failures_preserve_valid_visible_blocks(
     await manager.shutdown()
 
 
-async def test_protocol_failure_before_visible_content_retries_once_strictly(
+@pytest.mark.parametrize(
+    "invalid_response",
+    [
+        b"not-json\n",
+        _response_stream(
+            "Visible draft that must be discarded",
+            {
+                "operation": "establish",
+                "source": "Synthetic source",
+                "output": "Different hidden output",
+                "brief": {"direction": "en-US-fr-CA"},
+            },
+        ),
+    ],
+)
+async def test_protocol_failure_retries_once_and_discards_any_visible_draft(
     manager_database: tuple[Database, Settings, User],
+    invalid_response: bytes,
 ) -> None:
     database, settings, user = manager_database
-    provider = ScriptedProvider([b"not-json\n", _SUCCESS])
+    provider = ScriptedProvider([invalid_response, _SUCCESS])
     manager = GenerationManager(database, settings, provider)
     async with database.sessions() as db:
         thread = Thread(owner_id=user.id, mode="translate", title="Existing conversation")
@@ -852,6 +865,17 @@ async def test_protocol_failure_before_visible_content_retries_once_strictly(
     assert len(provider.requests) == 2
     assert "PROTOCOL RETRY" not in str(provider.requests[0].snapshot)
     assert "PROTOCOL RETRY" in str(provider.requests[1].snapshot)
+    async with database.sessions() as db:
+        assert await db.scalar(select(func.count()).select_from(WorkVersion)) == 0
+        assistant_messages = int(
+            await db.scalar(
+                select(func.count())
+                .select_from(Message)
+                .where(Message.thread_id == thread_id, Message.role == "assistant")
+            )
+            or 0
+        )
+        assert assistant_messages == 1
     await manager.shutdown()
 
 
@@ -1339,7 +1363,7 @@ async def test_prompt_handoff_rejects_unreplaced_reserved_sentinel(
         "OVEO_HANDOFF_TEXT_MUST_BE_REPLACED_V1",
         {"operation": "none"},
     )
-    provider = ScriptedProvider([sentinel_stream])
+    provider = ScriptedProvider([sentinel_stream, sentinel_stream])
     manager = GenerationManager(database, settings, provider)
     async with database.sessions() as db:
         thread = Thread(owner_id=user.id, mode="translate", title="Existing thread")
@@ -1364,7 +1388,7 @@ async def test_prompt_handoff_rejects_unreplaced_reserved_sentinel(
     )
     failed = await _wait_status(manager, generation_id, {"failed"})
     assert failed["error_code"] == "protocol_error"
-    assert len(provider.requests) == 1
+    assert len(provider.requests) == 2
     await manager.shutdown()
 
 
