@@ -56,7 +56,7 @@ async def test_streaming_request_locks_model_privacy_and_parses_actual_cost(
             "stream": True,
             "stream_options": {"include_usage": True},
             "max_completion_tokens": 2048,
-            "reasoning_effort": "medium",
+            "reasoning_effort": "high",
             "provider": {
                 "order": ["azure/eu"],
                 "allow_fallbacks": True,
