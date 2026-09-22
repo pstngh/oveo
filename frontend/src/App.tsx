@@ -203,14 +203,16 @@ export function ResponseBlocks({ blocks, streaming = false }: { blocks: ContentB
     <div className={`response-blocks${streaming ? " streaming" : ""}`}>
       {visibleBlocks.map((block, index) => block.type === "deliverable" ? (
         <section className="deliverable" key={index} aria-label="Deliverable">
-          <button
-            className="copy-button"
-            onClick={() => copy(block.text, index)}
-            aria-label={copied === index ? "Copied" : "Copy deliverable"}
-            title={copied === index ? "Copied" : "Copy deliverable"}
-          >
-            {copied === index ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
-          </button>
+          <div className="copy-button-rail">
+            <button
+              className="copy-button"
+              onClick={() => copy(block.text, index)}
+              aria-label={copied === index ? "Copied" : "Copy deliverable"}
+              title={copied === index ? "Copied" : "Copy deliverable"}
+            >
+              {copied === index ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+            </button>
+          </div>
           <pre>{block.text}</pre>
         </section>
       ) : (

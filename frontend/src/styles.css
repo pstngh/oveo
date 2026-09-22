@@ -95,7 +95,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .response-blocks a { color: #e4b271; }
 .deliverable { position: relative; padding: 10px 10px 18px 18px; border: 1px solid #3a3b40; border-radius: 11px; background: #202124; }
 .deliverable pre { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; color: #f0f0ed; font: inherit; line-height: 1.62; }
-.copy-button { position: absolute; z-index: 2; top: 10px; right: 10px; width: 32px; height: 32px; display: grid; place-items: center; padding: 0; border: 1px solid #3c3d41; border-radius: 7px; opacity: 0; color: #aaa9a5; background: #292a2e; box-shadow: 0 3px 10px rgba(0,0,0,.22); cursor: pointer; pointer-events: none; transform: translateY(-2px); transition: opacity .14s ease, transform .14s ease; }
+.copy-button-rail { width: 32px; position: absolute; z-index: 2; top: 10px; right: 10px; bottom: 10px; pointer-events: none; }
+.copy-button { position: sticky; top: 10px; width: 32px; height: 32px; display: grid; place-items: center; padding: 0; border: 1px solid #3c3d41; border-radius: 7px; opacity: 0; color: #aaa9a5; background: #292a2e; box-shadow: 0 3px 10px rgba(0,0,0,.22); cursor: pointer; pointer-events: none; transform: translateY(-2px); transition: opacity .14s ease, transform .14s ease; }
+.messages .copy-button { top: 58px; }
 .deliverable:hover .copy-button, .deliverable:focus-within .copy-button { opacity: 1; pointer-events: auto; transform: translateY(0); }
 .copy-button:hover { color: #e5e4df; background: #333438; }
 .copy-button svg { width: 15px; height: 15px; }

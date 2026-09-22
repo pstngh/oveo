@@ -131,6 +131,7 @@ describe("deliverable copy", () => {
       { type: "advice", text: "Do not copy this note." },
     ]} />);
     const copyButton = screen.getByRole("button", { name: "Copy deliverable" });
+    expect(copyButton.parentElement).toHaveClass("copy-button-rail");
     expect(copyButton).toHaveTextContent("");
     await user.click(copyButton);
     expect(writeText).toHaveBeenCalledWith("First line\n\nSecond **literal** line");
