@@ -17,5 +17,8 @@ frontend/vite.config.d.ts
 frontend/vite.config.js
 playwright-report/
 test-results/
+.coverage
+work/
+outputs/
 .DS_Store
 *.log
