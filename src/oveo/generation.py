@@ -2425,11 +2425,19 @@ class GenerationManager:
             return
         async with self.database.sessions() as db:
             if cost_microusd is not None:
-                # Keyed by the provider call, so a call is charged exactly once.
-                call_key = provider_generation_id or request_id or scope
+                # Keyed by the provider call, so a call is charged exactly once. With a
+                # provider generation id this is the key every reconciler checks, this
+                # release's and the one it replaces: the id recorded early as `pending`
+                # then counts as settled, even after a rollback, and a reconciliation that
+                # raced the stream cannot add a second charge.
+                dedupe_key = (
+                    f"{provider_generation_id}:{purpose}:reconciled-charge"
+                    if provider_generation_id is not None
+                    else f"{request_id or scope}:{purpose}:{suffix}"
+                )
                 await append_usage_event(
                     db,
-                    dedupe_key=f"{call_key}:{purpose}:{suffix}",
+                    dedupe_key=dedupe_key,
                     event_type="charge",
                     purpose=purpose,
                     amount_microusd=cost_microusd,

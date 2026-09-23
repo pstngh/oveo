@@ -14,6 +14,7 @@ import pytest
 from pydantic import SecretStr
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import aliased
 
 import oveo.generation as generation_module
 from oveo.attachments import ValidatedAttachment, persist_attachment
@@ -777,6 +778,37 @@ async def _ledger(database: Database) -> list[tuple[str, str, int | None, str | 
         )
 
 
+async def _unsettled_for_the_previous_release(database: Database) -> set[str]:
+    """Provider calls the deployed release's reconciler would still charge after a rollback.
+
+    Its query (ad44646 `reconcile_pending_costs`) treats a pending row as settled only by
+    a charge keyed `{generation id}:{purpose}:reconciled-charge`.
+    """
+
+    charge = aliased(UsageEvent)
+    settled = (
+        select(charge.id)
+        .where(
+            charge.event_type == "charge",
+            charge.dedupe_key
+            == (
+                UsageEvent.provider_generation_id + ":" + UsageEvent.purpose + ":reconciled-charge"
+            ),
+        )
+        .correlate(UsageEvent)
+        .exists()
+    )
+    async with database.sessions() as db:
+        rows = await db.scalars(
+            select(UsageEvent.provider_generation_id).where(
+                UsageEvent.event_type == "pending",
+                UsageEvent.provider_generation_id.is_not(None),
+                ~settled,
+            )
+        )
+        return {row for row in rows if row is not None}
+
+
 async def test_protocol_retry_and_stop_leave_every_provider_call_chargeable(
     manager_database: tuple[Database, Settings, User],
 ) -> None:
@@ -821,7 +853,13 @@ async def test_protocol_retry_and_stop_leave_every_provider_call_chargeable(
     assert ("pending", "chat", None, "gen-bad") in before
     assert ("pending", "chat", None, "gen-stopped") in before
     assert ("charge", "chat", 250_000, "gen-good") in before
+    # Rolling back must not make the previous release charge completed calls again:
+    # their ids were recorded early as pending, but their charges settle them for it too.
+    # (The failed calls may already be settled by a background reconciliation.)
+    unsettled = await _unsettled_for_the_previous_release(database)
+    assert unsettled <= {"gen-bad", "gen-stopped"}
     await manager.reconcile_pending_costs()
+    assert await _unsettled_for_the_previous_release(database) == set()
     after = await _ledger(database)
     charges = [row for row in after if row[0] == "charge"]
     # The failed attempt and the stopped stream are charged exactly once each; the
