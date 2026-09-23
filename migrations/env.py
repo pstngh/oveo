@@ -10,6 +10,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from oveo.config import Settings
+from oveo.db import prepare_sqlite_path
 from oveo.models import Base
 
 config = context.config
@@ -17,6 +18,7 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 database_url = os.environ.get("OVEO_DATABASE_URL") or Settings().database_url
+prepare_sqlite_path(database_url)
 config.set_main_option("sqlalchemy.url", database_url)
 target_metadata = Base.metadata
 

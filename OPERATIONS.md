@@ -135,6 +135,28 @@ Test a restore at any time with `--destination`. A live restore is intentionally
 
 After successful application-level verification, remove only the exact timestamped `/var/lib/oveo.pre-restore.TIMESTAMP` directory. Never glob or prune `/var/lib`.
 
+## Request limits and client addresses
+
+The application rejects oversized requests before reading them: 16 KiB for JSON
+routes and the upload limit plus 256 KiB for the two message routes that accept a
+DOCX file (declared `Content-Length` or counted while streaming). As optional
+defense in depth, an operator may add `request_body { max_size 3MB }` to the Oveo
+site block of the shared Caddyfile during a maintenance window; this repository does
+not edit that file.
+
+Sign-in attempts are serialized per account, password checks run on one dedicated
+thread with a short admission queue, and failed attempts are rate limited per client
+address and globally before any hashing. Uvicorn now trusts `X-Forwarded-For` only
+from addresses in `FORWARDED_ALLOW_IPS` (default: loopback). Inside the container,
+Caddy's connections arrive from the Docker network gateway, so by default every
+client shares one address for the per-client limit; the global and per-account
+limits still apply and no local process can spoof a client address. To enable
+per-client limits, first confirm the gateway with
+`docker network inspect oveo_default --format '{{(index .IPAM.Config 0).Gateway}}'`
+and that Caddy's `reverse_proxy` does not trust client-supplied forwarding headers
+(its default), then add `FORWARDED_ALLOW_IPS=<that address>` to
+`/etc/oveo/runtime.env` and redeploy.
+
 ## Incidents
 
 Inspect container state and content-free logs with `docker compose ... ps` and `docker compose ... logs --since 30m app`. Do not log or paste prompts, messages, attachment contents, cookies, provider bodies, or secrets. Disk recovery must target only exact superseded Oveo digest references and documented timestamped restore directories. Never run `docker system prune`, `docker image prune`, `docker volume prune`, or a global builder prune on this shared VPS.

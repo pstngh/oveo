@@ -17,7 +17,6 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy import update as sa_update
-from starlette.requests import Request
 
 import oveo.generation as generation_module
 from oveo.auth import change_password, hash_password, verify_password
@@ -321,21 +320,30 @@ def test_unexpected_http_failure_returns_and_logs_an_opaque_error_id(
         secure_cookies=False,
     )
     app = create_app(settings=settings, database=database, provider=ImmediateProvider())
+
+    async def failing_route() -> None:
+        raise RuntimeError("private request marker")
+
+    app.add_api_route("/api/test-failure", failing_route)
+    app.router.routes.insert(0, app.router.routes.pop())  # ahead of the SPA fallback
     caplog.set_level(logging.ERROR, logger="oveo.http")
-    handler = app.exception_handlers[Exception]
-    response = asyncio.run(
-        handler(Request({"type": "http"}), RuntimeError("private request marker"))
-    )
+    # raise_server_exceptions stays on: the exception must not be re-raised to the
+    # server, which would print its traceback and message to the container log.
+    with TestClient(app, base_url="http://testserver") as client:
+        response = client.get("/api/test-failure")
     asyncio.run(database.dispose())
 
     assert response.status_code == 500
-    error_id = json.loads(response.body)["error_id"]
+    assert response.headers["x-content-type-options"] == "nosniff"
+    error_id = response.json()["error_id"]
     assert re.fullmatch(r"[0-9a-f]{32}", error_id)
     diagnostics = "\n".join(record.getMessage() for record in caplog.records)
     assert f"error_id={error_id}" in diagnostics
     assert "area=http" in diagnostics
     assert "exception_class=RuntimeError" in diagnostics
-    assert "locations=" in diagnostics
+    # The innermost frame names the failing function, not only framework middleware.
+    assert "test_api_integration.py:" in diagnostics
+    assert ":failing_route" in diagnostics
     assert "private request marker" not in diagnostics
 
 

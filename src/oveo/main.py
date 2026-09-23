@@ -10,8 +10,8 @@ from argon2.low_level import Type
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
-from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from oveo.api import ApiError, router
@@ -25,10 +25,23 @@ from oveo.generation import (
     UnavailableProvider,
 )
 from oveo.logging_config import install_error_file_handler, remove_error_file_handler
+from oveo.login_guard import LoginGuard
+from oveo.middleware import (
+    ContentFreeErrors,
+    ImmutableStaticFiles,
+    MaintenanceGate,
+    RequestBodyLimit,
+)
 from oveo.models import User
 from oveo.provider import warm_tokenizer
 
 _LOGGER = logging.getLogger("oveo.http")
+_HTTP_ERRORS = {
+    400: ("invalid_request", "The request is invalid."),
+    404: ("not_found", "Endpoint not found."),
+    405: ("method_not_allowed", "The request method is not allowed."),
+    413: ("request_too_large", "The request is too large."),
+}
 
 
 def _validated_argon2id_hash(encoded: str, *, username: str) -> str:
@@ -119,6 +132,11 @@ def create_app(
             else UnavailableProvider()
         )
     manager = GenerationManager(app_database, app_settings, provider)
+    login_guard = LoginGuard(
+        window_seconds=app_settings.login_window_seconds,
+        client_failure_limit=app_settings.login_client_failure_limit,
+        global_failure_limit=app_settings.login_global_failure_limit,
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -143,6 +161,7 @@ def create_app(
             raise
         finally:
             await manager.shutdown()
+            login_guard.close()
             if owns_database:
                 await app_database.dispose()
             remove_error_file_handler(error_handler)
@@ -158,7 +177,14 @@ def create_app(
     app.state.settings = app_settings
     app.state.database = app_database
     app.state.generation_manager = manager
+    app.state.login_guard = login_guard
+    # Added innermost first: security headers wrap the content-free error catch-all,
+    # which wraps the body limit (checked before routing parses anything), the
+    # deployment write gate, and the host check.
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=app_settings.trusted_hosts)
+    app.add_middleware(MaintenanceGate, marker=app_settings.maintenance_marker)
+    app.add_middleware(RequestBodyLimit, max_upload_bytes=app_settings.max_upload_bytes)
+    app.add_middleware(ContentFreeErrors)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: object) -> object:
@@ -200,16 +226,15 @@ def create_app(
             content={"code": "invalid_request", "message": "The request is invalid."},
         )
 
-    @app.exception_handler(Exception)
-    async def internal_error_handler(_request: Request, exc: Exception) -> JSONResponse:
-        error_id = log_unexpected(_LOGGER, exc, area="http")
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error_handler(_request: Request, exc: StarletteHTTPException) -> Response:
+        code, message = _HTTP_ERRORS.get(
+            exc.status_code, ("request_failed", "The request could not be completed.")
+        )
         return JSONResponse(
-            status_code=500,
-            content={
-                "code": "internal_error",
-                "message": "The request could not be completed.",
-                "error_id": error_id,
-            },
+            status_code=exc.status_code,
+            content={"code": code, "message": message},
+            headers=exc.headers,
         )
 
     app.include_router(router)
@@ -217,7 +242,8 @@ def create_app(
     frontend_dir = app_settings.frontend_dir
     assets_dir = frontend_dir / "assets"
     if assets_dir.is_dir():
-        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+        # Build assets have content-hashed names, so browsers may keep them forever.
+        app.mount("/assets", ImmutableStaticFiles(directory=assets_dir), name="assets")
 
     @app.get("/{path:path}", include_in_schema=False, response_model=None)
     async def spa(path: str) -> Response:
@@ -232,7 +258,9 @@ def create_app(
                 status_code=404,
                 content={"code": "frontend_unavailable", "message": "Frontend is unavailable."},
             )
-        return FileResponse(index)
+        # The shell names the current assets, so browsers must revalidate it on every
+        # load; otherwise a cached shell keeps requesting assets from an old release.
+        return FileResponse(index, headers={"Cache-Control": "no-cache"})
 
     return app
 

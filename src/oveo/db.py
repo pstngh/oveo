@@ -12,7 +12,9 @@ from sqlalchemy.ext.asyncio import (
 )
 
 
-def _prepare_sqlite_path(database_url: str) -> None:
+def prepare_sqlite_path(database_url: str) -> None:
+    """Create a file database's directory (private) if it does not exist yet."""
+
     prefix = "sqlite+aiosqlite:///"
     if not database_url.startswith(prefix):
         return
@@ -25,7 +27,6 @@ def _prepare_sqlite_path(database_url: str) -> None:
 def create_engine(database_url: str, *, echo: bool = False) -> AsyncEngine:
     """Create the application engine with SQLite safety pragmas on every connection."""
 
-    _prepare_sqlite_path(database_url)
     engine = create_async_engine(
         database_url,
         echo=echo,
@@ -34,6 +35,12 @@ def create_engine(database_url: str, *, echo: bool = False) -> AsyncEngine:
     )
 
     if database_url.startswith("sqlite"):
+
+        @event.listens_for(engine.sync_engine, "do_connect")
+        def prepare_directory(*_args: Any) -> None:
+            # On first use rather than at construction: importing the application
+            # module must not create a data directory in the working directory.
+            prepare_sqlite_path(database_url)
 
         @event.listens_for(engine.sync_engine, "connect")
         def configure_sqlite(dbapi_connection: Any, _connection_record: Any) -> None:

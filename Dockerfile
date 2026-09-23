@@ -58,4 +58,6 @@ WORKDIR /app
 USER 10001:10001
 EXPOSE 8000
 ENTRYPOINT ["/app/container-entrypoint.sh"]
-CMD ["uvicorn", "oveo.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# Forwarded client addresses are trusted only from FORWARDED_ALLOW_IPS (uvicorn's
+# default is loopback); see OPERATIONS.md before widening it.
+CMD ["uvicorn", "oveo.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers"]

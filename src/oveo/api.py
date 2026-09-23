@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Form, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
@@ -22,6 +22,7 @@ from oveo.auth import (
     authenticate_user,
     create_session,
     get_session_principal,
+    normalize_username,
     revoke_session,
     session_is_active,
     validate_csrf,
@@ -31,6 +32,7 @@ from oveo.config import Settings
 from oveo.db import Database
 from oveo.docx import DOCX_MEDIA_TYPE, DocxError, docx_uncompressed_limit, render_docx
 from oveo.generation import GenerationError, GenerationManager
+from oveo.login_guard import LoginBusy, LoginGuard
 from oveo.models import (
     Attachment,
     Generation,
@@ -188,31 +190,59 @@ def _set_auth_cookies(
 
 
 @router.post("/api/auth/login")
-async def login(request: Request, response: Response, body: LoginBody, db: Db) -> dict[str, str]:
+async def login(request: Request, response: Response, body: LoginBody) -> dict[str, str]:
     settings = _settings(request)
     origin = request.headers.get("origin")
     if origin is not None and origin.rstrip("/") != settings.public_origin:
         raise ApiError(403, "csrf_failed", "The request could not be verified.")
-    try:
-        user = await authenticate_user(
-            db,
-            username=body.username,
-            password=body.password,
-            max_attempts=settings.login_attempts,
-            window_seconds=settings.login_window_seconds,
-            lock_seconds=settings.login_lock_seconds,
-        )
-    except LoginThrottled as exc:
-        await db.commit()
-        response.headers["Retry-After"] = str(exc.retry_after_seconds)
-        raise ApiError(429, "login_throttled", "Try signing in again later.") from exc
-    except InvalidCredentials as exc:
-        await db.commit()
+    guard: LoginGuard = request.app.state.login_guard
+    # The address uvicorn resolved: the proxy's forwarded client address only when the
+    # immediate peer is a trusted proxy (FORWARDED_ALLOW_IPS), otherwise the peer.
+    client = request.client.host if request.client is not None else "unknown"
+    retry_after = guard.retry_after(client)
+    if retry_after is not None:
         raise ApiError(
-            401, "invalid_credentials", "The username or password is incorrect."
+            429,
+            "login_throttled",
+            "Too many failed sign-in attempts. Try again later.",
+            headers={"Retry-After": str(retry_after)},
+        )
+    try:
+        async with guard.account(normalize_username(body.username)):
+            async with _database(request).sessions() as db:
+                try:
+                    user = await authenticate_user(
+                        db,
+                        username=body.username,
+                        password=body.password,
+                        max_attempts=settings.login_attempts,
+                        window_seconds=settings.login_window_seconds,
+                        lock_seconds=settings.login_lock_seconds,
+                        verify=guard.verify,
+                    )
+                except LoginThrottled as exc:
+                    await db.commit()
+                    raise ApiError(
+                        429,
+                        "login_throttled",
+                        "Try signing in again later.",
+                        headers={"Retry-After": str(exc.retry_after_seconds)},
+                    ) from exc
+                except InvalidCredentials as exc:
+                    await db.commit()
+                    guard.record_failure(client)
+                    raise ApiError(
+                        401, "invalid_credentials", "The username or password is incorrect."
+                    ) from exc
+                issued = await create_session(db, user=user, session_days=settings.session_days)
+                await db.commit()
+    except LoginBusy as exc:
+        raise ApiError(
+            429,
+            "login_busy",
+            "Too many sign-in attempts are being checked. Try again in a moment.",
+            headers={"Retry-After": "1"},
         ) from exc
-    issued = await create_session(db, user=user, session_days=settings.session_days)
-    await db.commit()
     _set_auth_cookies(
         response,
         settings=settings,
@@ -248,17 +278,12 @@ async def accounts(principal: Principal) -> list[dict[str, str]]:
     return [_account(principal.user)]
 
 
-async def _thread_summary(db: AsyncSession, thread: Thread) -> dict[str, Any]:
-    active_generation = await db.scalar(
-        select(Generation.id)
-        .where(
-            Generation.thread_id == thread.id,
-            Generation.status.in_(("queued", "running", "stopping")),
-        )
-        .order_by(Generation.created_at.desc())
-        .limit(1)
-    )
-    owner_username = await db.scalar(select(User.username).where(User.id == thread.owner_id))
+_ACTIVE_STATUSES = ("queued", "running", "stopping")
+
+
+def _thread_summary(
+    thread: Thread, *, owner_username: str, active_generation_id: str | None
+) -> dict[str, Any]:
     return {
         "id": thread.id,
         "owner_id": thread.owner_id,
@@ -266,8 +291,20 @@ async def _thread_summary(db: AsyncSession, thread: Thread) -> dict[str, Any]:
         "mode": thread.mode,
         "title": thread.title or "New conversation",
         "updated_at": thread.updated_at.isoformat(),
-        "active_generation_id": active_generation,
+        "active_generation_id": active_generation_id,
     }
+
+
+async def _active_generation_id(db: AsyncSession, thread_id: str) -> str | None:
+    # At most one generation per thread is active (partial unique index).
+    return cast(
+        str | None,
+        await db.scalar(
+            select(Generation.id).where(
+                Generation.thread_id == thread_id, Generation.status.in_(_ACTIVE_STATUSES)
+            )
+        ),
+    )
 
 
 @router.get("/api/threads")
@@ -276,14 +313,25 @@ async def list_threads(
 ) -> list[dict[str, Any]]:
     if owner_id is not None and owner_id != principal.user.id:
         raise ApiError(403, "forbidden", "You cannot view that account.")
-    threads = (
-        await db.execute(
-            select(Thread)
-            .where(Thread.owner_id == principal.user.id)
-            .order_by(Thread.updated_at.desc())
+    # One query for the whole list: every thread here belongs to the principal, and the
+    # join can match at most one active generation per thread.
+    rows = await db.execute(
+        select(Thread, Generation.id)
+        .outerjoin(
+            Generation,
+            (Generation.thread_id == Thread.id) & Generation.status.in_(_ACTIVE_STATUSES),
         )
-    ).scalars()
-    return [await _thread_summary(db, thread) for thread in threads]
+        .where(Thread.owner_id == principal.user.id)
+        .order_by(Thread.updated_at.desc())
+    )
+    return [
+        _thread_summary(
+            thread,
+            owner_username=principal.user.username,
+            active_generation_id=active_generation_id,
+        )
+        for thread, active_generation_id in rows.tuples()
+    ]
 
 
 def _message_blocks(message: Message) -> list[dict[str, str]]:
@@ -311,17 +359,28 @@ async def _latest_work_version(db: AsyncSession, thread_id: str) -> WorkVersion 
 
 @router.get("/api/threads/{thread_id}")
 async def thread_detail(
-    thread_id: str, request: Request, principal: Principal, db: Db
+    thread_id: str,
+    request: Request,
+    principal: Principal,
+    db: Db,
+    after_ordinal: Annotated[int | None, Query(ge=0)] = None,
 ) -> dict[str, Any]:
+    """Return a conversation; with ``after_ordinal``, only its newer messages.
+
+    The browser refreshes an open conversation after every response, so it asks only
+    for what it does not have instead of downloading the whole transcript again.
+    """
+
     thread = _require_thread(principal, await db.get(Thread, thread_id))
-    summary = await _thread_summary(db, thread)
-    messages = list(
-        (
-            await db.execute(
-                select(Message).where(Message.thread_id == thread.id).order_by(Message.ordinal)
-            )
-        ).scalars()
+    summary = _thread_summary(
+        thread,
+        owner_username=principal.user.username,
+        active_generation_id=await _active_generation_id(db, thread.id),
     )
+    message_query = select(Message).where(Message.thread_id == thread.id)
+    if after_ordinal is not None:
+        message_query = message_query.where(Message.ordinal > after_ordinal)
+    messages = list((await db.execute(message_query.order_by(Message.ordinal))).scalars())
     actor_ids = {message.actor_user_id for message in messages if message.actor_user_id}
     actors = {
         user.id: user.username
@@ -330,9 +389,9 @@ async def thread_detail(
     attachment_rows = list(
         (
             await db.execute(
-                select(Attachment)
-                .join(Message, Attachment.message_id == Message.id)
-                .where(Message.thread_id == thread.id)
+                select(Attachment).where(
+                    Attachment.message_id.in_([message.id for message in messages])
+                )
             )
         ).scalars()
     )
@@ -346,6 +405,7 @@ async def thread_detail(
         serialized_messages.append(
             {
                 "id": message.id,
+                "ordinal": message.ordinal,
                 "role": message.role,
                 "actor_username": actor_username,
                 "blocks": _message_blocks(message),
@@ -504,7 +564,11 @@ async def rename_thread(
         raise ApiError(422, "invalid_title", "Enter a conversation title.")
     thread.title = title
     await db.commit()
-    return await _thread_summary(db, thread)
+    return _thread_summary(
+        thread,
+        owner_username=principal.user.username,
+        active_generation_id=await _active_generation_id(db, thread.id),
+    )
 
 
 @router.delete("/api/threads/{thread_id}", status_code=204)

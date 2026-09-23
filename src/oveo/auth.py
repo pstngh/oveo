@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -85,14 +86,25 @@ async def authenticate_user(
     window_seconds: int,
     lock_seconds: int,
     now: datetime | None = None,
+    verify: Callable[[str, str], Awaitable[bool]] | None = None,
 ) -> User:
-    """Verify credentials and maintain the account's bounded persistent throttle state."""
+    """Verify credentials and maintain the account's bounded persistent throttle state.
+
+    ``verify`` runs the password check off the event loop (the API passes the bounded
+    Argon2 worker). Callers must serialize attempts per account (see login_guard); the
+    counter update below is a read-modify-write.
+    """
+
+    async def check(password_hash: str) -> bool:
+        if verify is None:
+            return verify_password(password_hash, password)
+        return await verify(password_hash, password)
 
     current_time = now or datetime.now(UTC)
     normalized = normalize_username(username)
     user = await db.scalar(select(User).where(User.username == normalized))
     if user is None:
-        verify_password(_DUMMY_PASSWORD_HASH, password)
+        await check(_DUMMY_PASSWORD_HASH)
         raise InvalidCredentials
 
     if user.login_locked_until is not None:
@@ -101,7 +113,7 @@ async def authenticate_user(
             remaining = max(1, int((locked_until - current_time).total_seconds()))
             raise LoginThrottled(remaining)
 
-    if not verify_password(user.password_hash, password):
+    if not await check(user.password_hash):
         window_started = (
             _aware(user.login_window_started_at)
             if user.login_window_started_at is not None

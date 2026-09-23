@@ -21,9 +21,12 @@ def log_unexpected(logger: logging.Logger, error: BaseException, *, area: str) -
     """
 
     error_id = uuid.uuid4().hex
+    # The innermost frames name the failing line; the outermost ones are only the
+    # framework's middleware stack.
+    frames = traceback.extract_tb(error.__traceback__)[-8:]
     locations = "|".join(
         f"{_label(Path(frame.filename).name)}:{frame.lineno}:{_label(frame.name)}"
-        for frame in traceback.extract_tb(error.__traceback__, limit=8)
+        for frame in frames
     )
     logger.error(
         "unexpected_error error_id=%s area=%s exception_class=%s locations=%s",

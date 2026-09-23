@@ -160,8 +160,10 @@ server access controls.
 Content-free error diagnostics are written to
 `/data/logs/oveo-errors.log` in production. The private log rotates at 5 MB and
 retains five previous files. It contains error identifiers, codes, components,
-and code locations, never prompts, chat text, attachments, cookies, or provider
-bodies.
+and the innermost code locations, never prompts, chat text, attachments, cookies,
+or provider bodies. Unexpected request errors are answered with that opaque error
+ID and are not re-raised, so the server does not print their tracebacks or
+messages to the container log.
 
 Never commit `.env`, credentials, live databases, attachments, backup identities,
 or decrypted backups.

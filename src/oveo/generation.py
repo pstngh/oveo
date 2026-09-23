@@ -28,6 +28,7 @@ from oveo.context import (
     HANDOFF_SENTINEL,
     AttachmentDocument,
     AttachmentRole,
+    PromptLoader,
     build_handoff_merge_messages,
     build_provider_messages,
 )
@@ -581,6 +582,8 @@ class GenerationManager:
         # One thread each: a DOCX parse can use tens of MiB, so request-path parses are
         # admitted one running plus one waiting. Token counting is lighter but still
         # CPU-bound and kept off the event loop.
+        # Prompts come from the configured directory, never the working directory.
+        self._prompts = PromptLoader(settings.prompts_dir)
         self.docx_worker = BoundedWorker("oveo-docx", max_pending=2)
         self.token_worker = BoundedWorker("oveo-tokens", max_pending=4)
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -1022,6 +1025,7 @@ class GenerationManager:
             attachments=attachments,
             active_reference_document=active_reference_document,
             canonical_state=canonical,
+            prompt_loader=self._prompts,
         )
         return {
             "schema_version": 1,

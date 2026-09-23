@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     login_attempts: int = Field(default=5, ge=2, le=20)
     login_window_seconds: int = Field(default=900, ge=60, le=3600)
     login_lock_seconds: int = Field(default=900, ge=60, le=86_400)
+    # Failed sign-ins per window from one client address, and from all clients, before
+    # further attempts are refused without hashing.
+    login_client_failure_limit: int = Field(default=20, ge=5, le=1_000)
+    login_global_failure_limit: int = Field(default=60, ge=10, le=10_000)
     max_upload_bytes: int = Field(default=2_000_000, ge=1024, le=10_000_000)
     max_source_words: int = Field(default=25_000, ge=1000, le=100_000)
     # The latest reference is re-sent with every turn and cannot be compacted away.
@@ -66,6 +70,12 @@ class Settings(BaseSettings):
     @property
     def resolved_error_log_path(self) -> Path:
         return self.error_log_path or self.data_dir / "logs" / "oveo-errors.log"
+
+    @property
+    def maintenance_marker(self) -> Path:
+        """While this file exists, state-changing API requests get 503 (see deploy)."""
+
+        return self.data_dir / "maintenance-mode"
 
     def ensure_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
