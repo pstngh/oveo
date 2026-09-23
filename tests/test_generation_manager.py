@@ -713,7 +713,7 @@ async def test_mutation_rejects_multiple_or_mismatched_visible_deliverables(
             "brief": {"direction": "en-US-fr-CA"},
         },
     )
-    provider = ScriptedProvider([invalid_response, invalid_response])
+    provider = ScriptedProvider([invalid_response] * 3)
     manager = GenerationManager(database, settings, provider)
     async with database.sessions() as db:
         thread = Thread(owner_id=user.id, mode="translate", title="Existing conversation")
@@ -734,7 +734,7 @@ async def test_mutation_rejects_multiple_or_mismatched_visible_deliverables(
     async with database.sessions() as db:
         assert await db.scalar(select(func.count()).select_from(WorkVersion)) == 0
         assert await db.scalar(select(func.count()).select_from(Message)) == 1
-    assert len(provider.requests) == 2
+    assert len(provider.requests) == 3
     await manager.shutdown()
 
 
@@ -876,6 +876,66 @@ async def test_protocol_failure_retries_once_and_discards_any_visible_draft(
             or 0
         )
         assert assistant_messages == 1
+    await manager.shutdown()
+
+
+async def test_internal_comms_recovers_from_mismatch_then_invalid_event_fields(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, settings, user = manager_database
+    mismatch = _response_stream(
+        "Visible draft",
+        {
+            "operation": "establish",
+            "source": "Synthetic brief",
+            "output": "Different hidden draft",
+            "brief": {"audience": "staff"},
+        },
+    )
+    invalid_fields = _ESTABLISH.replace(
+        b'{"v":1,"event":"response_end"}',
+        b'{"v":1,"event":"response_end","extra":true}',
+    )
+    valid = _response_stream(
+        "Final draft",
+        {
+            "operation": "establish",
+            "source": "Synthetic brief",
+            "output": "Final draft",
+            "brief": {"audience": "staff"},
+        },
+    )
+    provider = ScriptedProvider([mismatch, invalid_fields, valid])
+    manager = GenerationManager(database, settings, provider)
+    async with database.sessions() as db:
+        thread = Thread(owner_id=user.id, mode="internal_comms", title="Existing conversation")
+        db.add(thread)
+        await db.commit()
+        thread_id = thread.id
+
+    submitted = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="internal-comms-protocol-repair",
+        text="Draft a short staff notice from this synthetic brief.",
+        attachment=None,
+        thread_id=thread_id,
+    )
+    completed = await _wait_status(manager, submitted.generation_id, {"completed"})
+    assert completed["blocks"] == [{"type": "deliverable", "text": "Final draft"}]
+    assert len(provider.requests) == 3
+    assert len({request.generation_id for request in provider.requests}) == 3
+    assert "visible deliverable differed" in str(provider.requests[1].snapshot)
+    assert "missing or extra keys" in str(provider.requests[2].snapshot)
+    async with database.sessions() as db:
+        assert await db.scalar(select(func.count()).select_from(WorkVersion)) == 1
+        assert (
+            await db.scalar(
+                select(func.count())
+                .select_from(Message)
+                .where(Message.thread_id == thread_id, Message.role == "assistant")
+            )
+            == 1
+        )
     await manager.shutdown()
 
 
@@ -1363,7 +1423,7 @@ async def test_prompt_handoff_rejects_unreplaced_reserved_sentinel(
         "OVEO_HANDOFF_TEXT_MUST_BE_REPLACED_V1",
         {"operation": "none"},
     )
-    provider = ScriptedProvider([sentinel_stream, sentinel_stream])
+    provider = ScriptedProvider([sentinel_stream] * 3)
     manager = GenerationManager(database, settings, provider)
     async with database.sessions() as db:
         thread = Thread(owner_id=user.id, mode="translate", title="Existing thread")
@@ -1388,7 +1448,7 @@ async def test_prompt_handoff_rejects_unreplaced_reserved_sentinel(
     )
     failed = await _wait_status(manager, generation_id, {"failed"})
     assert failed["error_code"] == "protocol_error"
-    assert len(provider.requests) == 2
+    assert len(provider.requests) == 3
     await manager.shutdown()
 
 

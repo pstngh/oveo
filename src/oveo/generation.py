@@ -1960,7 +1960,7 @@ class GenerationManager:
             )
             raise error from exc
 
-    async def _prepare_protocol_retry(self, generation_id: str) -> bool:
+    async def _prepare_protocol_retry(self, generation_id: str, retry_number: int) -> bool:
         """Discard one uncommitted attempt so the model can regenerate it strictly."""
 
         async with self.database.sessions() as db:
@@ -1969,14 +1969,14 @@ class GenerationManager:
                 return False
             # Partial blocks are explicitly draft streaming state. A response that fails
             # protocol validation was never committed as an assistant message, so reset
-            # that draft before the single bounded retry even when text had started to
+            # that draft before each bounded retry even when text had started to
             # stream. This avoids turning a repairable late state/terminal-event mistake
             # into a user-visible hard failure.
             generation.partial_blocks = []
             generation.stream_revision += 1
             await append_usage_event(
                 db,
-                dedupe_key=f"{generation.id}:protocol_retry:pending",
+                dedupe_key=f"{generation.id}:protocol_retry:{retry_number}:pending",
                 event_type="pending",
                 purpose=generation.purpose,
                 amount_microusd=None,
@@ -1990,15 +1990,32 @@ class GenerationManager:
         return True
 
     @staticmethod
-    def _protocol_retry_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    def _protocol_retry_snapshot(snapshot: Mapping[str, Any], error_code: str) -> dict[str, Any]:
         messages = _snapshot_messages(snapshot, error_code="invalid_request_snapshot")
         if not messages or messages[0].role != "system":
             raise ProviderError("invalid_request_snapshot")
+        guidance = {
+            "state_deliverable_mismatch": (
+                "The visible deliverable differed from the canonical output. For "
+                "establish, full, or replace, make the deliverable exactly equal the "
+                "complete resulting output, character for character. For append, use "
+                "the exact output addition or the complete joined output."
+            ),
+            "state_deliverable_count_mismatch": (
+                "A state mutation requires exactly one deliverable block. If you "
+                "present multiple alternatives, use operation none instead."
+            ),
+            "invalid_event_fields": (
+                "An event had missing or extra keys. Use only the exact keys for "
+                "each event and the chosen state operation in the protocol. Omit "
+                "unchanged optional state fields rather than adding null values."
+            ),
+        }.get(error_code, "Check every event against the exact protocol schema.")
         reminder = (
             "\n\nPROTOCOL RETRY: The preceding attempt failed strict response-protocol "
-            "validation before any substantive visible content was accepted. Regenerate "
-            "the response from the same data. Emit only the exact NDJSON grammar already "
-            "specified; do not quote, explain, loosen, or work around it."
+            "validation and was discarded. Regenerate the response from the same "
+            "data. Emit only the exact NDJSON grammar already specified; do not "
+            "quote, explain, loosen, or work around it. " + guidance
         )
         repaired = [
             ProviderMessage(role="system", content=messages[0].content + reminder),
@@ -2059,10 +2076,12 @@ class GenerationManager:
                 return emit
 
             try:
-                for attempt in range(2):
+                for attempt in range(3):
                     request = ProviderRequest(
                         generation_id=(
-                            generation.id if attempt == 0 else f"{generation.id}:protocol-retry"
+                            generation.id
+                            if attempt == 0
+                            else f"{generation.id}:protocol-retry:{attempt}"
                         ),
                         purpose=generation.purpose,
                         mode=str(request_snapshot.get("mode", "translate")),
@@ -2089,9 +2108,13 @@ class GenerationManager:
                             attempt + 1,
                             error.code,
                         )
-                        if attempt != 0 or not await self._prepare_protocol_retry(generation_id):
+                        if attempt == 2 or not await self._prepare_protocol_retry(
+                            generation_id, attempt + 1
+                        ):
                             raise
-                        request_snapshot = self._protocol_retry_snapshot(request_snapshot)
+                        request_snapshot = self._protocol_retry_snapshot(
+                            request_snapshot, error.code
+                        )
                 if generation.purpose == "chat" and generation.thread_id is not None:
                     await self._maybe_generate_title(generation.id, generation.thread_id)
             except ProviderError as error:
