@@ -1,6 +1,9 @@
 import type { Account, AttachmentRole, GenerationSnapshot, SessionUser, ThreadDetail, ThreadSummary } from "./types";
 
-let csrfToken = "";
+// Used only when the cookie below cannot be read (a server configured with another
+// cookie name). The cookie is authoritative: signing in again, in this tab or another
+// one, replaces it, and the server compares the header with it.
+let fallbackCsrfToken = "";
 
 function cookie(name: string): string {
   const prefix = `${encodeURIComponent(name)}=`;
@@ -9,7 +12,7 @@ function cookie(name: string): string {
 }
 
 export function setCsrfToken(token: string): void {
-  csrfToken = token;
+  fallbackCsrfToken = token;
 }
 
 export class ApiError extends Error {
@@ -22,11 +25,15 @@ export class ApiError extends Error {
   }
 }
 
+// Every identifier is one encoded path segment, so a value such as "../auth/me" can
+// never address another route.
+const segment = encodeURIComponent;
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body && !(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
   if (init.method && !["GET", "HEAD"].includes(init.method.toUpperCase())) {
-    headers.set("X-CSRF-Token", csrfToken || cookie("oveo_csrf"));
+    headers.set("X-CSRF-Token", cookie("oveo_csrf") || fallbackCsrfToken);
   }
   const response = await fetch(path, { ...init, headers, credentials: "same-origin" });
   if (response.status === 401) window.dispatchEvent(new Event("oveo:unauthorized"));
@@ -45,11 +52,15 @@ export const api = {
   logout: () => request<void>("/api/auth/logout", { method: "POST" }),
   accounts: () => request<Account[]>("/api/accounts"),
   threads: () => request<ThreadSummary[]>("/api/threads"),
-  thread: (id: string) => request<ThreadDetail>(`/api/threads/${id}`),
-  documentUrl: (id: string) => `/api/threads/${encodeURIComponent(id)}/document.docx`,
+  /** A conversation; with `afterOrdinal`, only the messages newer than that one. */
+  thread: (id: string, afterOrdinal?: number) =>
+    request<ThreadDetail>(
+      `/api/threads/${segment(id)}${afterOrdinal === undefined ? "" : `?after_ordinal=${afterOrdinal}`}`,
+    ),
+  documentUrl: (id: string) => `/api/threads/${segment(id)}/document.docx`,
   rename: (id: string, title: string) =>
-    request<ThreadSummary>(`/api/threads/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
-  deleteThread: (id: string) => request<void>(`/api/threads/${id}`, { method: "DELETE" }),
+    request<ThreadSummary>(`/api/threads/${segment(id)}`, { method: "PATCH", body: JSON.stringify({ title }) }),
+  deleteThread: (id: string) => request<void>(`/api/threads/${segment(id)}`, { method: "DELETE" }),
   submit: async (args: {
     threadId?: string;
     mode?: string;
@@ -66,20 +77,20 @@ export const api = {
       form.set("attachment", args.attachment);
       form.set("attachment_role", args.attachmentRole ?? "source");
     }
-    const path = args.threadId ? `/api/threads/${args.threadId}/messages` : "/api/threads";
+    const path = args.threadId ? `/api/threads/${segment(args.threadId)}/messages` : "/api/threads";
     return request<{ thread_id: string; generation_id: string }>(path, { method: "POST", body: form });
   },
-  stop: (id: string) => request<void>(`/api/generations/${id}/stop`, { method: "POST" }),
+  stop: (id: string) => request<void>(`/api/generations/${segment(id)}/stop`, { method: "POST" }),
   retry: (id: string, clientRequestId: string) =>
-    request<{ generation_id: string }>(`/api/generations/${id}/retry`, {
+    request<{ generation_id: string }>(`/api/generations/${segment(id)}/retry`, {
       method: "POST",
       body: JSON.stringify({ client_request_id: clientRequestId }),
     }),
   handoff: (threadId: string, clientRequestId: string) =>
-    request<{ generation_id: string }>(`/api/threads/${threadId}/prompt-handoff`, {
+    request<{ generation_id: string }>(`/api/threads/${segment(threadId)}/prompt-handoff`, {
       method: "POST",
       body: JSON.stringify({ client_request_id: clientRequestId }),
     }),
-  generation: (id: string) => request<GenerationSnapshot>(`/api/generations/${id}`),
+  generation: (id: string) => request<GenerationSnapshot>(`/api/generations/${segment(id)}`),
   usage: () => request<{ formatted: string }>("/api/usage/lifetime"),
 };

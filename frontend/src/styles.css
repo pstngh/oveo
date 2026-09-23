@@ -150,9 +150,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .modal-actions .danger-button { border-color: #784947; background: #663c3b; }
 .handoff-body { max-height: 65vh; overflow-y: auto; }
 .handoff-loading { padding: 32px; color: var(--muted); text-align: center; }
-.toast { position: fixed; z-index: 80; right: 20px; bottom: 20px; max-width: 440px; display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid #704b49; border-radius: 9px; background: #422d2c; box-shadow: 0 10px 30px rgba(0,0,0,.3); font-size: .86rem; }
+.handoff-note { margin: 12px 0 0; color: var(--muted); font-size: .8rem; text-align: center; }
+.conversation-loading { padding: 48px 24px; color: var(--muted); text-align: center; }
+.toasts { position: fixed; z-index: 80; right: 20px; bottom: 20px; max-width: min(440px, calc(100vw - 40px)); display: grid; gap: 8px; }
+.toast { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid #704b49; border-radius: 9px; background: #422d2c; box-shadow: 0 10px 30px rgba(0,0,0,.3); font-size: .86rem; }
+.toast.notice { border-color: #4a4f57; background: #2c2f34; }
 .toast button { margin-left: auto; border: 0; color: inherit; background: transparent; cursor: pointer; }
 .toast svg { width: 16px; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; margin: -1px; padding: 0; border: 0; clip-path: inset(50%); white-space: nowrap; }
 .mobile-menu, .mobile-close { display: none; }
 
 @keyframes pulse { 50% { opacity: .45; } }

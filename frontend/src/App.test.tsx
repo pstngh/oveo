@@ -6,6 +6,8 @@ import App, { canonicalPath, Composer, conversationIdFromPath, conversationPath,
 import { api } from "./api";
 import type { GenerationSnapshot, ThreadDetail } from "./types";
 
+const THREAD_ID = "3f2c8a1e-5b7d-4c9a-8e1f-2a6b9c0d4e57";
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
@@ -48,7 +50,7 @@ describe("authenticated bootstrap", () => {
   });
 
   it("shows a DOCX download only for an exportable canonical document", async () => {
-    window.history.replaceState(null, "", "/conversations/thread-1");
+    window.history.replaceState(null, "", `/conversations/${THREAD_ID}`);
     vi.spyOn(api, "me").mockResolvedValue({
       id: "user-1",
       username: "charles",
@@ -56,7 +58,7 @@ describe("authenticated bootstrap", () => {
       csrf_token: "csrf",
     });
     vi.spyOn(api, "threads").mockResolvedValue([{
-      id: "thread-1",
+      id: THREAD_ID,
       owner_id: "user-1",
       mode: "translate",
       title: "Word translation",
@@ -64,7 +66,7 @@ describe("authenticated bootstrap", () => {
       active_generation_id: null,
     }]);
     vi.spyOn(api, "thread").mockResolvedValue({
-      id: "thread-1",
+      id: THREAD_ID,
       owner_id: "user-1",
       owner_username: "charles",
       mode: "translate",
@@ -80,7 +82,7 @@ describe("authenticated bootstrap", () => {
 
     expect(await screen.findByRole("link", { name: "Download DOCX" })).toHaveAttribute(
       "href",
-      "/api/threads/thread-1/document.docx",
+      `/api/threads/${THREAD_ID}/document.docx`,
     );
   });
 });
@@ -373,22 +375,31 @@ describe("conversation scrolling", () => {
     expect(screen.getByRole("region", { name: "Deliverable" })).toHaveTextContent(
       "Preserved translated text.",
     );
-    expect(screen.getByRole("status")).toHaveTextContent("document update could not be saved");
+    expect(screen.getByText(/document update could not be saved/)).toBeInTheDocument();
     expect(screen.queryByLabelText("Generating")).not.toBeInTheDocument();
   });
 });
 
 describe("conversation addresses", () => {
   it("builds and reads a visible conversation path", () => {
-    expect(conversationPath("thread-1")).toBe("/conversations/thread-1");
-    expect(conversationIdFromPath("/conversations/thread-1")).toBe("thread-1");
+    expect(conversationPath(THREAD_ID)).toBe(`/conversations/${THREAD_ID}`);
+    expect(conversationIdFromPath(`/conversations/${THREAD_ID}`)).toBe(THREAD_ID);
+    expect(conversationIdFromPath(`/conversations/${THREAD_ID.toUpperCase()}`)).toBe(THREAD_ID);
     expect(conversationIdFromPath("/new")).toBeNull();
   });
 
+  it("accepts only conversation identifiers as conversations", () => {
+    expect(conversationIdFromPath("/conversations/..%2Fauth%2Fme")).toBeNull();
+    expect(conversationIdFromPath("/conversations/..")).toBeNull();
+    expect(conversationIdFromPath("/conversations/thread-1")).toBeNull();
+    expect(conversationIdFromPath("/conversations/%E0%A4%A")).toBeNull();
+  });
+
   it("normalizes signed-out and signed-in addresses", () => {
-    expect(canonicalPath("/conversations/thread-1", false)).toBe("/");
+    expect(canonicalPath(`/conversations/${THREAD_ID}`, false)).toBe("/");
     expect(canonicalPath("/", true)).toBe("/new");
     expect(canonicalPath("/new", true)).toBe("/new");
-    expect(canonicalPath("/conversations/thread-1/", true)).toBe("/conversations/thread-1");
+    expect(canonicalPath(`/conversations/${THREAD_ID}/`, true)).toBe(`/conversations/${THREAD_ID}`);
+    expect(canonicalPath("/conversations/..%2Fauth%2Fme", true)).toBe("/new");
   });
 });

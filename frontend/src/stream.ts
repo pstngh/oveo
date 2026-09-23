@@ -93,6 +93,10 @@ export function followGeneration(
 
   const open = () => {
     if (stopped) return;
+    if (typeof EventSource === "undefined") {
+      void poll();
+      return;
+    }
     const stream = new EventSource(`/api/generations/${encodeURIComponent(id)}/events`);
     source = stream;
     stream.addEventListener("snapshot", (event) => {

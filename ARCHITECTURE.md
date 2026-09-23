@@ -146,6 +146,23 @@ Export is an authenticated, private/no-store GET that selects the latest active
 canonical version and patches the original OOXML package in memory. Generated
 exports are not persisted.
 
+## Browser application
+
+Everything one sign-in can see (conversation list, open conversation, unsent drafts,
+event streams, timers, the tab title) belongs to a workspace that is created at sign-in
+and discarded at sign-out or on any 401, so the next account starts from nothing. Every
+navigation invalidates responses still in flight for the previous view: a slow load,
+or a send that finishes after the user moved on, can neither replace what is shown nor
+pull the user back. Unsent text and attachments are kept per conversation. A message
+whose submission outcome is unknown stays in the composer and is sent again with the
+same idempotency key, so the server returns the turn it may already hold instead of
+creating a second one; once the server accepts a turn, a failed refresh is reported as
+such, never as an unsent message. Conversation addresses must be UUIDs and every
+identifier is one encoded path segment. The CSRF header is read from the cookie at
+request time. The conversation list is polled every 15 seconds and only while the tab
+is visible; after a response the browser fetches only newer messages. Streamed text is
+not a live region; a separate status region announces coarse progress.
+
 ## Deliberate omissions
 
 Oveo has no dynamic rule-pack loader, prompt database/editor, unified-conversation

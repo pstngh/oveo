@@ -34,6 +34,15 @@ import type {
 } from "./types";
 
 const uuid = () => crypto.randomUUID();
+// Conversation IDs are UUIDs; anything else in the address is not a conversation and
+// never reaches an API path.
+const CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// The list only shows titles and activity, so a hidden tab does not poll at all.
+const THREAD_LIST_POLL_MS = 15_000;
+const HANDOFF_POLL_MS = 700;
+// Matches the breakpoint in styles.css where the sidebar becomes an off-canvas panel.
+const MOBILE_LAYOUT = "(max-width: 760px)";
+const UNCONFIRMED_SEND = "Oveo could not confirm that your message was sent. Send it again; it will not be duplicated.";
 
 const MODE_COPY: Record<Mode, { label: string; heading: string; guidance: string }> = {
   translate: {
@@ -60,11 +69,13 @@ export function conversationPath(id: string) {
 export function conversationIdFromPath(pathname: string) {
   const match = /^\/conversations\/([^/]+)\/?$/.exec(pathname);
   if (!match) return null;
+  let id: string;
   try {
-    return decodeURIComponent(match[1]);
+    id = decodeURIComponent(match[1]);
   } catch {
     return null;
   }
+  return CONVERSATION_ID.test(id) ? id.toLowerCase() : null;
 }
 
 export function canonicalPath(pathname: string, authenticated: boolean) {
@@ -77,6 +88,68 @@ export function canonicalPath(pathname: string, authenticated: boolean) {
 function updateAddress(path: string, replace = false) {
   if (window.location.pathname === path) return;
   window.history[replace ? "replaceState" : "pushState"](null, "", path);
+}
+
+function errorMessage(reason: unknown, fallback: string) {
+  return reason instanceof ApiError ? reason.message : fallback;
+}
+
+function isUnauthorized(reason: unknown) {
+  return reason instanceof ApiError && reason.status === 401;
+}
+
+function delay(ms: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+}
+
+/** What the workspace shows: a new conversation (with or without a chosen mode) or one conversation. */
+type View = { kind: "new"; mode: Mode | null } | { kind: "thread"; id: string };
+
+function viewFromPath(pathname: string): View {
+  const id = conversationIdFromPath(pathname);
+  return id ? { kind: "thread", id } : { kind: "new", mode: null };
+}
+
+function viewKey(view: View) {
+  return view.kind === "thread" ? `thread:${view.id}` : `new:${view.mode ?? ""}`;
+}
+
+/** The newest message ordinal shown, or undefined when a message has none (older server). */
+function knownOrdinal(detail: ThreadDetail): number | undefined {
+  let highest = 0;
+  for (const message of detail.messages) {
+    if (typeof message.ordinal !== "number") return undefined;
+    highest = Math.max(highest, message.ordinal);
+  }
+  return highest;
+}
+
+/** Add the messages of an incremental refresh to the conversation already shown. */
+export function mergeDetail(previous: ThreadDetail | undefined, loaded: ThreadDetail, incremental: boolean): ThreadDetail {
+  if (!incremental || !previous || previous.id !== loaded.id) return loaded;
+  const shown = new Set(previous.messages.map((message) => message.id));
+  return { ...loaded, messages: [...previous.messages, ...loaded.messages.filter((message) => !shown.has(message.id))] };
+}
+
+/** A refresh can return an older copy of the generation the stream already advanced. */
+function newerGeneration(previous: GenerationSnapshot | null, loaded: GenerationSnapshot | null) {
+  return previous && loaded && previous.id === loaded.id && previous.seq > loaded.seq ? previous : loaded;
+}
+
+function statusAnnouncement(status: GenerationSnapshot["status"], error?: string | null) {
+  switch (status) {
+    case "queued":
+    case "running":
+      return "Oveo is writing a response.";
+    case "stopping":
+      return "Stopping the response.";
+    case "completed":
+      return "Response complete.";
+    case "stopped":
+      return "Response stopped.";
+    case "failed":
+      return `Response failed. ${error ?? "Oveo could not complete this response."}`;
+  }
 }
 
 interface WebMcpContext {
@@ -193,13 +266,20 @@ function Markdown({ text }: { text: string }) {
 }
 
 export function ResponseBlocks({ blocks, streaming = false }: { blocks: ContentBlock[]; streaming?: boolean }) {
-  const [copied, setCopied] = useState<number | null>(null);
+  const [copied, setCopied] = useState<{ index: number; ok: boolean } | null>(null);
   const visibleBlocks = streaming ? blocks.filter((block) => block.text.trim().length > 0) : blocks;
   async function copy(text: string, index: number) {
-    await navigator.clipboard.writeText(text);
-    setCopied(index);
+    let ok = true;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Clipboard access can be refused (permissions, insecure context); say so.
+      ok = false;
+    }
+    setCopied({ index, ok });
     window.setTimeout(() => setCopied(null), 1600);
   }
+  const copyLabel = (index: number) => copied?.index !== index ? "Copy deliverable" : copied.ok ? "Copied" : "Copy failed";
   return (
     <div className={`response-blocks${streaming ? " streaming" : ""}`}>
       {visibleBlocks.map((block, index) => block.type === "deliverable" ? (
@@ -207,11 +287,11 @@ export function ResponseBlocks({ blocks, streaming = false }: { blocks: ContentB
           <div className="copy-button-rail">
             <button
               className="copy-button"
-              onClick={() => copy(block.text, index)}
-              aria-label={copied === index ? "Copied" : "Copy deliverable"}
-              title={copied === index ? "Copied" : "Copy deliverable"}
+              onClick={() => void copy(block.text, index)}
+              aria-label={copyLabel(index)}
+              title={copyLabel(index)}
             >
-              {copied === index ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+              {copied?.index === index && copied.ok ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
             </button>
           </div>
           <pre>{block.text}</pre>
@@ -222,7 +302,7 @@ export function ResponseBlocks({ blocks, streaming = false }: { blocks: ContentB
           <Markdown text={block.text} />
         </section>
       ))}
-      {streaming && <span className="stream-caret" aria-label="Generating" />}
+      {streaming && <span className="stream-caret" role="img" aria-label="Generating" />}
     </div>
   );
 }
@@ -233,8 +313,10 @@ export function MessageList({ detail, generation }: { detail: ThreadDetail; gene
     const messages = messagesRef.current;
     if (messages) messages.scrollTop = messages.scrollHeight;
   }, [detail.messages.length, generation?.seq]);
+  // Not a live region: streamed text would be read out chunk by chunk. The workspace
+  // announces coarse status changes in its own status region instead.
   return (
-    <div ref={messagesRef} className="messages" aria-live="polite">
+    <div ref={messagesRef} className="messages">
       {detail.messages.map((message) => (
         <article className={`message ${message.role}`} key={message.id}>
           <div className="message-inner">
@@ -248,14 +330,14 @@ export function MessageList({ detail, generation }: { detail: ThreadDetail; gene
           </div>
         </article>
       ))}
-      {generation && ["queued", "running", "stopping"].includes(generation.status) && (
+      {generation && !isTerminal(generation.status) && (
         <article className="message assistant pending"><div className="message-inner"><ResponseBlocks blocks={generation.blocks} streaming /></div></article>
       )}
       {generation?.status === "failed" && generation.blocks.length > 0 && (
         <article className="message assistant preserved"><div className="message-inner"><ResponseBlocks blocks={generation.blocks} /></div></article>
       )}
       {generation && ["failed", "stopped"].includes(generation.status) && (
-        <div className="generation-notice" role="status">
+        <div className="generation-notice">
           <span>{generation.status === "stopped" ? "Generation stopped." : generation.error_message ?? "Oveo could not complete this response."}</span>
         </div>
       )}
@@ -263,51 +345,81 @@ export function MessageList({ detail, generation }: { detail: ThreadDetail; gene
   );
 }
 
+export interface ComposerDraft {
+  text: string;
+  attachment?: File;
+  attachmentRole: AttachmentRole;
+}
+
 export function Composer({
   activeGeneration,
+  readDraft,
+  onDraftChange,
   onSend,
   onStop,
   onRetry,
   onCreateHandoff,
 }: {
   activeGeneration: GenerationSnapshot | null;
+  /** The unsent draft this conversation had when its composer was last shown. */
+  readDraft?: () => ComposerDraft | undefined;
+  onDraftChange?: (draft: ComposerDraft) => void;
   onSend: (text: string, attachment?: File, attachmentRole?: AttachmentRole) => Promise<void>;
   onStop: () => Promise<void>;
   onRetry: () => Promise<void>;
   onCreateHandoff?: () => void;
 }) {
-  const [text, setText] = useState("");
-  const [attachment, setAttachment] = useState<File>();
-  const [attachmentRole, setAttachmentRole] = useState<AttachmentRole>("source");
+  const [draft, setDraft] = useState<ComposerDraft>(() => readDraft?.() ?? { text: "", attachmentRole: "source" });
   const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<"send" | "stop" | "retry" | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-  const generating = activeGeneration && ["queued", "running", "stopping"].includes(activeGeneration.status);
-  const retryable = activeGeneration && ["failed", "stopped"].includes(activeGeneration.status);
+  const { text, attachment, attachmentRole } = draft;
+  const generating = Boolean(activeGeneration && !isTerminal(activeGeneration.status));
+  const retryable = Boolean(activeGeneration && ["failed", "stopped"].includes(activeGeneration.status));
 
+  function change(next: Partial<ComposerDraft>) {
+    const merged = { ...draft, ...next };
+    setDraft(merged);
+    onDraftChange?.(merged);
+  }
   function acceptFile(file?: File) {
     if (!file) return;
     if (attachment) return setError("Remove the current attachment before adding another.");
     if (!/\.docx$/i.test(file.name)) return setError("Only .docx files are supported.");
-    setAttachment(file);
-    setAttachmentRole("source");
+    change({ attachment: file, attachmentRole: "source" });
     setError("");
+  }
+  function removeAttachment() {
+    change({ attachment: undefined, attachmentRole: "source" });
+    if (fileRef.current) fileRef.current.value = "";
   }
   async function send() {
     if ((!text.trim() && !attachment) || busy || generating) return;
-    setBusy(true);
+    setBusy("send");
     setError("");
     try {
       if (attachment) await onSend(text, attachment, attachmentRole);
       else await onSend(text);
-      setText("");
-      setAttachment(undefined);
-      setAttachmentRole("source");
+      change({ text: "", attachment: undefined, attachmentRole: "source" });
       if (fileRef.current) fileRef.current.value = "";
     } catch (reason) {
-      setError(reason instanceof ApiError ? reason.message : "Message could not be sent.");
+      // Without an answer from the server the message may or may not have arrived. The
+      // text stays here, and sending it again reuses the same request identifier.
+      setError(errorMessage(reason, UNCONFIRMED_SEND));
     } finally {
-      setBusy(false);
+      setBusy(null);
+    }
+  }
+  async function run(action: "stop" | "retry", call: () => Promise<void>, fallback: string) {
+    if (busy) return;
+    setBusy(action);
+    setError("");
+    try {
+      await call();
+    } catch (reason) {
+      setError(errorMessage(reason, fallback));
+    } finally {
+      setBusy(null);
     }
   }
   function keyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -318,26 +430,37 @@ export function Composer({
   }
   return (
     <div className="composer-wrap">
-      {retryable && <button className="retry-button" onClick={onRetry}><RotateCcw /> Retry</button>}
+      {retryable && (
+        <button className="retry-button" onClick={() => void run("retry", onRetry, "The response could not be retried. Try again.")} disabled={busy === "retry"}>
+          <RotateCcw /> {busy === "retry" ? "Retrying…" : "Retry"}
+        </button>
+      )}
       <div className="composer">
-        {attachment && <div className="attachment-chip"><FileText /><span>{attachment.name}</span><select aria-label="Use attachment as" value={attachmentRole} onChange={(event) => setAttachmentRole(event.target.value as AttachmentRole)}><option value="source">Source document</option><option value="reference">Style reference</option></select><button onClick={() => { setAttachment(undefined); setAttachmentRole("source"); }} aria-label="Remove attachment"><X /></button></div>}
+        {attachment && <div className="attachment-chip"><FileText /><span>{attachment.name}</span><select aria-label="Use attachment as" value={attachmentRole} onChange={(event) => change({ attachmentRole: event.target.value as AttachmentRole })}><option value="source">Source document</option><option value="reference">Style reference</option></select><button onClick={removeAttachment} aria-label="Remove attachment"><X /></button></div>}
         <textarea
           aria-label="Message"
           placeholder="Message"
           value={text}
-          onChange={(event) => setText(event.target.value)}
+          onChange={(event) => change({ text: event.target.value })}
           onKeyDown={keyDown}
           rows={3}
-          disabled={Boolean(generating)}
+          disabled={generating}
         />
         <div className="composer-actions">
-          {onCreateHandoff && <button className="icon-button handoff-button" onClick={onCreateHandoff} disabled={Boolean(generating)} aria-label="Create prompt handoff" title="Create prompt handoff"><Sparkles /></button>}
-          <button className="icon-button attach" onClick={() => fileRef.current?.click()} disabled={Boolean(generating)} aria-label="Attach a DOCX file"><Paperclip /></button>
+          {onCreateHandoff && <button className="icon-button handoff-button" onClick={onCreateHandoff} disabled={generating} aria-label="Create prompt handoff" title="Create prompt handoff"><Sparkles /></button>}
+          <button className="icon-button attach" onClick={() => fileRef.current?.click()} disabled={generating} aria-label="Attach a DOCX file"><Paperclip /></button>
           <input ref={fileRef} className="file-input" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={(e) => acceptFile(e.target.files?.[0])} />
           {generating ? (
-            <button className="send-button stop" onClick={onStop} aria-label="Stop generation"><Square /></button>
+            <button
+              className="send-button stop"
+              onClick={() => void run("stop", onStop, "The response could not be stopped. Try again.")}
+              disabled={busy === "stop" || activeGeneration?.status === "stopping"}
+              aria-label="Stop generation"
+            >
+              <Square />
+            </button>
           ) : (
-            <button className="send-button" onClick={send} disabled={busy || (!text.trim() && !attachment)} aria-label="Send message"><Send /></button>
+            <button className="send-button" onClick={() => void send()} disabled={busy !== null || (!text.trim() && !attachment)} aria-label="Send message"><Send /></button>
           )}
         </div>
       </div>
@@ -371,119 +494,210 @@ export function SidebarHeader({ onClose }: { onClose: () => void }) {
   );
 }
 
-export default function App() {
-  const [user, setUser] = useState<SessionUser | null | undefined>(undefined);
-  const [threads, setThreads] = useState<ThreadSummary[]>([]);
+interface HandoffView {
+  threadId: string;
+  generationId: string | null;
+  blocks: ContentBlock[];
+  finished: boolean;
+}
+
+/**
+ * Everything one sign-in can see. The app renders a new instance for every sign-in,
+ * so conversations, drafts, streams and timers are discarded with the session and can
+ * never be shown to the next account.
+ */
+function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () => void }) {
+  const [view, setView] = useState<View>(() => viewFromPath(window.location.pathname));
   const [detail, setDetail] = useState<ThreadDetail>();
-  const [draftMode, setDraftMode] = useState<Mode | null>(null);
   const [generation, setGeneration] = useState<GenerationSnapshot | null>(null);
+  const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [usage, setUsage] = useState("$0.00");
   const [deleteTarget, setDeleteTarget] = useState<ThreadSummary | null>(null);
-  const [handoff, setHandoff] = useState<ContentBlock[] | null>(null);
+  const [deletion, setDeletion] = useState({ busy: false, error: "" });
+  const [handoff, setHandoff] = useState<HandoffView | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [mobileLayout, setMobileLayout] = useState(() => typeof window.matchMedia === "function" && window.matchMedia(MOBILE_LAYOUT).matches);
   const [globalError, setGlobalError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [announcement, setAnnouncement] = useState("");
+  const [signingOut, setSigningOut] = useState(false);
+  const sidebarId = useId();
+
+  // Every navigation stores a new view object here, so a response that arrives for a
+  // view the user has left can tell and is dropped.
+  const viewRef = useRef(view);
+  const detailRef = useRef(detail);
+  // Changes whenever the shown generation is replaced by navigation, a send or a retry,
+  // so an older refresh cannot put back the generation it read.
+  const generationEpoch = useRef(0);
+  const listRequest = useRef(0);
+  const handoffRun = useRef(0);
+  const lifetime = useRef<AbortSignal | null>(null);
+  const drafts = useRef(new Map<string, ComposerDraft>());
+  const requestIds = useRef(new Map<string, { id: string; parts: unknown[] }>());
+
+  useEffect(() => { detailRef.current = detail; }, [detail]);
+  useEffect(() => {
+    const controller = new AbortController();
+    lifetime.current = controller.signal;
+    return () => {
+      controller.abort();
+      document.title = "Oveo";
+    };
+  }, []);
 
   const refreshUsage = useCallback(() => {
     void api.usage().then((total) => setUsage(total.formatted)).catch(() => undefined);
   }, []);
-  const bootstrap = useCallback(async () => {
+
+  const refreshThreads = useCallback(async (reportFailure = false) => {
+    const request = ++listRequest.current;
     try {
-      const current = await api.me();
-      if (current.csrf_token) setCsrfToken(current.csrf_token);
-      setUser(current);
-      refreshUsage();
-    } catch {
-      setUser(null);
+      const list = await api.threads();
+      if (listRequest.current === request) setThreads(list);
+    } catch (reason) {
+      if (reportFailure && listRequest.current === request && !isUnauthorized(reason)) {
+        setGlobalError(errorMessage(reason, "Could not load conversations."));
+      }
     }
-  }, [refreshUsage]);
-  useEffect(() => { void bootstrap(); }, [bootstrap]);
-  useEffect(() => {
-    const unauthorized = () => setUser(null);
-    window.addEventListener("oveo:unauthorized", unauthorized);
-    return () => window.removeEventListener("oveo:unauthorized", unauthorized);
   }, []);
-  useEffect(() => {
-    if (user !== null) return;
-    const normalizeAddress = () => updateAddress(canonicalPath(window.location.pathname, false), true);
-    normalizeAddress();
-    window.addEventListener("popstate", normalizeAddress);
-    return () => window.removeEventListener("popstate", normalizeAddress);
-  }, [user]);
 
-  const refreshThreads = useCallback(async () => {
-    if (!user) return;
-    try { setThreads(await api.threads()); } catch (reason) { setGlobalError(reason instanceof Error ? reason.message : "Could not load conversations."); }
-  }, [user]);
-  useEffect(() => {
+  const enter = useCallback((next: View, address: "push" | "replace" | "none") => {
+    viewRef.current = next;
+    generationEpoch.current += 1;
+    setView(next);
     setDetail(undefined);
-    setDraftMode(null);
-    void refreshThreads();
-  }, [refreshThreads]);
-  useEffect(() => {
-    if (!user) return;
-    const timer = window.setInterval(() => void refreshThreads(), 5000);
-    return () => window.clearInterval(timer);
-  }, [user, refreshThreads]);
-
-  const openThread = useCallback(async (id: string, navigate = true) => {
-    setDraftMode(null);
+    setGeneration(null);
     setSidebarOpen(false);
-    const loaded = await api.thread(id);
-    setDetail(loaded);
-    setGeneration(loaded.generation ?? null);
-    if (navigate) updateAddress(conversationPath(id));
+    if (address !== "none") updateAddress(next.kind === "thread" ? conversationPath(next.id) : "/new", address === "replace");
+  }, []);
+
+  const openView = useCallback((next: View, address: "push" | "replace" | "none") => {
+    enter(next, address);
+    if (next.kind !== "thread") return;
+    void api.thread(next.id).then(
+      (loaded) => {
+        if (viewRef.current !== next) return;
+        setDetail(loaded);
+        setGeneration(loaded.generation ?? null);
+      },
+      (reason: unknown) => {
+        if (viewRef.current !== next || isUnauthorized(reason)) return;
+        setGlobalError(errorMessage(reason, "Could not load that conversation."));
+        enter({ kind: "new", mode: null }, "replace");
+      },
+    );
+  }, [enter]);
+
+  /** Fetch what is new in an open conversation. False only when the request failed. */
+  const refreshDetail = useCallback(async (id: string): Promise<boolean> => {
+    const target = viewRef.current;
+    if (target.kind !== "thread" || target.id !== id) return true;
+    const shown = detailRef.current?.id === id ? detailRef.current : undefined;
+    const after = shown ? knownOrdinal(shown) : undefined;
+    const epoch = generationEpoch.current;
+    try {
+      const loaded = await api.thread(id, after);
+      if (viewRef.current !== target) return true;
+      setDetail((previous) => mergeDetail(previous, loaded, after !== undefined));
+      if (generationEpoch.current === epoch) {
+        setGeneration((previous) => newerGeneration(previous, loaded.generation ?? null));
+      }
+      return true;
+    } catch (reason) {
+      if (viewRef.current !== target || isUnauthorized(reason)) return true;
+      if (reason instanceof ApiError && reason.status === 404) {
+        setGlobalError("This conversation no longer exists.");
+        enter({ kind: "new", mode: null }, "replace");
+        return true;
+      }
+      return false;
+    }
+  }, [enter]);
+
+  const adoptGeneration = useCallback((snapshot: GenerationSnapshot) => {
+    generationEpoch.current += 1;
+    setGeneration(snapshot);
   }, []);
 
   useEffect(() => {
-    if (!user) return;
+    void refreshThreads(true);
+    refreshUsage();
+    const poll = () => {
+      if (document.visibilityState === "visible") void refreshThreads();
+    };
+    const timer = window.setInterval(poll, THREAD_LIST_POLL_MS);
+    document.addEventListener("visibilitychange", poll);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", poll);
+    };
+  }, [refreshThreads, refreshUsage]);
+
+  useEffect(() => {
     const applyAddress = () => {
       const path = canonicalPath(window.location.pathname, true);
       updateAddress(path, true);
-      const id = conversationIdFromPath(path);
-      if (id) {
-        void openThread(id, false).catch((reason) => {
-          setGlobalError(reason instanceof Error ? reason.message : "Could not load that conversation.");
-          setDetail(undefined);
-          setGeneration(null);
-          setDraftMode(null);
-          updateAddress("/new", true);
-        });
-        return;
-      }
-      setDetail(undefined);
-      setGeneration(null);
-      setDraftMode(null);
-      setSidebarOpen(false);
+      openView(viewFromPath(path), "none");
     };
     applyAddress();
     window.addEventListener("popstate", applyAddress);
     return () => window.removeEventListener("popstate", applyAddress);
-  }, [openThread, user]);
+  }, [openView]);
 
   useEffect(() => {
-    document.title = detail ? `${detail.title} · Oveo` : "Oveo";
-  }, [detail]);
+    if (typeof window.matchMedia !== "function") return;
+    const query = window.matchMedia(MOBILE_LAYOUT);
+    const update = () => setMobileLayout(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
 
-  const generationId = generation?.id;
-  const generationActive = Boolean(generation && !isTerminal(generation.status));
+  const current = view.kind === "thread" && detail?.id === view.id ? detail : undefined;
+  const active = current && generation?.thread_id === current.id ? generation : null;
+
+  const title = current?.title;
   useEffect(() => {
-    if (!generationId || !generationActive) return;
-    return followGeneration(generationId, {
+    document.title = title ? `${title} · Oveo` : "Oveo";
+  }, [title]);
+
+  const activeId = active?.id;
+  const activeStatus = active?.status;
+  const activeError = active?.error_message;
+  useEffect(() => {
+    if (activeId && activeStatus) setAnnouncement(statusAnnouncement(activeStatus, activeError));
+  }, [activeId, activeStatus, activeError]);
+
+  const followedId = generation && !isTerminal(generation.status) ? generation.id : undefined;
+  useEffect(() => {
+    if (!followedId) return;
+    return followGeneration(followedId, {
       onUpdate: (next) => {
-        setGeneration(next);
-        if (isTerminal(next.status)) {
-          if (next.thread_id) void openThread(next.thread_id, false);
-          void refreshThreads();
-          refreshUsage();
+        setGeneration((previous) => (previous?.id === next.id ? next : previous));
+        if (!isTerminal(next.status)) return;
+        if (next.thread_id) {
+          void refreshDetail(next.thread_id).then((refreshed) => {
+            if (!refreshed) setNotice("The response has finished, but the conversation could not be refreshed. Reload the page to see it.");
+          });
         }
+        void refreshThreads();
+        refreshUsage();
+      },
+      onUnavailable: () => {
+        // A 401 signs the whole app out; otherwise the generation is gone because its
+        // conversation was deleted, which the refresh reports.
+        setGeneration((previous) => (previous?.id === followedId ? null : previous));
+        const target = viewRef.current;
+        if (target.kind === "thread") void refreshDetail(target.id);
       },
     });
-  }, [generationId, generationActive, openThread, refreshThreads, refreshUsage]);
+  }, [followedId, refreshDetail, refreshThreads, refreshUsage]);
 
   useEffect(() => {
     const context = (document as Document & { modelContext?: WebMcpContext }).modelContext;
-    if (!context?.registerTool || !user) return;
-    const lifecycle = new AbortController();
+    if (!context?.registerTool) return;
+    const registration = new AbortController();
     void Promise.resolve(context.registerTool({
       name: "start_oveo_conversation",
       title: "Start an Oveo conversation",
@@ -500,118 +714,272 @@ export default function App() {
       async execute(input) {
         const value = input as { mode?: unknown };
         if (value.mode !== "translate" && value.mode !== "revision" && value.mode !== "internal_comms") throw new Error("Invalid mode.");
-        setDetail(undefined);
-        setGeneration(null);
-        setDraftMode(value.mode);
-        setSidebarOpen(false);
-        updateAddress("/new");
+        openView({ kind: "new", mode: value.mode }, "push");
         return { state: "ready", mode: value.mode, ownerUsername: user.username };
       },
-    }, { signal: lifecycle.signal })).catch(() => undefined);
-    return () => lifecycle.abort();
-  }, [user]);
+    }, { signal: registration.signal })).catch(() => undefined);
+    return () => registration.abort();
+  }, [openView, user.username]);
 
-  async function send(text: string, attachment?: File, attachmentRole?: AttachmentRole) {
-    if (!user) return;
+  /**
+   * One identifier per unsent request: an attempt whose outcome is unknown (network
+   * failure, lost response) is repeated with the same identifier, so the server returns
+   * the turn it may already have accepted instead of creating a second one. Changing
+   * what is sent starts a new request.
+   */
+  function requestIdFor(key: string, parts: unknown[]) {
+    const known = requestIds.current.get(key);
+    if (known && known.parts.length === parts.length && known.parts.every((part, index) => Object.is(part, parts[index]))) {
+      return known.id;
+    }
+    const id = uuid();
+    requestIds.current.set(key, { id, parts });
+    return id;
+  }
+
+  async function send(origin: View, text: string, attachment?: File, attachmentRole?: AttachmentRole) {
+    const key = viewKey(origin);
+    const requestKey = `send:${key}`;
     const result = await api.submit({
-      threadId: detail?.id,
-      mode: detail ? undefined : draftMode ?? undefined,
+      threadId: origin.kind === "thread" ? origin.id : undefined,
+      mode: origin.kind === "new" ? origin.mode ?? undefined : undefined,
       text,
       attachment,
       attachmentRole,
-      clientRequestId: uuid(),
+      clientRequestId: requestIdFor(requestKey, [text, attachment, attachmentRole]),
     });
-    const [loaded, pending] = await Promise.all([api.thread(result.thread_id), api.generation(result.generation_id)]);
-    setDetail(loaded);
-    setDraftMode(null);
-    setGeneration(pending);
-    updateAddress(conversationPath(result.thread_id), true);
-    await refreshThreads();
-  }
-  async function retry() {
-    if (!generation) return;
-    const result = await api.retry(generation.id, uuid());
-    setGeneration(await api.generation(result.generation_id));
-  }
-  async function removeThread() {
-    if (!deleteTarget) return;
-    await api.deleteThread(deleteTarget.id);
-    const deletedActiveThread = detail?.id === deleteTarget.id;
-    setDeleteTarget(null);
-    if (deletedActiveThread) {
-      setDetail(undefined);
-      setGeneration(null);
-      updateAddress("/new", true);
+    // The server has the turn now; nothing below may report the message as unsent.
+    requestIds.current.delete(requestKey);
+    drafts.current.delete(key);
+    void refreshThreads();
+    // The user moved on while this was sending: leave them where they are.
+    if (viewRef.current !== origin) return;
+    let target = origin;
+    if (origin.kind === "new") {
+      target = { kind: "thread", id: result.thread_id };
+      enter(target, "replace");
     }
-    await refreshThreads();
+    adoptGeneration({ id: result.generation_id, thread_id: result.thread_id, status: "queued", blocks: [], seq: 0 });
+    if (!(await refreshDetail(result.thread_id)) && viewRef.current === target) {
+      setNotice("Your message was sent, but the conversation could not be refreshed. Reload the page if it does not update.");
+    }
   }
-  async function createHandoff() {
-    if (!detail) return;
-    setHandoff([]);
+
+  async function retry(failed: GenerationSnapshot) {
+    const origin = viewRef.current;
+    const requestKey = `retry:${failed.id}`;
+    const result = await api.retry(failed.id, requestIdFor(requestKey, []));
+    requestIds.current.delete(requestKey);
+    if (viewRef.current !== origin) return;
+    adoptGeneration({ id: result.generation_id, thread_id: failed.thread_id, status: "queued", blocks: [], seq: 0 });
+  }
+
+  function openThread(id: string) {
+    const shown = viewRef.current;
+    if (shown.kind === "thread" && shown.id === id && detailRef.current?.id === id) {
+      setSidebarOpen(false);
+      return;
+    }
+    openView({ kind: "thread", id }, "push");
+  }
+
+  function closeDelete() {
+    setDeleteTarget(null);
+    setDeletion({ busy: false, error: "" });
+  }
+
+  async function removeThread() {
+    const target = deleteTarget;
+    if (!target || deletion.busy) return;
+    setDeletion({ busy: true, error: "" });
     try {
-      const { generation_id } = await api.handoff(detail.id, uuid());
-      let current = await api.generation(generation_id);
-      setHandoff(current.blocks);
-      while (["queued", "running", "stopping"].includes(current.status)) {
-        await new Promise((resolve) => window.setTimeout(resolve, 700));
-        current = await api.generation(generation_id);
-        setHandoff(current.blocks);
+      await api.deleteThread(target.id);
+    } catch (reason) {
+      // Already deleted (for example in another tab) is the outcome the user asked for.
+      if (!(reason instanceof ApiError && reason.status === 404)) {
+        if (!isUnauthorized(reason)) setDeletion({ busy: false, error: errorMessage(reason, "The conversation could not be deleted. Try again.") });
+        return;
       }
-      if (current.status !== "completed") setGlobalError(current.error_message ?? "Prompt handoff could not be created.");
+    }
+    closeDelete();
+    drafts.current.delete(viewKey({ kind: "thread", id: target.id }));
+    const shown = viewRef.current;
+    if (shown.kind === "thread" && shown.id === target.id) enter({ kind: "new", mode: null }, "replace");
+    void refreshThreads();
+  }
+
+  async function createHandoff(conversation: ThreadDetail) {
+    const run = ++handoffRun.current;
+    const signal = lifetime.current;
+    const running = () => handoffRun.current === run && !signal?.aborted;
+    const threadId = conversation.id;
+    const requestKey = `handoff:${threadId}`;
+    // A handoff still running from before (for example across a reload) is followed
+    // instead of starting a second one, which the server would refuse.
+    let generationId = conversation.handoff && !isTerminal(conversation.handoff.status) ? conversation.handoff.id : null;
+    setHandoff({ threadId, generationId, blocks: [], finished: false });
+    try {
+      if (!generationId) {
+        generationId = (await api.handoff(threadId, requestIdFor(requestKey, []))).generation_id;
+        requestIds.current.delete(requestKey);
+        if (!running()) {
+          // Closed while it was being created.
+          void api.stop(generationId).catch(() => undefined);
+          return;
+        }
+        setHandoff({ threadId, generationId, blocks: [], finished: false });
+      }
+      let snapshot = await api.generation(generationId);
+      while (running()) {
+        const finished = isTerminal(snapshot.status);
+        setHandoff({ threadId, generationId, blocks: snapshot.blocks, finished });
+        if (finished) break;
+        await delay(HANDOFF_POLL_MS);
+        if (!running()) return;
+        snapshot = await api.generation(generationId);
+      }
+      if (!running()) return;
+      setDetail((shown) => (shown?.id === threadId && shown.handoff ? { ...shown, handoff: null } : shown));
+      if (snapshot.status !== "completed") setGlobalError(snapshot.error_message ?? "Prompt handoff could not be created.");
       refreshUsage();
     } catch (reason) {
+      if (!running()) return;
       setHandoff(null);
-      setGlobalError(reason instanceof Error ? reason.message : "Prompt handoff could not be created.");
+      if (!isUnauthorized(reason)) setGlobalError(errorMessage(reason, "Prompt handoff could not be created."));
     }
   }
+
+  function closeHandoff() {
+    handoffRun.current += 1;
+    const closing = handoff;
+    setHandoff(null);
+    if (!closing?.generationId || closing.finished) return;
+    // A handoff is shown only in this dialog: left running, it would be paid for without
+    // ever being seen and would keep the conversation busy. The dialog says so.
+    const generationId = closing.generationId;
+    void api.stop(generationId).catch(() => undefined);
+    setDetail((shown) => (shown?.handoff?.id === generationId ? { ...shown, handoff: null } : shown));
+  }
+
   async function logout() {
-    await api.logout();
-    setUser(null);
+    if (signingOut) return;
+    setSigningOut(true);
+    try {
+      await api.logout();
+      onSignedOut();
+    } catch (reason) {
+      // 401: the session had already ended, and the app has switched to sign-in.
+      if (isUnauthorized(reason)) return;
+      setSigningOut(false);
+      setGlobalError(errorMessage(reason, "Sign-out failed. Check your connection and try again."));
+    }
   }
-  function startNewConversation() {
-    setDetail(undefined);
-    setGeneration(null);
-    setDraftMode(null);
-    setSidebarOpen(false);
-    updateAddress("/new");
-  }
-  if (user === undefined) return <div className="app-loading"><BrandLogo /></div>;
-  if (!user) return <Login onLogin={() => void bootstrap()} />;
-  const active = generation && generation.thread_id === detail?.id ? generation : null;
+
+  const composerShown = view.kind === "thread" ? Boolean(current) : view.mode !== null;
+  const draftKey = viewKey(view);
 
   return (
     <div className="app-shell">
-      <button className="mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar"><Menu /></button>
-      <aside className={sidebarOpen ? "sidebar open" : "sidebar"}>
+      <button className="mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar" aria-expanded={sidebarOpen} aria-controls={sidebarId}><Menu /></button>
+      <aside id={sidebarId} className={sidebarOpen ? "sidebar open" : "sidebar"} inert={mobileLayout && !sidebarOpen}>
         <SidebarHeader onClose={() => setSidebarOpen(false)} />
-        <button className="new-button" onClick={startNewConversation}><Plus /> New</button>
+        <button className="new-button" onClick={() => openView({ kind: "new", mode: null }, "push")}><Plus /> New</button>
         <nav className="thread-list" aria-label="Conversations">
-          {threads.map((thread) => (
-            <div className={detail?.id === thread.id ? "thread-row selected" : "thread-row"} key={thread.id}>
-              <button className="thread-item" onClick={() => void openThread(thread.id)}>
-                <div><span className="thread-title">{thread.title}</span>{thread.active_generation_id && <span className="activity-dot" aria-label="Generating" />}</div>
-                <ModeBadge mode={thread.mode} />
-              </button>
-              <button className="thread-delete" onClick={() => setDeleteTarget(thread)} aria-label={`Delete ${thread.title}`} title="Delete conversation"><Trash2 /></button>
-            </div>
-          ))}
+          {threads.map((thread) => {
+            const selected = view.kind === "thread" && view.id === thread.id;
+            return (
+              <div className={selected ? "thread-row selected" : "thread-row"} key={thread.id}>
+                <button className="thread-item" onClick={() => openThread(thread.id)} aria-current={selected ? "page" : undefined}>
+                  <div><span className="thread-title">{thread.title}</span>{thread.active_generation_id && <span className="activity-dot" role="img" aria-label="Generating" />}</div>
+                  <ModeBadge mode={thread.mode} />
+                </button>
+                <button className="thread-delete" onClick={() => setDeleteTarget(thread)} aria-label={`Delete ${thread.title}`} title="Delete conversation"><Trash2 /></button>
+              </div>
+            );
+          })}
         </nav>
-        <footer className="sidebar-footer"><span className="cost">{usage}</span><button className="icon-button" onClick={logout} aria-label="Sign out"><LogOut /></button></footer>
+        <footer className="sidebar-footer"><span className="cost">{usage}</span><button className="icon-button" onClick={() => void logout()} disabled={signingOut} aria-label="Sign out"><LogOut /></button></footer>
       </aside>
       <main className="workspace">
-        {detail?.docx_exportable && (
-          <a className="docx-download" href={api.documentUrl(detail.id)}>
+        {current?.docx_exportable && (
+          <a className="docx-download" href={api.documentUrl(current.id)}>
             <Download aria-hidden="true" /> Download DOCX
           </a>
         )}
         <section className="conversation-area">
-          {detail ? <MessageList detail={detail} generation={active} /> : <EmptyThread mode={draftMode} onSelect={setDraftMode} />}
+          {view.kind === "thread"
+            ? current ? <MessageList detail={current} generation={active} /> : <div className="conversation-loading">Loading conversation…</div>
+            : <EmptyThread mode={view.mode} onSelect={(mode) => openView({ kind: "new", mode }, "none")} />}
         </section>
-        {(detail || draftMode) && <Composer activeGeneration={active} onSend={send} onStop={() => active ? api.stop(active.id) : Promise.resolve()} onRetry={retry} onCreateHandoff={detail ? () => void createHandoff() : undefined} />}
+        {composerShown && (
+          <Composer
+            key={draftKey}
+            activeGeneration={active}
+            readDraft={() => drafts.current.get(draftKey)}
+            onDraftChange={(next) => drafts.current.set(draftKey, next)}
+            onSend={(text, attachment, attachmentRole) => send(view, text, attachment, attachmentRole)}
+            onStop={() => (active ? api.stop(active.id) : Promise.resolve())}
+            onRetry={() => (active ? retry(active) : Promise.resolve())}
+            onCreateHandoff={current ? () => void createHandoff(current) : undefined}
+          />
+        )}
       </main>
-      {deleteTarget && <Modal title="Delete conversation?" onClose={() => setDeleteTarget(null)}><p className="modal-copy">Delete “{deleteTarget.title}”? This permanently deletes the conversation and its attachments. This cannot be undone.</p><div className="modal-actions"><button onClick={() => setDeleteTarget(null)}>Cancel</button><button className="danger-button" onClick={removeThread}>Delete permanently</button></div></Modal>}
-      {handoff !== null && <Modal title="Prompt handoff" onClose={() => setHandoff(null)}><div className="handoff-body">{handoff.length ? <ResponseBlocks blocks={handoff.map((block) => ({ ...block, type: "deliverable" }))} /> : <div className="handoff-loading">Collecting user instructions…</div>}</div></Modal>}
-      {globalError && <div className="toast" role="alert">{globalError}<button onClick={() => setGlobalError("")} aria-label="Dismiss"><X /></button></div>}
+      {deleteTarget && (
+        <Modal title="Delete conversation?" onClose={closeDelete}>
+          <p className="modal-copy">Delete “{deleteTarget.title}”? This permanently deletes the conversation and its attachments. This cannot be undone.</p>
+          {deletion.error && <p className="form-error" role="alert">{deletion.error}</p>}
+          <div className="modal-actions">
+            <button onClick={closeDelete}>Cancel</button>
+            <button className="danger-button" onClick={() => void removeThread()} disabled={deletion.busy}>{deletion.busy ? "Deleting…" : "Delete permanently"}</button>
+          </div>
+        </Modal>
+      )}
+      {handoff !== null && (
+        <Modal title="Prompt handoff" onClose={closeHandoff}>
+          <div className="handoff-body">
+            {handoff.blocks.length ? <ResponseBlocks blocks={handoff.blocks.map((block) => ({ ...block, type: "deliverable" }))} /> : <div className="handoff-loading">Collecting user instructions…</div>}
+            {!handoff.finished && <p className="handoff-note">Closing this dialog cancels the handoff.</p>}
+          </div>
+        </Modal>
+      )}
+      <div className="toasts">
+        {globalError && <div className="toast" role="alert">{globalError}<button onClick={() => setGlobalError("")} aria-label="Dismiss"><X /></button></div>}
+        {notice && <div className="toast notice" role="status">{notice}<button onClick={() => setNotice("")} aria-label="Dismiss notice"><X /></button></div>}
+      </div>
+      <div className="visually-hidden" role="status" aria-live="polite">{announcement}</div>
     </div>
   );
+}
+
+export default function App() {
+  const [session, setSession] = useState<{ user: SessionUser; key: number } | null | undefined>(undefined);
+  const signIns = useRef(0);
+
+  const bootstrap = useCallback(async () => {
+    try {
+      const current = await api.me();
+      if (current.csrf_token) setCsrfToken(current.csrf_token);
+      signIns.current += 1;
+      setSession({ user: current, key: signIns.current });
+    } catch {
+      setSession(null);
+    }
+  }, []);
+  useEffect(() => { void bootstrap(); }, [bootstrap]);
+  useEffect(() => {
+    const unauthorized = () => setSession(null);
+    window.addEventListener("oveo:unauthorized", unauthorized);
+    return () => window.removeEventListener("oveo:unauthorized", unauthorized);
+  }, []);
+  useEffect(() => {
+    if (session !== null) return;
+    const normalizeAddress = () => updateAddress(canonicalPath(window.location.pathname, false), true);
+    normalizeAddress();
+    window.addEventListener("popstate", normalizeAddress);
+    return () => window.removeEventListener("popstate", normalizeAddress);
+  }, [session]);
+
+  if (session === undefined) return <div className="app-loading"><BrandLogo /></div>;
+  if (!session) return <Login onLogin={() => void bootstrap()} />;
+  return <Workspace key={session.key} user={session.user} onSignedOut={() => setSession(null)} />;
 }

@@ -36,6 +36,8 @@ export interface AttachmentInfo {
 
 export interface Message {
   id: string;
+  /** Position in the conversation; absent only from servers older than this client. */
+  ordinal?: number;
   role: "user" | "assistant";
   actor_username: string | null;
   blocks: ContentBlock[];
