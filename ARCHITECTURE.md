@@ -90,8 +90,15 @@ bounded busy timeout. Model calls and streaming never hold transactions open.
 
 The server atomically stores validated input and a queued generation, then starts
 an independent task. It composes a frozen context, calls the fixed model with
-privacy routing, incrementally validates typed NDJSON, and checkpoints replayable
-visible blocks. Reconnecting clients receive an authoritative SSE snapshot.
+privacy routing, and incrementally validates typed NDJSON into an in-memory draft
+(drafts are not rewritten to SQLite for every delta; only status changes and the
+final result are stored, and a restart discards drafts). Each SSE connection first
+receives an authoritative snapshot and then small sequenced deltas; a gap, a slow
+reader, or a reconnect starts again from a fresh snapshot. An event stream is
+authorized in a short database session that closes before streaming, so open
+streams hold no pooled connection; the sign-in session is re-checked every few
+seconds, sign-out closes that browser's streams at once, and each account has a
+small cap on simultaneously open streams.
 
 Success atomically creates the assistant message, validates any state operation,
 and completes the generation. The server enforces closed schemas, exact anchors,

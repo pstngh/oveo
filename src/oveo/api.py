@@ -23,6 +23,7 @@ from oveo.auth import (
     create_session,
     get_session_principal,
     revoke_session,
+    session_is_active,
     validate_csrf,
 )
 from oveo.authorization import may_access_thread
@@ -222,10 +223,13 @@ async def login(request: Request, response: Response, body: LoginBody, db: Db) -
 
 
 @router.post("/api/auth/logout", status_code=204)
-async def logout(request: Request, response: Response, _: CsrfPrincipal, db: Db) -> None:
+async def logout(request: Request, response: Response, principal: CsrfPrincipal, db: Db) -> None:
     settings = _settings(request)
+    session_id = principal.session.id
     await revoke_session(db, request.cookies.get(settings.session_cookie_name))
     await db.commit()
+    # Live responses must stop reaching this browser as soon as it signs out.
+    _manager(request).close_session_streams(session_id)
     response.delete_cookie(settings.session_cookie_name, path="/")
     response.delete_cookie(settings.csrf_cookie_name, path="/")
 
@@ -634,12 +638,35 @@ async def generation_snapshot(
 
 
 @router.get("/api/generations/{generation_id}/events")
-async def generation_events(
-    generation_id: str, request: Request, principal: Principal, db: Db
-) -> StreamingResponse:
-    await _require_generation(db, principal, generation_id)
+async def generation_events(generation_id: str, request: Request) -> StreamingResponse:
+    # No request-scoped session here: FastAPI would keep it (and its pooled connection)
+    # until the stream ends. Authorize in a short session that closes first.
+    database = _database(request)
+    token = request.cookies.get(_settings(request).session_cookie_name)
+    async with database.sessions() as db:
+        principal = await get_session_principal(db, token)
+        if principal is None:
+            await db.commit()
+            raise ApiError(401, "authentication_required", "Sign in to continue.")
+        await _require_generation(db, principal, generation_id)
+        session_id = principal.session.id
+        user_id = principal.user.id
+
+    async def session_valid() -> bool:
+        async with database.sessions() as db:
+            return await session_is_active(db, session_id)
+
+    try:
+        stream = _manager(request).open_event_stream(
+            generation_id,
+            user_id=user_id,
+            session_id=session_id,
+            session_valid=session_valid,
+        )
+    except GenerationError as exc:
+        raise ApiError(exc.status_code, exc.code, exc.message) from exc
     return StreamingResponse(
-        _manager(request).events(generation_id),
+        stream,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
     )

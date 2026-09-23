@@ -22,6 +22,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api, ApiError, setCsrfToken } from "./api";
 import BrandLogo from "./BrandLogo";
+import { followGeneration, isTerminal } from "./stream";
 import type {
   AttachmentRole,
   ContentBlock,
@@ -464,24 +465,20 @@ export default function App() {
   }, [detail]);
 
   const generationId = generation?.id;
-  const generationStatus = generation?.status;
+  const generationActive = Boolean(generation && !isTerminal(generation.status));
   useEffect(() => {
-    if (!generationId || !generationStatus || !["queued", "running", "stopping"].includes(generationStatus)) return;
-    const source = new EventSource(`/api/generations/${generationId}/events`);
-    source.onmessage = (event) => {
-      const next = JSON.parse(event.data) as GenerationSnapshot;
-      setGeneration(next);
-      if (["completed", "failed", "stopped"].includes(next.status)) {
-        source.close();
-        if (next.thread_id) void openThread(next.thread_id, false);
-        void refreshThreads();
-        refreshUsage();
-      }
-    };
-    // EventSource reconnects automatically after a transient network interruption.
-    source.onerror = () => undefined;
-    return () => source.close();
-  }, [generationId, generationStatus, openThread, refreshThreads, refreshUsage]);
+    if (!generationId || !generationActive) return;
+    return followGeneration(generationId, {
+      onUpdate: (next) => {
+        setGeneration(next);
+        if (isTerminal(next.status)) {
+          if (next.thread_id) void openThread(next.thread_id, false);
+          void refreshThreads();
+          refreshUsage();
+        }
+      },
+    });
+  }, [generationId, generationActive, openThread, refreshThreads, refreshUsage]);
 
   useEffect(() => {
     const context = (document as Document & { modelContext?: WebMcpContext }).modelContext;

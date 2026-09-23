@@ -4,8 +4,9 @@ import asyncio
 import hashlib
 import json
 import logging
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from itertools import pairwise
 from pathlib import Path
@@ -323,6 +324,7 @@ _RECONCILE_MAX_ATTEMPTS = 8
 _RECONCILE_BASE_DELAY_SECONDS = 5.0
 _RECONCILE_MAX_DELAY_SECONDS = 600.0
 _CANCEL_WAIT_SECONDS = 1.0
+_SHUTDOWN_GRACE_SECONDS = 5.0
 # Bounded backoff for terminal status writes that hit a locked or failing database.
 _WRITE_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 # Title input comes from the first request only, bounded to this many characters.
@@ -333,6 +335,76 @@ _DELTA_FRAMING_TOKENS = 18
 _DELTA_CHARS = 200
 _STATE_FRAMING_TOKENS = 100
 _DOCX_BLOCK_FRAMING_TOKENS = 11
+
+
+_KEEPALIVE_SECONDS = 15.0
+# How often an open event stream re-checks that its sign-in session is still valid.
+_SESSION_CHECK_SECONDS = 5.0
+_STREAM_QUEUE_SIZE = 256
+_MAX_STREAMS_PER_USER = 8
+
+
+@dataclass(frozen=True, slots=True)
+class _Delta:
+    seq: int
+    ops: tuple[dict[str, str], ...]
+
+
+class _Signal:
+    """A stream control marker (see _RESYNC and _CLOSE)."""
+
+
+# Re-read the authoritative snapshot (status change, retry reset, or a slow reader).
+_RESYNC = _Signal()
+# The stream's sign-in session ended: close it.
+_CLOSE = _Signal()
+_StreamItem = _Delta | _Signal
+
+
+@dataclass(slots=True)
+class _LiveGeneration:
+    """In-memory draft of a generation this process is running.
+
+    Streaming drafts are served from here rather than rewritten to SQLite for every
+    delta: nothing reads a live draft from the database, and a restart discards it.
+    """
+
+    thread_id: str | None
+    status: str = "queued"
+    seq: int = 0
+    blocks: list[tuple[str, list[str]]] = field(default_factory=list)
+
+    def snapshot_blocks(self) -> list[dict[str, str]]:
+        return [{"type": block_type, "text": "".join(parts)} for block_type, parts in self.blocks]
+
+
+def _sse(event: str, data: Mapping[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
+
+
+def _discard(
+    registry: dict[str, set[asyncio.Queue[_StreamItem]]],
+    key: str,
+    queue: asyncio.Queue[_StreamItem],
+) -> None:
+    queues = registry.get(key)
+    if queues is None:
+        return
+    queues.discard(queue)
+    if not queues:
+        del registry[key]
+
+
+def _offer(queue: asyncio.Queue[_StreamItem], item: _StreamItem) -> None:
+    """Queue an item for one reader; a reader that fell behind resynchronizes instead."""
+
+    try:
+        queue.put_nowait(item)
+    except asyncio.QueueFull:
+        closing = item is _CLOSE
+        while not queue.empty():
+            closing = queue.get_nowait() is _CLOSE or closing
+        queue.put_nowait(_CLOSE if closing else _RESYNC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -513,7 +585,12 @@ class GenerationManager:
         self.token_worker = BoundedWorker("oveo-tokens", max_pending=4)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._cancel: dict[str, asyncio.Event] = {}
-        self._conditions: dict[str, asyncio.Condition] = {}
+        self._provider_calls: dict[str, asyncio.Future[ProviderCompletion]] = {}
+        self._live: dict[str, _LiveGeneration] = {}
+        # Event-stream queues by generation, by sign-in session, and counts per user.
+        self._subscribers: dict[str, set[asyncio.Queue[_StreamItem]]] = {}
+        self._session_streams: dict[str, set[asyncio.Queue[_StreamItem]]] = {}
+        self._user_streams: Counter[str] = Counter()
         # Generations committed but not yet scheduled. One process owns every
         # generation, so an active row that is neither here nor in _tasks is orphaned.
         self._starting: set[str] = set()
@@ -796,11 +873,18 @@ class GenerationManager:
         self._shutting_down = True
         if self._reconcile_timer is not None:
             self._reconcile_timer.cancel()
+        for cancel_event in tuple(self._cancel.values()):
+            cancel_event.set()
+        for call in tuple(self._provider_calls.values()):
+            call.cancel()
         tasks = tuple(self._tasks.values())
-        for task in tasks:
-            task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Let runs finish their current database writes, then force the rest.
+            _done, pending = await asyncio.wait(tasks, timeout=_SHUTDOWN_GRACE_SECONDS)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
         reconcile_task = self._reconcile_task
         if reconcile_task is not None and not reconcile_task.done():
             reconcile_task.cancel()
@@ -815,22 +899,62 @@ class GenerationManager:
         messages = _snapshot_messages(snapshot)
         return await self.token_worker.run(partial(count_input_tokens, messages), wait=True)
 
-    def _schedule(self, generation_id: str) -> None:
+    def _schedule(self, generation_id: str, thread_id: str | None) -> None:
         if generation_id in self._tasks:
             return
         cancel_event = asyncio.Event()
         self._cancel[generation_id] = cancel_event
+        self._live[generation_id] = _LiveGeneration(thread_id=thread_id)
         task = asyncio.create_task(self._run(generation_id, cancel_event))
         self._tasks[generation_id] = task
 
         def finished(done_task: asyncio.Task[None]) -> None:
             self._tasks.pop(generation_id, None)
             self._cancel.pop(generation_id, None)
-            self._conditions.pop(generation_id, None)
+            self._live.pop(generation_id, None)
+            # Readers re-read the stored row (normally terminal by now).
+            self._notify(generation_id)
             if not done_task.cancelled() and (error := done_task.exception()) is not None:
                 log_unexpected(_LOGGER, error, area="generation_task")
 
         task.add_done_callback(finished)
+
+    def _publish(self, generation_id: str, item: _StreamItem) -> None:
+        for queue in tuple(self._subscribers.get(generation_id, ())):
+            _offer(queue, item)
+
+    def _notify(self, generation_id: str) -> None:
+        self._publish(generation_id, _RESYNC)
+
+    def _set_live_status(self, generation_id: str, status: str) -> None:
+        live = self._live.get(generation_id)
+        if live is None:
+            return
+        live.status = status
+        if status in _TERMINAL:
+            self._notify(generation_id)
+            return
+        live.seq += 1
+        self._publish(generation_id, _Delta(live.seq, ({"op": "status", "status": status},)))
+
+    def _mark_finished(self, generation_id: str, status: str) -> None:
+        if generation_id in self._live:
+            self._set_live_status(generation_id, status)
+        else:
+            self._notify(generation_id)
+
+    def _live_blocks(self, generation_id: str) -> list[dict[str, str]]:
+        live = self._live.get(generation_id)
+        return live.snapshot_blocks() if live is not None else []
+
+    def close_session_streams(self, session_id: str) -> None:
+        """End every open event stream of a signed-out session immediately."""
+
+        for queue in tuple(self._session_streams.get(session_id, ())):
+            # Drop anything still queued so no further content reaches this browser.
+            while not queue.empty():
+                queue.get_nowait()
+            queue.put_nowait(_CLOSE)
 
     async def _request_snapshot(
         self,
@@ -1147,10 +1271,10 @@ class GenerationManager:
             staged_files.clear()
             # Schedule before any further await so the committed row is never seen
             # without its task (see _is_live).
-            self._schedule(generation_id)
+            self._schedule(generation_id, thread.id)
             thread_id = thread.id
         for orphan_id in finalized:
-            await self._notify(orphan_id)
+            self._notify(orphan_id)
         return Submission(thread_id, generation_id)
 
     async def _check_response_budget(
@@ -1365,7 +1489,7 @@ class GenerationManager:
                         )
                     )
                     await db.commit()
-                    self._schedule(generation_id)
+                    self._schedule(generation_id, thread.id)
             except IntegrityError as exc:
                 async with self.database.sessions() as db:
                     existing = await self._existing_request(db, requester_id, client_request_id)
@@ -1375,7 +1499,7 @@ class GenerationManager:
         finally:
             self._starting.discard(generation_id)
         for orphan_id in finalized:
-            await self._notify(orphan_id)
+            self._notify(orphan_id)
         return generation_id
 
     async def retry(
@@ -1439,7 +1563,7 @@ class GenerationManager:
                         )
                     )
                     await db.commit()
-                    self._schedule(retry_id)
+                    self._schedule(retry_id, original.thread_id)
             except IntegrityError as exc:
                 async with self.database.sessions() as db:
                     existing = await self._existing_request(db, requester_id, client_request_id)
@@ -1449,7 +1573,7 @@ class GenerationManager:
         finally:
             self._starting.discard(retry_id)
         for orphan_id in finalized:
-            await self._notify(orphan_id)
+            self._notify(orphan_id)
         return retry_id
 
     async def _is_retryable(self, db: AsyncSession, generation: Generation) -> bool:
@@ -1508,17 +1632,22 @@ class GenerationManager:
                 if status != "stopping":
                     # Already finished: a late Stop must not reopen or relabel it.
                     return
-        await self._notify(generation_id)
+        if generation_id in self._live:
+            self._set_live_status(generation_id, "stopping")
+        else:
+            self._notify(generation_id)
         if not self._is_live(generation_id):
             # No task will ever finish this row (see _is_live), so finish it now.
             await self._finish_stopped(generation_id)
             return
+        # Cancel only the in-flight provider call; the run loop checks the event at its
+        # safe points, so no database transaction is ever interrupted.
         cancel_event = self._cancel.get(generation_id)
         if cancel_event is not None:
             cancel_event.set()
-        task = self._tasks.get(generation_id)
-        if task is not None:
-            task.cancel()
+        call = self._provider_calls.get(generation_id)
+        if call is not None:
+            call.cancel()
 
     async def cancel_thread(self, thread_id: str) -> None:
         async with self.database.sessions() as db:
@@ -1542,6 +1671,19 @@ class GenerationManager:
             await asyncio.wait(tasks, timeout=_CANCEL_WAIT_SECONDS)
 
     async def get_snapshot(self, generation_id: str) -> dict[str, Any] | None:
+        live = self._live.get(generation_id)
+        if live is not None and live.status in _ACTIVE:
+            # Served from memory without a database connection; drafts are not stored.
+            return {
+                "id": generation_id,
+                "thread_id": live.thread_id,
+                "status": live.status,
+                "blocks": live.snapshot_blocks(),
+                "error_code": None,
+                "error_message": None,
+                "retryable": False,
+                "seq": live.seq,
+            }
         async with self.database.sessions() as db:
             generation = await db.get(Generation, generation_id)
             if generation is None:
@@ -1560,29 +1702,115 @@ class GenerationManager:
                 "seq": generation.stream_revision,
             }
 
-    async def events(self, generation_id: str) -> AsyncIterator[str]:
-        last_seq = -1
-        while True:
+    def open_event_stream(
+        self,
+        generation_id: str,
+        *,
+        user_id: str,
+        session_id: str,
+        session_valid: Callable[[], Awaitable[bool]],
+    ) -> AsyncIterator[str]:
+        """Return a server-sent event stream, refusing a user's excess open streams."""
+
+        if self._user_streams[user_id] >= _MAX_STREAMS_PER_USER:
+            raise GenerationError(
+                "too_many_streams",
+                "Too many live responses are open. Close another tab and try again.",
+                status_code=429,
+            )
+        return self._events(
+            generation_id, user_id=user_id, session_id=session_id, session_valid=session_valid
+        )
+
+    async def _events(
+        self,
+        generation_id: str,
+        *,
+        user_id: str,
+        session_id: str,
+        session_valid: Callable[[], Awaitable[bool]],
+    ) -> AsyncIterator[str]:
+        """Send one snapshot, then sequenced deltas; resynchronize with a new snapshot.
+
+        No database connection is held while the stream is open. Snapshots use short
+        sessions (or the live draft), and the sign-in session is re-checked every few
+        seconds, so a revoked session stops receiving content.
+        """
+
+        queue: asyncio.Queue[_StreamItem] = asyncio.Queue(maxsize=_STREAM_QUEUE_SIZE)
+        # Subscribe before taking the snapshot so no delta falls between the two.
+        self._subscribers.setdefault(generation_id, set()).add(queue)
+        self._session_streams.setdefault(session_id, set()).add(queue)
+        self._user_streams[user_id] += 1
+        loop = asyncio.get_running_loop()
+        try:
             snapshot = await self.get_snapshot(generation_id)
             if snapshot is None:
                 return
-            seq = int(snapshot["seq"])
-            if seq != last_seq:
-                yield f"id: {seq}\ndata: {json.dumps(snapshot, separators=(',', ':'))}\n\n"
-                last_seq = seq
+            yield _sse("snapshot", snapshot)
+            last_seq = int(snapshot["seq"])
             if snapshot["status"] in _TERMINAL:
                 return
-            condition = self._conditions.setdefault(generation_id, asyncio.Condition())
-            try:
-                async with condition:
-                    await asyncio.wait_for(condition.wait(), timeout=15)
-            except TimeoutError:
-                yield ": keep-alive\n\n"
-
-    async def _notify(self, generation_id: str) -> None:
-        condition = self._conditions.setdefault(generation_id, asyncio.Condition())
-        async with condition:
-            condition.notify_all()
+            next_check = loop.time() + _SESSION_CHECK_SECONDS
+            pending: _StreamItem | None = None
+            while True:
+                if pending is not None:
+                    item: _StreamItem | None = pending
+                    pending = None
+                else:
+                    wait = max(0.0, min(_KEEPALIVE_SECONDS, next_check - loop.time()))
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=wait)
+                    except TimeoutError:
+                        item = None
+                if item is _CLOSE:
+                    return
+                if loop.time() >= next_check:
+                    if not await session_valid():
+                        return
+                    next_check = loop.time() + _SESSION_CHECK_SECONDS
+                idle = item is None
+                if idle and generation_id in self._live:
+                    yield ": keep-alive\n\n"
+                    continue
+                if isinstance(item, _Delta):
+                    if item.seq <= last_seq:
+                        continue  # already part of the snapshot
+                    if item.seq != last_seq + 1:
+                        item = _RESYNC
+                    else:
+                        first = item.seq
+                        ops = list(item.ops)
+                        last_seq = item.seq
+                        # Coalesce whatever else is already queued into one message.
+                        while not queue.empty():
+                            queued = queue.get_nowait()
+                            if isinstance(queued, _Delta) and queued.seq == last_seq + 1:
+                                ops.extend(queued.ops)
+                                last_seq = queued.seq
+                            else:
+                                pending = queued
+                                break
+                        yield _sse("delta", {"from": first, "seq": last_seq, "ops": ops})
+                        continue
+                # A resync, a sequence gap, or an idle stream whose row no task in this
+                # process drives: re-read the authoritative snapshot.
+                snapshot = await self.get_snapshot(generation_id)
+                if snapshot is None:
+                    return
+                if snapshot["status"] in _TERMINAL or int(snapshot["seq"]) != last_seq:
+                    yield _sse("snapshot", snapshot)
+                    last_seq = int(snapshot["seq"])
+                elif idle:
+                    yield ": keep-alive\n\n"
+                if snapshot["status"] in _TERMINAL:
+                    return
+        finally:
+            _discard(self._subscribers, generation_id, queue)
+            _discard(self._session_streams, session_id, queue)
+            self._user_streams[user_id] -= 1
+            if self._user_streams[user_id] <= 0:
+                del self._user_streams[user_id]
 
     async def _set_running(self, generation_id: str) -> Generation | None:
         async with self.database.sessions() as db:
@@ -1605,33 +1833,28 @@ class GenerationManager:
                 provider_request_id=None,
             )
             await db.commit()
-            return generation
+        self._set_live_status(generation_id, "running")
+        return generation
 
-    async def _record_events(self, generation_id: str, events: Sequence[ProtocolEvent]) -> None:
-        if not events:
-            return
-        async with self.database.sessions() as db:
-            generation = await db.get(Generation, generation_id)
-            if generation is None or generation.status != "running":
-                raise asyncio.CancelledError
-            blocks = [dict(block) for block in generation.partial_blocks]
-            for event in events:
-                if event.event == "block_start":
-                    blocks.append({"type": event.block_type, "text": ""})
-                elif event.event == "block_delta":
-                    if not blocks or event.text is None:
-                        raise ProtocolError("delta_without_active_block")
-                    blocks[-1]["text"] = f"{blocks[-1].get('text', '')}{event.text}"
-            result = await db.execute(
-                update(Generation)
-                .where(Generation.id == generation_id, Generation.status == "running")
-                .values(partial_blocks=blocks, stream_revision=Generation.stream_revision + 1)
-                .execution_options(synchronize_session=False)
-            )
-            if int(result.rowcount or 0) != 1:  # type: ignore[attr-defined]
-                raise asyncio.CancelledError
-            await db.commit()
-        await self._notify(generation_id)
+    def _apply_live_events(self, generation_id: str, events: Sequence[ProtocolEvent]) -> None:
+        """Add decoded events to the in-memory draft and send them as one delta."""
+
+        live = self._live.get(generation_id)
+        if live is None or live.status != "running":
+            raise asyncio.CancelledError  # a Stop or shutdown owns the row now
+        ops: list[dict[str, str]] = []
+        for event in events:
+            if event.event == "block_start" and event.block_type is not None:
+                live.blocks.append((event.block_type, []))
+                ops.append({"op": "start", "type": event.block_type})
+            elif event.event == "block_delta":
+                if not live.blocks or event.text is None:
+                    raise ProtocolError("delta_without_active_block")
+                live.blocks[-1][1].append(event.text)
+                ops.append({"op": "append", "text": event.text})
+        if ops:
+            live.seq += 1
+            self._publish(generation_id, _Delta(live.seq, tuple(ops)))
 
     async def _commit_success(
         self,
@@ -1670,7 +1893,7 @@ class GenerationManager:
             # Stop won the race before the answer was committed: finish the stop.
             await self._finish_stopped(generation_id)
             return
-        await self._notify(generation_id)
+        self._mark_finished(generation_id, "completed")
 
     async def _commit_success_once(
         self,
@@ -2044,31 +2267,69 @@ class GenerationManager:
             observed["request_id"] = request_id
             observed["generation_id"] = provider_generation_id
             try:
-                await self._record_provider_ids(
-                    usage,
-                    purpose=ledger_purpose,
-                    request_id=request_id,
-                    provider_generation_id=provider_generation_id,
-                    record_ids=record_ids,
+                # Shielded: a Stop cancelling the stream must not abort this write.
+                await asyncio.shield(
+                    self._record_provider_ids(
+                        usage,
+                        purpose=ledger_purpose,
+                        request_id=request_id,
+                        provider_generation_id=provider_generation_id,
+                        record_ids=record_ids,
+                    )
                 )
             except SQLAlchemyError as error:
                 # Best effort: bookkeeping must not abort a response that is streaming.
                 log_unexpected(_LOGGER, error, area="usage_ids")
 
-        async with self._provider_slots:
-            try:
-                completion = await self.provider.generate(
+        stop_requested = self._cancel.get(usage.generation_id)
+        await self._acquire_provider_slot(stop_requested)
+        try:
+            # Stop cancels only this call (see stop()), so a cancellation can never land
+            # inside one of this generation's database transactions.
+            call = asyncio.ensure_future(
+                self.provider.generate(
                     replace(request, on_provider_ids=on_provider_ids), emit, cancel_event
                 )
+            )
+            self._provider_calls[usage.generation_id] = call
+            try:
+                completion = await call
             except ProviderError as error:
                 await self._record_provider_error(
                     usage, error, purpose=ledger_purpose, scope=dedupe_scope, observed=observed
                 )
                 raise
+            finally:
+                if self._provider_calls.get(usage.generation_id) is call:
+                    del self._provider_calls[usage.generation_id]
+        finally:
+            self._provider_slots.release()
         await self._record_provider_completion(
             usage, completion, purpose=ledger_purpose, scope=dedupe_scope, observed=observed
         )
         return completion
+
+    async def _acquire_provider_slot(self, stop_requested: asyncio.Event | None) -> None:
+        """Wait for a provider slot, giving up at once if Stop is requested meanwhile."""
+
+        if stop_requested is None:
+            await self._provider_slots.acquire()
+            return
+        if stop_requested.is_set():
+            raise asyncio.CancelledError
+        acquire = asyncio.ensure_future(self._provider_slots.acquire())
+        stopped = asyncio.ensure_future(stop_requested.wait())
+        try:
+            await asyncio.wait({acquire, stopped}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stopped.cancel()
+        if acquire.done() and not acquire.cancelled():
+            if not stop_requested.is_set():
+                return
+            self._provider_slots.release()
+        else:
+            acquire.cancel()
+        raise asyncio.CancelledError
 
     async def _record_provider_ids(
         self,
@@ -2349,7 +2610,7 @@ class GenerationManager:
                 await db.commit()
 
         await self._with_write_retries(write)
-        await self._notify(generation_id)
+        self._mark_finished(generation_id, "stopped")
 
     async def _maybe_compact_context(self, generation: Generation) -> Mapping[str, Any]:
         snapshot = generation.request_snapshot
@@ -2763,7 +3024,11 @@ class GenerationManager:
                 provider_request_id=None,
             )
             await db.commit()
-        await self._notify(generation_id)
+        live = self._live.get(generation_id)
+        if live is not None:
+            live.blocks.clear()
+            live.seq += 1
+        self._notify(generation_id)
         return True
 
     @staticmethod
@@ -2830,15 +3095,18 @@ class GenerationManager:
         generation_id: str,
         code: str,
         *,
-        preserve_blocks: bool = False,
+        blocks: list[dict[str, str]] | None = None,
     ) -> None:
+        """Record a failure; ``blocks`` keeps a valid visible response for the user."""
+
         recorded_code = code if code in _ERROR_MESSAGES else "provider_error"
 
         async def write() -> bool:
             async with self.database.sessions() as db:
-                values: dict[str, Any] = {"error_code": recorded_code}
-                if not preserve_blocks:
-                    values["partial_blocks"] = []
+                values: dict[str, Any] = {
+                    "error_code": recorded_code,
+                    "partial_blocks": blocks or [],
+                }
                 failed = await self._transition(
                     db,
                     generation_id,
@@ -2861,13 +3129,14 @@ class GenerationManager:
 
         # If even the retried write fails, the row stays active without a task and is
         # finished by the next Stop, submission, retry or restart (see _is_live).
-        if await self._with_write_retries(write):
+        failed = await self._with_write_retries(write)
+        if failed:
             _LOGGER.error(
                 "generation_failed generation_id=%s error_code=%s",
                 generation_id,
                 recorded_code,
             )
-        await self._notify(generation_id)
+        self._mark_finished(generation_id, "failed" if failed else "stopped")
 
     async def _run(self, generation_id: str, cancel_event: asyncio.Event) -> None:
         try:
@@ -2877,17 +3146,13 @@ class GenerationManager:
                 await self._finish_stopped(generation_id)
                 return
             usage = _usage_of(generation)
-            await self._notify(generation_id)
             request_snapshot = await self._maybe_compact_context(generation)
 
             def protocol_emitter(attempt_decoder: ProtocolDecoder) -> EmitChunk:
                 async def emit(chunk: bytes) -> None:
                     if cancel_event.is_set():
                         raise asyncio.CancelledError
-                    await self._record_events(
-                        generation_id,
-                        attempt_decoder.feed(chunk),
-                    )
+                    self._apply_live_events(generation_id, attempt_decoder.feed(chunk))
 
                 return emit
 
@@ -2940,15 +3205,22 @@ class GenerationManager:
                 await self._fail(generation_id, error.code)
             except ProtocolError:
                 await self._fail(generation_id, "protocol_error")
+            # The response itself was valid; keep it visible with the failure.
             except StaleStateError:
-                await self._fail(generation_id, "stale_state", preserve_blocks=True)
+                await self._fail(
+                    generation_id, "stale_state", blocks=self._live_blocks(generation_id)
+                )
             except DocxTemplateOutdatedError:
-                await self._fail(generation_id, "docx_template_outdated", preserve_blocks=True)
+                await self._fail(
+                    generation_id,
+                    "docx_template_outdated",
+                    blocks=self._live_blocks(generation_id),
+                )
             except StatePersistenceError:
                 await self._fail(
                     generation_id,
                     "state_persistence_failed",
-                    preserve_blocks=True,
+                    blocks=self._live_blocks(generation_id),
                 )
         except asyncio.CancelledError:
             await asyncio.shield(self._finish_stopped(generation_id))

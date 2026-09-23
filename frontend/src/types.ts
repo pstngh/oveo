@@ -47,7 +47,10 @@ export interface ThreadDetail extends ThreadSummary {
   owner_username: string;
   messages: Message[];
   docx_exportable?: boolean;
+  /** The latest chat generation unless it completed. */
   generation?: GenerationSnapshot | null;
+  /** A prompt handoff that is still running, reported apart from the chat turn. */
+  handoff?: GenerationSnapshot | null;
 }
 
 export interface GenerationSnapshot {

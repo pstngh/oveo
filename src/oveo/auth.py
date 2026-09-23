@@ -173,6 +173,23 @@ async def get_session_principal(
     return SessionPrincipal(session=session, user=session.user)
 
 
+async def session_is_active(
+    db: AsyncSession,
+    session_id: str,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Whether a session still exists, is unexpired, and matches its credentials."""
+
+    current_time = now or datetime.now(UTC)
+    session = await db.get(Session, session_id)
+    return bool(
+        session is not None
+        and current_time < _aware(session.expires_at)
+        and session.credential_version == session.user.credential_version
+    )
+
+
 def validate_csrf(session: Session, cookie_token: str | None, header_token: str | None) -> bool:
     if not cookie_token or not header_token:
         return False

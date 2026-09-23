@@ -336,8 +336,14 @@ async def test_same_thread_guard_stop_and_snapshot_reconnect(
             thread_id=first.thread_id,
         )
 
-    event_stream = manager.events(first.generation_id)
+    async def always_valid() -> bool:
+        return True
+
+    event_stream = manager.open_event_stream(
+        first.generation_id, user_id=user.id, session_id="session", session_valid=always_valid
+    )
     initial = await anext(event_stream)
+    assert initial.startswith("event: snapshot\n")
     assert '"status":"running"' in initial
     await cast(AsyncGenerator[str, None], event_stream).aclose()
 
@@ -371,7 +377,8 @@ async def test_thread_cancellation_awaits_task_cleanup_before_returning(
     stopped = await manager.get_snapshot(submitted.generation_id)
     assert stopped is not None and stopped["status"] == "stopped"
     assert submitted.generation_id not in manager._tasks
-    assert submitted.generation_id not in manager._conditions
+    assert submitted.generation_id not in manager._live
+    assert submitted.generation_id not in manager._subscribers
     await manager.shutdown()
 
 
