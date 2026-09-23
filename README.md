@@ -116,7 +116,22 @@ does not map GPT-6 Luna by model name. Oveo compacts at 240,000 input tokens by
 default, leaving a 32,000-token margin below Luna's
 long-context pricing boundary. Oversized handoffs are reduced in user-only chunks;
 assistant turns, internal summaries, canonical work, and application prompts never
-enter those chunks.
+enter those chunks. When the prompts, current work, pinned reference, and latest
+turns alone exceed that budget, the turn fails at once with a request for a smaller
+reference instead of spending summary calls that cannot help.
+
+A visible response may use at most `OVEO_CHAT_MAX_COMPLETION_TOKENS` output tokens
+(32,000 by default; OpenRouter lists 128,000 as the pinned model's maximum). The
+response streams the complete result once as the deliverable plus one state copy
+(the text source or the DOCX block map), so new source material whose lower-bound
+output estimate already exceeds the cap is refused before any model call, with a
+suggested part size. A response that still reaches the cap, for example because of
+reasoning, fails with an explicit "output limit" message and is never replayed
+automatically. Reference DOCX files have their own word limit
+(`OVEO_MAX_REFERENCE_WORDS`, 25,000). At most `OVEO_MAX_CONCURRENT_PROVIDER_CALLS`
+(4) model calls run at once, and each attempt ends after
+`OVEO_PROVIDER_ATTEMPT_DEADLINE_SECONDS` (1,800) even if the provider keeps the
+stream alive.
 
 Production uses one slim image and one Uvicorn worker behind host Caddy. SQLite
 runs in WAL mode with foreign keys and a bounded busy timeout. Background calls

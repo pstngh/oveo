@@ -100,6 +100,22 @@ Mode prompts decide when those valid operations semantically apply. Each mode ma
 new canonical work to its corresponding work kind. Stop/failure discards partial
 assistant output but retains the user turn; retry does not duplicate it.
 
+Every status change is a compare-and-set update. Stop only moves queued or running
+work to stopping, and the success commit claims running → completed before it
+writes the answer, so a late Stop can neither relabel a committed answer nor leave
+the conversation locked. One process owns every generation: an active row without
+a live task (for example after a terminal write failed through all its retries) is
+finished by the next Stop, submission, retry, or restart, and restart
+reconciliation completes any row whose answer was already committed. Retry is
+offered only for the latest chat turn that has no answer; prompt handoffs are
+reported separately from the chat turn. Message ordinals are allocated inside the
+insert, and a concurrent or repeated submission resolves to the idempotent result or
+409. The frozen request snapshot is cleared when a generation finishes; error
+codes, provider IDs, and timestamps remain as content-free diagnostics. Each
+provider generation ID is recorded as a reconcilable pending usage row as soon as
+the stream names it, so stopped, cut-off, and retried calls are charged from
+OpenRouter's metadata without ever inventing an unknown amount.
+
 ## DOCX preservation path
 
 DOCX input stays inside the existing attachment directory and backup/deletion

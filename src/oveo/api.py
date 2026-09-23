@@ -359,20 +359,36 @@ async def thread_detail(
                 "created_at": message.created_at.isoformat(),
             }
         )
-    latest_generation = await db.scalar(
-        select(Generation)
-        .where(Generation.thread_id == thread.id)
-        .order_by(Generation.created_at.desc())
-        .limit(1)
-    )
+    manager = _manager(request)
+    # The chat view follows chat generations only; a prompt handoff has its own field so
+    # it can neither appear as the assistant's reply nor hide a failed turn's Retry.
+    latest_chat_row = (
+        await db.execute(
+            select(Generation.id, Generation.status)
+            .where(Generation.thread_id == thread.id, Generation.purpose == "chat")
+            .order_by(Generation.created_at.desc(), Generation.id.desc())
+            .limit(1)
+        )
+    ).first()
     generation_snapshot = None
-    if latest_generation is not None and latest_generation.status != "completed":
-        generation_snapshot = await _manager(request).get_snapshot(latest_generation.id)
+    if latest_chat_row is not None and latest_chat_row.status != "completed":
+        generation_snapshot = await manager.get_snapshot(latest_chat_row.id)
+    active_handoff = await db.scalar(
+        select(Generation.id).where(
+            Generation.thread_id == thread.id,
+            Generation.purpose == "prompt_handoff",
+            Generation.status.in_(("queued", "running", "stopping")),
+        )
+    )
+    handoff_snapshot = (
+        await manager.get_snapshot(active_handoff) if active_handoff is not None else None
+    )
     latest_version = await _latest_work_version(db, thread.id)
     return {
         **summary,
         "messages": serialized_messages,
         "generation": generation_snapshot,
+        "handoff": handoff_snapshot,
         "docx_exportable": bool(
             latest_version is not None
             and latest_version.docx_template_attachment_id is not None

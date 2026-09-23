@@ -32,6 +32,7 @@ class ValidatedAttachment:
     word_count: int
     sha256: str
     document_blocks: tuple[DocxBlock, ...]
+    plain_text: str = ""
 
 
 def count_words(text: str) -> int:
@@ -49,6 +50,7 @@ def _validated_docx(name: str, content: bytes, max_bytes: int) -> ValidatedAttac
         word_count=count_words(extracted.plain_text),
         sha256=hashlib.sha256(content).hexdigest(),
         document_blocks=extracted.blocks,
+        plain_text=extracted.plain_text,
     )
 
 

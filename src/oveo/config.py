@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     login_lock_seconds: int = Field(default=900, ge=60, le=86_400)
     max_upload_bytes: int = Field(default=2_000_000, ge=1024, le=10_000_000)
     max_source_words: int = Field(default=25_000, ge=1000, le=100_000)
+    # The latest reference is re-sent with every turn and cannot be compacted away.
+    max_reference_words: int = Field(default=25_000, ge=1000, le=100_000)
     context_compaction_tokens: int = Field(default=240_000, ge=1_000, le=260_000)
     context_recent_messages: int = Field(default=12, ge=4, le=100)
     openrouter_api_key: SecretStr | None = None
@@ -45,6 +47,8 @@ class Settings(BaseSettings):
     provider_attempt_deadline_seconds: float = Field(default=1_800.0, ge=60, le=7_200)
     provider_metadata_timeout_seconds: float = Field(default=3.0, ge=0.1, le=10)
     provider_retry_attempts: int = Field(default=3, ge=1, le=5)
+    # Provider calls in flight at once across all conversations; others wait their turn.
+    max_concurrent_provider_calls: int = Field(default=4, ge=1, le=16)
     session_cookie_name: str = "oveo_session"
     csrf_cookie_name: str = "oveo_csrf"
     charles_password_hash: SecretStr | None = None

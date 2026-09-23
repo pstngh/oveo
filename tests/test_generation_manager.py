@@ -5,8 +5,7 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import AsyncGenerator, AsyncIterator
-from pathlib import Path
+from collections.abc import AsyncGenerator
 from typing import cast
 
 import httpx
@@ -15,7 +14,6 @@ from pydantic import SecretStr
 from sqlalchemy import func, select
 
 from oveo.attachments import ValidatedAttachment
-from oveo.auth import hash_password
 from oveo.config import Settings
 from oveo.db import Database
 from oveo.docx import DocxBlock
@@ -29,7 +27,7 @@ from oveo.generation import (
     _apply_base_replacements,
     _snapshot_messages,
 )
-from oveo.models import Base, Generation, Message, Thread, UsageEvent, User, WorkItem, WorkVersion
+from oveo.models import Generation, Message, Thread, UsageEvent, User, WorkItem, WorkVersion
 from oveo.protocol import (
     AppendState,
     ContentBlock,
@@ -299,35 +297,6 @@ class HandoffCaptureProvider:
         self.request = request
         await emit(_SUCCESS)  # type: ignore[operator]
         return ProviderCompletion(cost_microusd=0)
-
-
-@pytest.fixture
-async def manager_database(tmp_path: Path) -> AsyncIterator[tuple[Database, Settings, User]]:
-    settings = Settings(
-        environment="test",
-        database_url=f"sqlite+aiosqlite:///{tmp_path / 'manager.sqlite3'}",
-        data_dir=tmp_path,
-        attachments_dir=tmp_path / "attachments",
-        frontend_dir=tmp_path / "frontend",
-        secure_cookies=False,
-        provider_retry_attempts=1,
-    )
-    database = Database(settings.database_url)
-    async with database.engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    async with database.sessions() as db:
-        user = User(
-            username="charles",
-            display_name="Charles",
-            password_hash=hash_password("test password"),
-        )
-        db.add(user)
-        await db.commit()
-        await db.refresh(user)
-    try:
-        yield database, settings, user
-    finally:
-        await database.dispose()
 
 
 async def _wait_status(
