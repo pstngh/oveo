@@ -40,6 +40,7 @@ from oveo.models import (
     WorkVersion,
 )
 from oveo.usage import format_lifetime_cost, lifetime_total
+from oveo.workers import WorkerBusy
 
 router = APIRouter()
 ThreadModeInput = Literal["translate", "revision", "internal_comms"]
@@ -47,11 +48,19 @@ AttachmentRoleInput = Literal["source", "reference"]
 
 
 class ApiError(Exception):
-    def __init__(self, status_code: int, code: str, message: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.headers = headers
 
 
 class LoginBody(BaseModel):
@@ -372,15 +381,21 @@ async def thread_detail(
     }
 
 
+_BUSY_RETRY_AFTER = {"Retry-After": "5"}
+
+
 async def _validated_upload(request: Request, attachment: UploadFile | None) -> Any:
     if attachment is None:
         return None
     try:
         return await validate_attachment_upload(
-            attachment, max_bytes=_settings(request).max_upload_bytes
+            attachment,
+            max_bytes=_settings(request).max_upload_bytes,
+            worker=_manager(request).docx_worker,
         )
     except AttachmentError as exc:
-        raise ApiError(exc.status_code, exc.code, exc.message) from exc
+        headers = _BUSY_RETRY_AFTER if exc.status_code == 503 else None
+        raise ApiError(exc.status_code, exc.code, exc.message, headers=headers) from exc
     finally:
         await attachment.close()
 
@@ -526,19 +541,47 @@ async def download_document(
     template_path = (attachment_root / attachment.storage_name).resolve()
     if template_path.parent != attachment_root:
         raise ApiError(409, "docx_export_unavailable", "The DOCX template is unavailable.")
-    try:
+
+    # Plain values only: the worker thread must not touch session-bound ORM objects.
+    replacements = list(version.docx_blocks or [])
+    stored_blocks = attachment.document_blocks
+    expected_size = attachment.byte_count
+    expected_sha256 = attachment.sha256
+    max_uncompressed = docx_uncompressed_limit(_settings(request).max_upload_bytes)
+
+    def export() -> bytes:
         template = template_path.read_bytes()
         if (
-            len(template) != attachment.byte_count
-            or hashlib.sha256(template).hexdigest() != attachment.sha256
+            len(template) != expected_size
+            or hashlib.sha256(template).hexdigest() != expected_sha256
         ):
             raise OSError("attachment integrity mismatch")
-        exported = render_docx(
+        # A stored map from the earlier text-box-unsafe extractor fails closed here.
+        return render_docx(
             template,
-            version.docx_blocks,
-            max_uncompressed_bytes=docx_uncompressed_limit(_settings(request).max_upload_bytes),
+            replacements,
+            max_uncompressed_bytes=max_uncompressed,
+            stored_blocks=stored_blocks,
         )
-    except (OSError, DocxError) as exc:
+
+    try:
+        exported = await _manager(request).docx_worker.run(export)
+    except WorkerBusy as exc:
+        raise ApiError(
+            503,
+            "document_worker_busy",
+            "Oveo is processing another document. Try again in a moment.",
+            headers=_BUSY_RETRY_AFTER,
+        ) from exc
+    except DocxError as exc:
+        if exc.code == "docx_template_outdated":
+            raise ApiError(409, exc.code, exc.message) from exc
+        raise ApiError(
+            409,
+            "docx_export_unavailable",
+            "The committed DOCX document could not be reproduced safely.",
+        ) from exc
+    except OSError as exc:
         raise ApiError(
             409,
             "docx_export_unavailable",

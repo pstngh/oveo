@@ -66,10 +66,15 @@ already-saved canonical work version.
 Each user message accepts one standard `.docx` file, selected as either the source
 document to transform or a style reference, subject to the configured byte and
 word limits. DOCX uploads are validated as bounded, non-encrypted, non-macro OOXML
-packages and extracted as stable paragraph and table-cell blocks. Tracked changes
-and field-code hyperlinks are rejected because they cannot be rewritten safely in
-v1. The latest style reference remains available after conversation compaction but
-never becomes the canonical document or export template.
+packages (including element and paragraph counts, checked before the document
+tree is built) and extracted as stable paragraph and table-cell blocks on a single
+background worker that turns new uploads away while it is busy. Tracked changes and
+field-code hyperlinks are rejected because they cannot be rewritten safely in v1.
+Text inside text boxes and shapes is never extracted or rewritten, like headers and
+footers. A document imported before text boxes were handled this way must be
+uploaded again before it can be edited or exported; Oveo refuses instead of
+producing a damaged file. The latest style reference remains available after
+conversation compaction but never becomes the canonical document or export template.
 
 For DOCX-backed canonical work, Oveo preserves the uploaded package as the
 template and stores a complete validated block replacement map on every committed

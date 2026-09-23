@@ -6,6 +6,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
@@ -40,6 +41,7 @@ from oveo.docx import (
     docx_uncompressed_limit,
     extract_docx,
     plain_text_from_replacements,
+    require_matching_blocks,
 )
 from oveo.models import (
     Attachment,
@@ -75,6 +77,7 @@ from oveo.provider import (
 )
 from oveo.provider import ProviderError as OpenRouterError
 from oveo.usage import append_usage_event
+from oveo.workers import BoundedWorker
 
 EmitChunk = Callable[[bytes], Awaitable[None]]
 
@@ -120,6 +123,31 @@ class StatePersistenceError(RuntimeError):
     """A valid visible response could not be applied to canonical state."""
 
 
+class DocxTemplateOutdatedError(RuntimeError):
+    """The stored DOCX block map no longer describes its template safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class _TemplateRef:
+    """Plain attachment fields handed to the DOCX worker thread."""
+
+    id: str
+    storage_name: str
+    media_type: str
+    byte_count: int
+    sha256: str
+    stored_blocks: object
+
+
+def _prepared_template(
+    templates: Mapping[str, ExtractedDocx] | None, attachment_id: str
+) -> ExtractedDocx:
+    extracted = (templates or {}).get(attachment_id)
+    if extracted is None:
+        raise ProtocolError("state_docx_template_missing")
+    return extracted
+
+
 class SummaryFormatError(ValueError):
     """A maintenance summary did not satisfy its closed response schema."""
 
@@ -147,10 +175,6 @@ def _snapshot_messages(
     if not messages:
         raise ProviderError(error_code)
     return messages
-
-
-def _snapshot_input_tokens(snapshot: Mapping[str, Any]) -> int:
-    return count_input_tokens(_snapshot_messages(snapshot))
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,6 +340,10 @@ _ERROR_MESSAGES = {
         "The response was generated, but its document update could not be saved. "
         "The visible response is preserved; retry before continuing."
     ),
+    "docx_template_outdated": (
+        "This Word document was imported by an earlier Oveo version that could not edit "
+        "its layout safely. Upload the document again to continue editing it."
+    ),
     "context_compaction_failed": "Oveo could not safely fit this conversation in context.",
     "handoff_turn_too_large": (
         "One user turn is too large to create a safe prompt handoff. "
@@ -428,6 +456,11 @@ class GenerationManager:
         self.database = database
         self.settings = settings
         self.provider = provider
+        # One thread each: a DOCX parse can use tens of MiB, so request-path parses are
+        # admitted one running plus one waiting. Token counting is lighter but still
+        # CPU-bound and kept off the event loop.
+        self.docx_worker = BoundedWorker("oveo-docx", max_pending=2)
+        self.token_worker = BoundedWorker("oveo-tokens", max_pending=4)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._cancel: dict[str, asyncio.Event] = {}
         self._conditions: dict[str, asyncio.Condition] = {}
@@ -590,6 +623,12 @@ class GenerationManager:
         close = getattr(self.provider, "aclose", None)
         if close is not None:
             await close()
+        self.docx_worker.close()
+        self.token_worker.close()
+
+    async def _snapshot_tokens(self, snapshot: Mapping[str, Any]) -> int:
+        messages = _snapshot_messages(snapshot)
+        return await self.token_worker.run(partial(count_input_tokens, messages), wait=True)
 
     def _schedule(self, generation_id: str) -> None:
         if generation_id in self._tasks:
@@ -1188,6 +1227,16 @@ class GenerationManager:
     ) -> None:
         blocks = cast(list[dict[str, str]], document.to_storage()["blocks"])
         mutates_state = not isinstance(document.state, NoState)
+        templates: Mapping[str, ExtractedDocx] = {}
+        if mutates_state:
+            # Parse any DOCX template before the write transaction so the database write
+            # lock is never held while the CPU-bound parse runs.
+            try:
+                templates = await self._prepare_docx_templates(generation_id, document)
+            except ProtocolError as exc:
+                if exc.code == "state_docx_template_outdated":
+                    raise DocxTemplateOutdatedError from exc
+                raise StatePersistenceError from exc
         try:
             async with self.database.sessions() as db:
                 generation = await db.get(Generation, generation_id)
@@ -1240,6 +1289,7 @@ class GenerationManager:
                             generation=generation,
                             thread=thread,
                             document=document,
+                            templates=templates,
                         )
                     except ProtocolError as exc:
                         if exc.code in _REPAIRABLE_STATE_CODES:
@@ -1269,8 +1319,12 @@ class GenerationManager:
         generation: Generation,
         thread: Thread | None,
         document: ProtocolDocument,
+        templates: Mapping[str, ExtractedDocx] | None = None,
     ) -> None:
-        """Validate and persist one hidden canonical mutation in the response commit."""
+        """Validate and persist one hidden canonical mutation in the response commit.
+
+        ``templates`` holds DOCX templates already parsed by `_prepare_docx_templates`.
+        """
 
         state = document.state
         if thread is None:
@@ -1335,7 +1389,7 @@ class GenerationManager:
             if source_docx is not None:
                 if state_docx_blocks is None:
                     raise ProtocolError("state_docx_blocks_missing")
-                extracted = self._read_docx_template(source_docx)
+                extracted = _prepared_template(templates, source_docx.id)
                 # The upload is the source. A redundant copy is accepted only if exact.
                 if state.source is not None and state.source != extracted.plain_text:
                     raise ProtocolError("state_docx_source_mismatch")
@@ -1375,7 +1429,7 @@ class GenerationManager:
                 template_attachment = await db.get(Attachment, current.docx_template_attachment_id)
                 if template_attachment is None:
                     raise ProtocolError("state_docx_template_missing")
-                extracted = self._read_docx_template(template_attachment)
+                extracted = _prepared_template(templates, template_attachment.id)
                 docx_template_attachment_id = template_attachment.id
                 template_blocks = extracted.blocks
             elif state_docx_blocks is not None:
@@ -1458,29 +1512,80 @@ class GenerationManager:
         )
         await db.flush()
 
-    def _read_docx_template(self, attachment: Attachment) -> ExtractedDocx:
-        if attachment.media_type != DOCX_MEDIA_TYPE:
+    async def _prepare_docx_templates(
+        self, generation_id: str, document: ProtocolDocument
+    ) -> dict[str, ExtractedDocx]:
+        """Parse the DOCX template a mutation needs, outside any write transaction."""
+
+        async with self.database.sessions() as db:
+            generation = await db.get(Generation, generation_id)
+            if generation is None or generation.purpose != "chat" or generation.thread_id is None:
+                return {}
+            attachment: Attachment | None
+            if isinstance(document.state, EstablishState):
+                if generation.source_message_id is None:
+                    return {}
+                attachment = await db.scalar(
+                    select(Attachment).where(Attachment.message_id == generation.source_message_id)
+                )
+                if attachment is None or attachment.role != "source":
+                    return {}
+            else:
+                current = await db.scalar(
+                    select(WorkVersion)
+                    .join(WorkItem, WorkVersion.work_item_id == WorkItem.id)
+                    .where(WorkItem.thread_id == generation.thread_id, WorkItem.active.is_(True))
+                    .order_by(WorkVersion.version_no.desc())
+                    .limit(1)
+                )
+                if current is None or current.docx_template_attachment_id is None:
+                    return {}
+                attachment = await db.get(Attachment, current.docx_template_attachment_id)
+                if attachment is None:
+                    raise ProtocolError("state_docx_template_missing")
+            template = _TemplateRef(
+                id=attachment.id,
+                storage_name=attachment.storage_name,
+                media_type=attachment.media_type,
+                byte_count=attachment.byte_count,
+                sha256=attachment.sha256,
+                stored_blocks=attachment.document_blocks,
+            )
+        extracted = await self.docx_worker.run(
+            partial(self._load_docx_template, template), wait=True
+        )
+        return {template.id: extracted}
+
+    def _load_docx_template(self, template: _TemplateRef) -> ExtractedDocx:
+        """Read, verify and parse one template (runs on the DOCX worker thread)."""
+
+        if template.media_type != DOCX_MEDIA_TYPE:
             raise ProtocolError("state_docx_template_invalid")
         root = self.settings.attachments_dir.resolve()
-        path = (root / attachment.storage_name).resolve()
+        path = (root / template.storage_name).resolve()
         if path.parent != root:
             raise ProtocolError("state_docx_template_invalid")
         try:
             content = path.read_bytes()
         except OSError as exc:
             raise ProtocolError("state_docx_template_missing") from exc
-        if (
-            len(content) != attachment.byte_count
-            or hashlib.sha256(content).hexdigest() != attachment.sha256
+        if len(content) != template.byte_count or hashlib.sha256(content).hexdigest() != (
+            template.sha256
         ):
             raise ProtocolError("state_docx_template_invalid")
         try:
-            return extract_docx(
+            extracted = extract_docx(
                 content,
                 max_uncompressed_bytes=docx_uncompressed_limit(self.settings.max_upload_bytes),
             )
+            # The model worked from the stored block map; it must still describe this
+            # package exactly (maps from the earlier text-box-unsafe extractor do not).
+            require_matching_blocks(extracted.blocks, template.stored_blocks)
         except DocxError as exc:
+            if exc.code == "docx_template_outdated":
+                raise ProtocolError("state_docx_template_outdated") from exc
             raise ProtocolError("state_docx_template_invalid") from exc
+        return extracted
 
     async def _record_provider_completion(
         self,
@@ -1669,7 +1774,7 @@ class GenerationManager:
         snapshot = generation.request_snapshot
         if generation.purpose not in {"chat", "prompt_handoff"}:
             return snapshot
-        if _snapshot_input_tokens(snapshot) <= self.settings.context_compaction_tokens:
+        if await self._snapshot_tokens(snapshot) <= self.settings.context_compaction_tokens:
             return snapshot
         if generation.thread_id is None:
             raise ProviderError("context_compaction_failed")
@@ -1680,7 +1785,7 @@ class GenerationManager:
     async def _compact_chat_context(self, generation: Generation) -> Mapping[str, Any]:
         snapshot: Mapping[str, Any] = generation.request_snapshot
         budget = self.settings.context_compaction_tokens
-        while _snapshot_input_tokens(snapshot) > budget:
+        while await self._snapshot_tokens(snapshot) > budget:
             async with self.database.sessions() as db:
                 thread = await db.get(Thread, generation.thread_id)
                 if thread is None:
@@ -1760,7 +1865,7 @@ class GenerationManager:
                 purpose="summary",
                 through_ordinal=cutoff,
             )
-            if _snapshot_input_tokens(candidate) <= self.settings.context_compaction_tokens:
+            if await self._snapshot_tokens(candidate) <= self.settings.context_compaction_tokens:
                 best = (cutoff, candidate)
                 low = middle + 1
             else:
@@ -1873,7 +1978,7 @@ class GenerationManager:
                         after_ordinal=after_ordinal,
                         through_ordinal=user_ordinals[middle],
                     )
-                    if _snapshot_input_tokens(candidate) <= budget:
+                    if await self._snapshot_tokens(candidate) <= budget:
                         best_end = middle
                         best_snapshot = candidate
                         low = middle + 1
@@ -1900,9 +2005,9 @@ class GenerationManager:
                 generation.request_snapshot,
                 build_handoff_merge_messages(extracts),
             )
-            if _snapshot_input_tokens(final_snapshot) <= budget:
+            if await self._snapshot_tokens(final_snapshot) <= budget:
                 break
-            groups = self._bounded_handoff_groups(generation.request_snapshot, extracts)
+            groups = await self._bounded_handoff_groups(generation.request_snapshot, extracts)
             if len(groups) >= len(extracts):
                 raise ProviderError("context_compaction_failed")
             extracts = [
@@ -1925,7 +2030,7 @@ class GenerationManager:
             await db.commit()
         return final_snapshot
 
-    def _bounded_handoff_groups(
+    async def _bounded_handoff_groups(
         self,
         base_snapshot: Mapping[str, Any],
         extracts: Sequence[str],
@@ -1939,7 +2044,7 @@ class GenerationManager:
                 build_handoff_merge_messages(candidate),
             )
             within_budget = (
-                _snapshot_input_tokens(candidate_snapshot)
+                await self._snapshot_tokens(candidate_snapshot)
                 <= self.settings.context_compaction_tokens
             )
             if within_budget:
@@ -2218,6 +2323,8 @@ class GenerationManager:
                 await self._fail(generation_id, "protocol_error")
             except StaleStateError:
                 await self._fail(generation_id, "stale_state", preserve_blocks=True)
+            except DocxTemplateOutdatedError:
+                await self._fail(generation_id, "docx_template_outdated", preserve_blocks=True)
             except StatePersistenceError:
                 await self._fail(
                     generation_id,

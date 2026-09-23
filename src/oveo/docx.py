@@ -15,6 +15,11 @@ MAX_DOCX_ENTRIES = 2_048
 MAX_DOCX_UNCOMPRESSED_BYTES = 50_000_000
 MAX_DOCX_XML_PART_BYTES = 12_000_000
 MAX_DOCX_BLOCKS = 10_000
+# Tree size limits checked before the document tree is built. A small package can
+# expand into millions of (empty) elements, which costs seconds of CPU and hundreds of
+# MiB; legitimate documents within the word limit stay far below these values.
+MAX_DOCX_XML_ELEMENTS = 300_000
+MAX_DOCX_PARAGRAPHS = 20_000
 MAX_COMPRESSION_RATIO = 500
 MIN_DOCX_UNCOMPRESSED_BYTES = 20_000_000
 
@@ -27,8 +32,19 @@ _WORD_MAIN_CONTENT_TYPE = (
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 _XML = "http://www.w3.org/XML/1998/namespace"
 _NS = {"w": _W, "r": _R, "pr": _PKG_REL}
+_P_TAG = f"{{{_W}}}p"
+_T_TAG = f"{{{_W}}}t"
+_HYPERLINK_TAG = f"{{{_W}}}hyperlink"
+_PPR_TAG = f"{{{_W}}}pPr"
+_ALTERNATE_CONTENT_TAG = f"{{{_MC}}}AlternateContent"
+_FIELD_TAGS = frozenset({f"{{{_W}}}fldChar", f"{{{_W}}}instrText", f"{{{_W}}}fldSimple"})
+# Paragraphs directly in the body flow (including table cells and content controls),
+# never paragraphs nested in another paragraph's text boxes or shapes.
+_BODY_PARAGRAPHS = etree.XPath(".//w:body//w:p[not(ancestor::w:p)]", namespaces=_NS)
+_IN_TABLE_CELL = etree.XPath("ancestor::w:tc", namespaces=_NS)
 _BLOCK_ID = re.compile(r"p[0-9]{6}\Z")
 _LINK_ID = re.compile(r"l[0-9]{6}\Z")
 _LINK_TOKEN = re.compile(
@@ -89,19 +105,72 @@ def docx_uncompressed_limit(max_upload_bytes: int) -> int:
     )
 
 
-def _xml(data: bytes, *, label: str) -> etree._Element:
-    if len(data) > MAX_DOCX_XML_PART_BYTES or b"<!DOCTYPE" in data.upper():
-        raise DocxError("invalid_docx", f"The DOCX {label} part is not supported.")
-    parser = etree.XMLParser(
+def _xml_part_limit(max_uncompressed_bytes: int) -> int:
+    # 10 MB for the default 2 MB upload limit; smaller uploads get a smaller ceiling.
+    return min(MAX_DOCX_XML_PART_BYTES, max_uncompressed_bytes // 4)
+
+
+def _xml_parser(**options: object) -> etree.XMLParser:
+    return etree.XMLParser(
         resolve_entities=False,
         load_dtd=False,
         no_network=True,
         recover=False,
         huge_tree=False,
         remove_blank_text=False,
+        **options,
     )
+
+
+class _TooComplex(Exception):
+    pass
+
+
+class _ElementCounter:
+    """lxml parser target that counts elements without building a tree."""
+
+    def __init__(self) -> None:
+        self.elements = 0
+        self.paragraphs = 0
+
+    def start(self, tag: str, _attrib: object) -> None:
+        self.elements += 1
+        if tag == _P_TAG:
+            self.paragraphs += 1
+        if self.elements > MAX_DOCX_XML_ELEMENTS or self.paragraphs > MAX_DOCX_PARAGRAPHS:
+            raise _TooComplex
+
+    def end(self, _tag: str) -> None:
+        return None
+
+    def data(self, _data: str) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+def _require_bounded_tree(data: bytes, *, label: str) -> None:
+    # Every element has at least one '<', so a byte count below the limit proves the
+    # bound without parsing. Otherwise count exactly, stopping at the first excess.
+    if data.count(b"<") <= MAX_DOCX_PARAGRAPHS:
+        return
     try:
-        return etree.fromstring(data, parser=parser)
+        etree.fromstring(data, parser=_xml_parser(target=_ElementCounter()))
+    except _TooComplex as exc:
+        raise DocxError(
+            "docx_too_complex", "The DOCX contains too many elements to process safely."
+        ) from exc
+    except (etree.XMLSyntaxError, ValueError) as exc:
+        raise DocxError("invalid_docx", f"The DOCX {label} part is malformed.") from exc
+
+
+def _xml(data: bytes, *, label: str, max_bytes: int = MAX_DOCX_XML_PART_BYTES) -> etree._Element:
+    if len(data) > max_bytes or b"<!DOCTYPE" in data.upper():
+        raise DocxError("invalid_docx", f"The DOCX {label} part is not supported.")
+    _require_bounded_tree(data, label=label)
+    try:
+        return etree.fromstring(data, parser=_xml_parser())
     except (etree.XMLSyntaxError, ValueError) as exc:
         raise DocxError("invalid_docx", f"The DOCX {label} part is malformed.") from exc
 
@@ -222,8 +291,33 @@ def _reject_unsupported_markup(root: etree._Element) -> None:
         )
 
 
-def _text(node: etree._Element) -> str:
-    return "".join(str(value) for value in node.xpath(".//w:t/text()", namespaces=_NS))
+def _belongs_to(node: etree._Element, paragraph: etree._Element) -> bool:
+    """True when ``paragraph`` is the nearest paragraph enclosing ``node``.
+
+    Text boxes and shapes anchored in a paragraph contain their own paragraphs; their
+    text is not part of the anchoring paragraph and must never be rewritten through it.
+    """
+
+    return next(node.iterancestors(_P_TAG), None) is paragraph
+
+
+def _own_text_nodes(node: etree._Element, paragraph: etree._Element) -> list[etree._Element]:
+    candidates = [node] if node.tag == _T_TAG else list(node.iter(_T_TAG))
+    return [text for text in candidates if _belongs_to(text, paragraph)]
+
+
+def _text(node: etree._Element, paragraph: etree._Element) -> str:
+    return "".join(text.text or "" for text in _own_text_nodes(node, paragraph))
+
+
+def _has_own_alternate_content(paragraph: etree._Element) -> bool:
+    for text in _own_text_nodes(paragraph, paragraph):
+        for ancestor in text.iterancestors():
+            if ancestor is paragraph:
+                break
+            if ancestor.tag == _ALTERNATE_CONTENT_TAG:
+                return True
+    return False
 
 
 def _reject_reserved_link_text(value: str) -> None:
@@ -241,25 +335,31 @@ def _paragraph_block(
     link_number: int,
     hyperlink_relationships: set[str],
 ) -> tuple[DocxBlock | None, int]:
-    if paragraph.xpath(".//w:fldChar | .//w:instrText | .//w:fldSimple", namespaces=_NS):
+    if any(_belongs_to(element, paragraph) for element in paragraph.iter(*_FIELD_TAGS)):
         return None, link_number
-    direct_hyperlinks = paragraph.xpath("./w:hyperlink", namespaces=_NS)
-    all_hyperlinks = paragraph.xpath(".//w:hyperlink", namespaces=_NS)
-    if len(direct_hyperlinks) != len(all_hyperlinks):
+    if _has_own_alternate_content(paragraph):
+        # Alternative renderings of the same text (for example a symbol with a legacy
+        # fallback) cannot be rewritten consistently, so the paragraph stays untouched.
+        return None, link_number
+    direct_hyperlinks = [child for child in paragraph if child.tag == _HYPERLINK_TAG]
+    own_hyperlinks = [
+        link for link in paragraph.iter(_HYPERLINK_TAG) if _belongs_to(link, paragraph)
+    ]
+    if len(direct_hyperlinks) != len(own_hyperlinks):
         raise DocxError(
             "unsupported_docx_hyperlink",
             "The DOCX contains a nested hyperlink that cannot be edited safely.",
         )
     parts: list[str] = []
     for child in paragraph:
-        if child.tag == f"{{{_W}}}pPr":
+        if child.tag == _PPR_TAG:
             continue
-        if child.tag != f"{{{_W}}}hyperlink":
-            value = _text(child)
+        if child.tag != _HYPERLINK_TAG:
+            value = _text(child, paragraph)
             _reject_reserved_link_text(value)
             parts.append(value)
             continue
-        display = _text(child)
+        display = _text(child, paragraph)
         if not display:
             # Image-only links and other non-text hyperlinks remain untouched. Omitting
             # the paragraph prevents a rewrite from moving text around the protected link.
@@ -283,7 +383,7 @@ def _paragraph_block(
     text = "".join(parts)
     if not text:
         return None, link_number
-    kind = "table_cell" if paragraph.xpath("ancestor::w:tc", namespaces=_NS) else "paragraph"
+    kind = "table_cell" if _IN_TABLE_CELL(paragraph) else "paragraph"
     return DocxBlock(id=f"p{block_number:06d}", kind=kind, text=text), link_number
 
 
@@ -296,12 +396,16 @@ def _parse_package(content: bytes, *, max_uncompressed_bytes: int) -> _ParsedPac
         names = {info.filename for info in infos}
         _validate_content_types(archive, names)
         hyperlink_relationships = _hyperlink_relationships(archive, names)
-        root = _xml(archive.read(_DOCUMENT_PART), label="document")
+        root = _xml(
+            archive.read(_DOCUMENT_PART),
+            label="document",
+            max_bytes=_xml_part_limit(max_uncompressed_bytes),
+        )
         _reject_unsupported_markup(root)
         blocks: list[DocxBlock] = []
         editable: list[etree._Element] = []
         link_number = 0
-        for paragraph in root.xpath(".//w:body//w:p", namespaces=_NS):
+        for paragraph in _BODY_PARAGRAPHS(root):
             block, link_number = _paragraph_block(
                 paragraph,
                 block_number=len(blocks) + 1,
@@ -495,17 +599,18 @@ def _insert_plain_run(
 
 def _patch_paragraph(paragraph: etree._Element, replacement: DocxReplacement) -> None:
     plain_parts, replacement_links = _link_parts(replacement.text)
-    hyperlinks = list(paragraph.xpath("./w:hyperlink", namespaces=_NS))
+    hyperlinks = [child for child in paragraph if child.tag == _HYPERLINK_TAG]
     if len(hyperlinks) != len(replacement_links):
         raise DocxError("invalid_docx_blocks", "The DOCX template no longer matches its blocks.")
     segments: list[list[etree._Element]] = [[]]
     for child in paragraph:
-        if child.tag == f"{{{_W}}}pPr":
+        if child.tag == _PPR_TAG:
             continue
-        if child.tag == f"{{{_W}}}hyperlink":
+        if child.tag == _HYPERLINK_TAG:
             segments.append([])
         else:
-            segments[-1].extend(child.xpath(".//w:t", namespaces=_NS))
+            # Only the paragraph's own text: text boxes anchored here keep theirs.
+            segments[-1].extend(_own_text_nodes(child, paragraph))
     if len(segments) != len(plain_parts):
         raise DocxError("invalid_docx_blocks", "The DOCX template no longer matches its blocks.")
     for index, (nodes, value) in enumerate(zip(segments, plain_parts, strict=True)):
@@ -515,10 +620,32 @@ def _patch_paragraph(paragraph: etree._Element, replacement: DocxReplacement) ->
             before = hyperlinks[index] if index < len(hyperlinks) else None
             _insert_plain_run(paragraph, value, before=before)
     for hyperlink, (_, display) in zip(hyperlinks, replacement_links, strict=True):
-        nodes = list(hyperlink.xpath(".//w:t", namespaces=_NS))
+        nodes = _own_text_nodes(hyperlink, paragraph)
         if not nodes:
             raise DocxError("invalid_docx_blocks", "The DOCX hyperlink has no editable text.")
         _write_text_nodes(nodes, display)
+
+
+_OUTDATED_TEMPLATE_MESSAGE = (
+    "This Word document was imported by an earlier Oveo version that could not edit its "
+    "layout safely. Upload the document again to continue editing it."
+)
+
+
+def require_matching_blocks(blocks: Sequence[DocxBlock], stored: object) -> None:
+    """Fail closed when a template no longer yields the block map stored at upload.
+
+    Earlier extraction read text-box paragraphs as extra blocks. Applying such a map to
+    today's parse would move text between paragraphs, so the document must be uploaded
+    again instead.
+    """
+
+    try:
+        matches = docx_blocks_from_storage(stored) == tuple(blocks)
+    except DocxError:
+        matches = False
+    if not matches:
+        raise DocxError("docx_template_outdated", _OUTDATED_TEMPLATE_MESSAGE)
 
 
 def render_docx(
@@ -526,9 +653,12 @@ def render_docx(
     replacements: Sequence[DocxReplacement | Mapping[str, object]],
     *,
     max_uncompressed_bytes: int = MAX_DOCX_UNCOMPRESSED_BYTES,
+    stored_blocks: object | None = None,
 ) -> bytes:
     parsed = _parse_package(template, max_uncompressed_bytes=max_uncompressed_bytes)
     try:
+        if stored_blocks is not None:
+            require_matching_blocks(parsed.blocks, stored_blocks)
         validated = validate_replacements(parsed.blocks, replacements)
         for paragraph, replacement in zip(parsed.editable, validated, strict=True):
             _patch_paragraph(paragraph, replacement)
@@ -563,5 +693,6 @@ __all__ = [
     "extract_docx",
     "plain_text_from_replacements",
     "render_docx",
+    "require_matching_blocks",
     "validate_replacements",
 ]

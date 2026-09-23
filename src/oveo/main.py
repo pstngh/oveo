@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -133,7 +132,7 @@ def create_app(
             validate_production_settings(app_settings)
             # Tokenizer initialization performs synchronous cache I/O. Finish it before the
             # server reports readiness so the first generation cannot stall every request.
-            await asyncio.to_thread(warm_tokenizer)
+            await manager.token_worker.run(warm_tokenizer, wait=True)
             await seed_configured_accounts(app_database, app_settings)
             await manager.reconcile_orphans()
             await manager.sweep_orphan_attachments()
@@ -189,6 +188,7 @@ def create_app(
         return JSONResponse(
             status_code=exc.status_code,
             content={"code": exc.code, "message": exc.message},
+            headers=exc.headers,
         )
 
     @app.exception_handler(RequestValidationError)

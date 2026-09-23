@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import re
 import time
+import zipfile
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any, cast
@@ -14,6 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import select
+from sqlalchemy import update as sa_update
 from starlette.requests import Request
 
 import oveo.generation as generation_module
@@ -23,8 +26,8 @@ from oveo.db import Database
 from oveo.docx import DOCX_MEDIA_TYPE, ExtractedDocx, extract_docx
 from oveo.generation import ProviderCompletion, ProviderRequest
 from oveo.main import create_app, seed_configured_accounts, validate_production_settings
-from oveo.models import Base, User
-from tests.docx_fixtures import make_docx
+from oveo.models import Attachment, Base, User
+from tests.docx_fixtures import make_docx, textbox_document
 
 _SUCCESS = (
     b'{"v":1,"event":"response_start"}\n'
@@ -703,3 +706,136 @@ def test_production_configuration_rejects_missing_and_malformed_secrets() -> Non
     )
     with pytest.raises(RuntimeError, match="valid Argon2id"):
         validate_production_settings(malformed)
+
+
+class TextboxDocxProvider:
+    """Answers for the two-block text-box fixture; optionally mismatched first."""
+
+    def __init__(self, *, mismatch_first: bool = False) -> None:
+        self.chat_requests: list[ProviderRequest] = []
+        self.mismatch_first = mismatch_first
+
+    async def generate(
+        self, request: ProviderRequest, emit: object, cancel_event: asyncio.Event
+    ) -> ProviderCompletion:
+        del cancel_event
+        if request.purpose == "title":
+            await emit(b"Quarterly Results")  # type: ignore[operator]
+            return ProviderCompletion(cost_microusd=1)
+        self.chat_requests.append(request)
+        blocks = ["Paragraphe d'introduction.", "Les résultats ont progressé."]
+        visible = "\n\n".join(blocks)
+        if self.mismatch_first and len(self.chat_requests) == 1:
+            visible = "Paragraphe d'introduction."  # omits the second block
+        events = [
+            {"v": 1, "event": "response_start"},
+            {"v": 1, "event": "block_start", "id": "b1", "type": "deliverable"},
+            {"v": 1, "event": "block_delta", "id": "b1", "text": visible},
+            {"v": 1, "event": "block_end", "id": "b1"},
+            {
+                "v": 1,
+                "event": "state",
+                "operation": "establish",
+                "brief": {"direction": "en-US-fr-CA"},
+                "docx_blocks": [
+                    {"id": f"p{index:06d}", "text": text}
+                    for index, text in enumerate(blocks, start=1)
+                ],
+            },
+            {"v": 1, "event": "response_end"},
+        ]
+        payload = "\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n"
+        await emit(payload.encode())  # type: ignore[operator]
+        return ProviderCompletion(cost_microusd=1)
+
+
+def _upload_textbox_source(client: TestClient, headers: dict[str, str], request_id: str) -> str:
+    submitted = client.post(
+        "/api/threads",
+        data={"mode": "translate", "text": "Translate this.", "client_request_id": request_id},
+        files={
+            "attachment": (
+                "report.docx",
+                make_docx(document_xml=textbox_document(anchor_first=True)),
+                DOCX_MEDIA_TYPE,
+            )
+        },
+        headers=headers,
+    )
+    assert submitted.status_code == 200
+    ids = submitted.json()
+    assert _wait_generation(client, ids["generation_id"])["status"] == "completed"
+    return cast(str, ids["thread_id"])
+
+
+def test_text_box_document_round_trips_without_touching_the_text_box(
+    api_client: TestClient,
+) -> None:
+    provider = TextboxDocxProvider()
+    api_client.app.state.generation_manager.provider = provider
+    _, csrf = _login(api_client, "charles", "charles password")
+    headers = {"X-CSRF-Token": csrf, "Origin": "http://testserver"}
+    thread_id = _upload_textbox_source(api_client, headers, "textbox")
+
+    untrusted = provider.chat_requests[0].snapshot["provider_messages"][1]["content"]
+    assert "Callout text" not in untrusted  # text-box text is never offered for editing
+    downloaded = api_client.get(f"/api/threads/{thread_id}/document.docx")
+    assert downloaded.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(downloaded.content)) as archive:
+        document = archive.read("word/document.xml").decode()
+    assert document.count("Callout text") == 2
+    assert "Les résultats ont progressé." in document
+    assert "Quarterly results improved." not in document
+
+
+def test_deliverable_that_disagrees_with_docx_blocks_gets_one_strict_retry(
+    api_client: TestClient,
+) -> None:
+    provider = TextboxDocxProvider(mismatch_first=True)
+    api_client.app.state.generation_manager.provider = provider
+    _, csrf = _login(api_client, "charles", "charles password")
+    headers = {"X-CSRF-Token": csrf, "Origin": "http://testserver"}
+    _upload_textbox_source(api_client, headers, "textbox-mismatch")
+    assert len(provider.chat_requests) == 2
+    retry_system = provider.chat_requests[1].snapshot["provider_messages"][0]["content"]
+    assert "docx_blocks' clean text" in retry_system
+
+
+def test_export_fails_closed_for_outdated_maps_and_turns_away_when_busy(
+    api_client: TestClient,
+) -> None:
+    api_client.app.state.generation_manager.provider = TextboxDocxProvider()
+    _, csrf = _login(api_client, "charles", "charles password")
+    headers = {"X-CSRF-Token": csrf, "Origin": "http://testserver"}
+    thread_id = _upload_textbox_source(api_client, headers, "textbox-export")
+
+    worker = api_client.app.state.generation_manager.docx_worker
+    worker._pending = 2  # simulate one running and one waiting document job
+    try:
+        busy = api_client.get(f"/api/threads/{thread_id}/document.docx")
+    finally:
+        worker._pending = 0
+    assert busy.status_code == 503
+    assert busy.headers["retry-after"] == "5"
+    assert busy.json()["code"] == "document_worker_busy"
+
+    # Simulate a block map stored by the earlier extractor for this package.
+    async def store_legacy_map() -> None:
+        database = api_client.app.state.database
+        async with database.sessions() as db:
+            await db.execute(
+                sa_update(Attachment).values(
+                    document_blocks=[
+                        {"id": "p000001", "kind": "paragraph", "text": "Intro paragraph."},
+                        {"id": "p000002", "kind": "paragraph", "text": "Callout text"},
+                        {"id": "p000003", "kind": "paragraph", "text": "Callout text"},
+                    ]
+                )
+            )
+            await db.commit()
+
+    api_client.portal.call(store_legacy_map)  # type: ignore[union-attr]
+    outdated = api_client.get(f"/api/threads/{thread_id}/document.docx")
+    assert outdated.status_code == 409
+    assert outdated.json()["code"] == "docx_template_outdated"
+    assert "Upload the document again" in outdated.json()["message"]

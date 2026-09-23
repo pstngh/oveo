@@ -90,3 +90,39 @@ def make_docx(
         for name, data in parts.items():
             archive.writestr(name, data)
     return output.getvalue()
+
+
+TEXTBOX_NAMESPACES = (
+    f'xmlns:w="{W}" xmlns:r="{R}" '
+    'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
+    'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+    'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+    'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" '
+    'xmlns:v="urn:schemas-microsoft-com:vml" mc:Ignorable="wps"'
+)
+
+
+def textbox_run(inner: str) -> str:
+    # Word's standard floating text box: DrawingML choice plus a VML fallback, each
+    # holding its own paragraphs inside w:txbxContent.
+    return (
+        '<w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><wp:anchor>'
+        '<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/'
+        f'wordprocessingShape"><wps:wsp><wps:txbx><w:txbxContent>{inner}</w:txbxContent>'
+        "</wps:txbx></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing>"
+        "</mc:Choice><mc:Fallback><w:pict><v:shape><v:textbox>"
+        f"<w:txbxContent>{inner}</w:txbxContent></v:textbox></v:shape></w:pict>"
+        "</mc:Fallback></mc:AlternateContent></w:r>"
+    )
+
+
+def textbox_document(*, anchor_first: bool, box: str | None = None) -> str:
+    inner = box or "<w:p><w:r><w:t>Callout text</w:t></w:r></w:p>"
+    body = "<w:r><w:t>Quarterly results improved.</w:t></w:r>"
+    paragraph = textbox_run(inner) + body if anchor_first else body + textbox_run(inner)
+    return (
+        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document '
+        f"{TEXTBOX_NAMESPACES}><w:body>"
+        "<w:p><w:r><w:t>Intro paragraph.</w:t></w:r></w:p>"
+        f"<w:p>{paragraph}</w:p><w:sectPr/></w:body></w:document>"
+    )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -13,9 +14,11 @@ import pytest
 from pydantic import SecretStr
 from sqlalchemy import func, select
 
+from oveo.attachments import ValidatedAttachment
 from oveo.auth import hash_password
 from oveo.config import Settings
 from oveo.db import Database
+from oveo.docx import DocxBlock
 from oveo.generation import (
     ActiveGenerationError,
     GenerationManager,
@@ -40,6 +43,7 @@ from oveo.protocol import (
     StateOperation,
 )
 from oveo.provider import OpenRouterClient
+from tests.docx_fixtures import make_docx, textbox_document
 
 
 def _document(state: StateOperation, visible: str) -> ProtocolDocument:
@@ -1630,4 +1634,64 @@ async def test_append_derives_the_addition_and_refuses_ambiguous_whole_documents
         latest = await db.scalar(select(WorkVersion).where(WorkVersion.version_no == 2))
     assert latest is not None
     assert (latest.source_text, latest.output_text) == ("One. Two.", "Un. Deux.")
+    await manager.shutdown()
+
+
+async def test_outdated_stored_docx_map_fails_closed_and_keeps_the_response(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, settings, user = manager_database
+    package = make_docx(document_xml=textbox_document(anchor_first=True))
+    # The block map the earlier extractor stored for this package (text-box text folded
+    # into the anchoring paragraph and repeated as extra blocks).
+    legacy_texts = [
+        "Intro paragraph.",
+        "Callout textCallout textQuarterly results improved.",
+        "Callout text",
+        "Callout text",
+    ]
+    attachment = ValidatedAttachment(
+        original_name="legacy.docx",
+        content=package,
+        byte_count=len(package),
+        word_count=8,
+        sha256=hashlib.sha256(package).hexdigest(),
+        document_blocks=tuple(
+            DocxBlock(id=f"p{index:06d}", kind="paragraph", text=text)
+            for index, text in enumerate(legacy_texts, start=1)
+        ),
+    )
+    visible = "\n\n".join(text.upper() for text in legacy_texts)
+    provider = ScriptedProvider(
+        [
+            _response_stream(
+                visible,
+                {
+                    "operation": "establish",
+                    "brief": {"direction": "en-fr"},
+                    "docx_blocks": [
+                        {"id": f"p{index:06d}", "text": text.upper()}
+                        for index, text in enumerate(legacy_texts, start=1)
+                    ],
+                },
+            )
+        ]
+    )
+    manager = GenerationManager(database, settings, provider)
+    submitted = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="legacy-map",
+        text="Translate the attached document.",
+        attachment=attachment,
+        owner_id=user.id,
+        mode="translate",
+    )
+    failed = await _wait_status(manager, submitted.generation_id, {"failed"})
+
+    assert failed["error_code"] == "docx_template_outdated"
+    assert "Upload the document again" in str(failed["error_message"])
+    assert failed["blocks"] == [{"type": "deliverable", "text": visible}]
+    assert len(provider.requests) == 1
+    async with database.sessions() as db:
+        assert await db.scalar(select(func.count()).select_from(WorkVersion)) == 0
     await manager.shutdown()

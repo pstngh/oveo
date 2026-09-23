@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import io
+import threading
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -15,14 +18,24 @@ from oveo.attachments import (
 )
 from oveo.provider import parse_usage
 from oveo.usage import format_lifetime_cost
+from oveo.workers import BoundedWorker
 from tests.docx_fixtures import make_docx
 
 
+@pytest.fixture
+def docx_worker() -> Iterator[BoundedWorker]:
+    worker = BoundedWorker("test-docx", max_pending=1)
+    try:
+        yield worker
+    finally:
+        worker.close()
+
+
 @pytest.mark.asyncio
-async def test_docx_upload_is_extracted() -> None:
+async def test_docx_upload_is_extracted(docx_worker: BoundedWorker) -> None:
     content = make_docx()
     upload = UploadFile(filename="source.DOCX", file=io.BytesIO(content))
-    result = await validate_attachment_upload(upload, max_bytes=len(content))
+    result = await validate_attachment_upload(upload, max_bytes=len(content), worker=docx_worker)
     assert result.word_count == 4
     assert [block.text for block in result.document_blocks] == [
         "Hello {{OVEO_LINK_l000001}}site{{/OVEO_LINK_l000001}}.",
@@ -31,16 +44,43 @@ async def test_docx_upload_is_extracted() -> None:
 
 
 @pytest.mark.asyncio
-async def test_upload_rejects_text_files_and_byte_overflow() -> None:
+async def test_upload_rejects_text_files_and_byte_overflow(docx_worker: BoundedWorker) -> None:
     text_upload = UploadFile(filename="source.txt", file=io.BytesIO(b"legacy"))
     with pytest.raises(AttachmentError, match=r"Only \.docx") as invalid_type:
-        await validate_attachment_upload(text_upload, max_bytes=100)
+        await validate_attachment_upload(text_upload, max_bytes=100, worker=docx_worker)
     assert invalid_type.value.code == "invalid_attachment_type"
 
     oversized = UploadFile(filename="source.docx", file=io.BytesIO(b"1234"))
     with pytest.raises(AttachmentError) as error:
-        await validate_attachment_upload(oversized, max_bytes=3)
+        await validate_attachment_upload(oversized, max_bytes=3, worker=docx_worker)
     assert error.value.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_busy_document_worker_turns_uploads_away_instead_of_queueing() -> None:
+    worker = BoundedWorker("test-docx-busy", max_pending=2)
+    release = threading.Event()
+    try:
+        running = asyncio.create_task(worker.run(release.wait))
+        waiting = asyncio.create_task(worker.run(release.wait))
+        await asyncio.sleep(0.05)
+        assert worker.pending == 2
+        content = make_docx()
+        upload = UploadFile(filename="source.docx", file=io.BytesIO(content))
+        with pytest.raises(AttachmentError) as busy:
+            await validate_attachment_upload(upload, max_bytes=len(content), worker=worker)
+        assert (busy.value.status_code, busy.value.code) == (503, "document_worker_busy")
+        release.set()
+        assert await running is True
+        assert await waiting is True
+        # Admission reopens once the thread has actually finished the earlier jobs.
+        upload = UploadFile(filename="source.docx", file=io.BytesIO(content))
+        result = await validate_attachment_upload(upload, max_bytes=len(content), worker=worker)
+        assert result.word_count == 4
+        assert worker.pending == 0
+    finally:
+        release.set()
+        worker.close()
 
 
 def test_attachment_storage_name_cannot_escape_its_directory(tmp_path: Path) -> None:

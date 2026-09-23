@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
+import threading
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -73,6 +76,34 @@ def warm_tokenizer() -> None:
     _model_encoding()
 
 
+_TOKEN_CACHE_SIZE = 64
+_token_cache: OrderedDict[bytes, int] = OrderedDict()
+_token_cache_lock = threading.Lock()
+
+
+def count_text_tokens(text: str) -> int:
+    """Estimate one text's tokens, reusing counts for identical text.
+
+    Compaction and preflight checks count the same system prompt and transcript
+    envelopes repeatedly. Entries are keyed by a SHA-256 digest so the cache never
+    holds conversation text itself.
+    """
+
+    digest = hashlib.sha256(text.encode("utf-8", "surrogatepass")).digest()
+    with _token_cache_lock:
+        cached = _token_cache.get(digest)
+        if cached is not None:
+            _token_cache.move_to_end(digest)
+            return cached
+    count = len(_model_encoding().encode(text, disallowed_special=()))
+    with _token_cache_lock:
+        _token_cache[digest] = count
+        _token_cache.move_to_end(digest)
+        while len(_token_cache) > _TOKEN_CACHE_SIZE:
+            _token_cache.popitem(last=False)
+    return count
+
+
 def count_input_tokens(messages: Sequence[ProviderMessage]) -> int:
     """Count model input tokens with a small allowance for chat framing.
 
@@ -81,12 +112,11 @@ def count_input_tokens(messages: Sequence[ProviderMessage]) -> int:
     and the default 32K-token margin absorbs provider serialization differences.
     """
 
-    encoding = _model_encoding()
     total = 3  # Assistant reply priming.
     for message in messages:
         total += 4  # Per-message role and framing markers.
-        total += len(encoding.encode(message.role, disallowed_special=()))
-        total += len(encoding.encode(message.content, disallowed_special=()))
+        total += count_text_tokens(message.role)
+        total += count_text_tokens(message.content)
     return total
 
 
