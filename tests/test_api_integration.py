@@ -61,20 +61,18 @@ def _docx_protocol_response(*, second_version: bool) -> bytes:
             "event": "state",
             "operation": "full",
             "base_version": 1,
-            "output": output,
             "docx_blocks": [
                 {"id": "p000001", "text": f"Salut {protected_link}."},
                 {"id": "p000002", "text": "Cellule révisée"},
             ],
         }
     else:
+        # The deliverable is the output and the uploaded DOCX is the source.
         output = "Bonjour portail!\n\nTexte de cellule"
         state = {
             "v": 1,
             "event": "state",
             "operation": "establish",
-            "source": "Hello site.\n\nCell text",
-            "output": output,
             "brief": {"direction": "en-US-fr-CA"},
             "docx_blocks": [
                 {"id": "p000001", "text": f"Bonjour {protected_link}!"},
@@ -135,7 +133,6 @@ class ReferenceProvider:
                     "event": "state",
                     "operation": "establish",
                     "source": source,
-                    "output": output,
                     "brief": {"depth": "revision", "locale": "fr-CA"},
                 },
                 {"v": 1, "event": "response_end"},

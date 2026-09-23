@@ -1,4 +1,5 @@
 import json
+import time
 
 import pytest
 
@@ -89,21 +90,17 @@ def test_decoder_returns_each_typed_state_operation() -> None:
         {
             "operation": "establish",
             "source": "Complete source.",
-            "output": "Source complète.",
             "brief": {"direction": "en-US-fr-CA", "tone": "professional"},
         }
     )
     assert establish == EstablishState(
         source="Complete source.",
-        output="Source complète.",
         brief={"direction": "en-US-fr-CA", "tone": "professional"},
     )
 
     docx_establish = decode_state(
         {
             "operation": "establish",
-            "source": "Source link",
-            "output": "Sortie lien",
             "brief": {"direction": "en-fr"},
             "docx_blocks": [
                 {
@@ -114,8 +111,6 @@ def test_decoder_returns_each_typed_state_operation() -> None:
         }
     )
     assert docx_establish == EstablishState(
-        source="Source link",
-        output="Sortie lien",
         brief={"direction": "en-fr"},
         docx_blocks=(
             DocxBlockReplacement(
@@ -184,14 +179,12 @@ def test_decoder_returns_each_typed_state_operation() -> None:
         {
             "operation": "full",
             "base_version": 4,
-            "output": "Complete replacement.",
             "source": "Complete revised source.",
             "brief": {"audience": "employees"},
         }
     )
     assert full == FullState(
         base_version=4,
-        output="Complete replacement.",
         source="Complete revised source.",
         brief={"audience": "employees"},
     )
@@ -201,7 +194,6 @@ def test_docx_state_requires_consecutive_bounded_block_ids() -> None:
     state = {
         "operation": "full",
         "base_version": 1,
-        "output": "Updated",
         "docx_blocks": [{"id": "p000002", "text": "Updated"}],
     }
     with pytest.raises(ProtocolError, match="invalid_docx_blocks"):
@@ -299,7 +291,6 @@ def test_conversation_blocks_can_only_have_none_state() -> None:
                 {
                     "operation": "establish",
                     "source": "Source",
-                    "output": "Output",
                     "brief": {"purpose": "test"},
                 },
                 block_type="conversation",
@@ -324,7 +315,6 @@ def test_conversation_blocks_can_only_have_none_state() -> None:
         {
             "operation": "full",
             "base_version": 1,
-            "output": "output",
             "source": None,
         },
         {
@@ -369,7 +359,6 @@ def test_state_bounds_text_brief_replacements_and_duplicate_anchors() -> None:
                 {
                     "operation": "establish",
                     "source": "source",
-                    "output": "output",
                     "brief": {"purpose": "test"},
                 }
             )
@@ -500,3 +489,64 @@ def test_append_rejects_unknown_or_missing_separator(separator: object) -> None:
     }
     with pytest.raises(ProtocolError):
         ProtocolDecoder().feed(complete_stream(state))
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"operation": "establish", "source": "s", "output": "Visible", "brief": {"a": "b"}},
+        {"operation": "full", "base_version": 1, "output": "Visible"},
+    ],
+)
+def test_state_never_repeats_the_deliverable_as_output(state: dict[str, object]) -> None:
+    with pytest.raises(ProtocolError) as caught:
+        ProtocolDecoder().feed(complete_stream(state))
+    assert caught.value.code == "invalid_event_fields"
+
+
+def test_optional_fields_are_derived_by_the_application() -> None:
+    assert decode_state({"operation": "establish", "brief": {"scope": "docx"}}) == (
+        EstablishState(brief={"scope": "docx"})
+    )
+    assert decode_state({"operation": "full", "base_version": 2}) == FullState(base_version=2)
+    assert decode_state(
+        {
+            "operation": "append",
+            "base_version": 1,
+            "source_addition": "More",
+            "source_separator": "space",
+            "output_separator": "space",
+        }
+    ) == AppendState(
+        base_version=1,
+        source_addition="More",
+        source_separator="space",
+        output_separator="space",
+    )
+
+
+def test_decoder_is_byte_split_invariant_and_linear_in_line_length() -> None:
+    text = "é" * 600_000 + "🌍"
+    stream = b"".join(
+        (
+            event({"v": 1, "event": "response_start"}),
+            event({"v": 1, "event": "block_start", "id": "b1", "type": "deliverable"}),
+            event({"v": 1, "event": "block_delta", "id": "b1", "text": text}),
+            event({"v": 1, "event": "block_end", "id": "b1"}),
+            event({"v": 1, "event": "state", "operation": "none"}),
+            event({"v": 1, "event": "response_end"}),
+        )
+    )
+    whole = ProtocolDecoder()
+    whole.feed(stream)
+    expected = whole.finish()
+
+    split = ProtocolDecoder()
+    started = time.perf_counter()
+    for start in range(0, len(stream), 16):
+        split.feed(stream[start : start + 16])
+    elapsed = time.perf_counter() - started
+    assert split.finish() == expected
+    # The former re-concatenating buffer needed seconds for a line this long (audit
+    # probe p09: 600,000 characters took 5.6 s); the pieces list keeps it linear.
+    assert elapsed < 2.0

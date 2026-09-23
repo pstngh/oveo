@@ -23,8 +23,15 @@ _PROVIDER_ROUTING: dict[str, object] = {
     "zdr": True,
 }
 
+# Effort levels OpenRouter publishes for this model (GET /api/v1/models, 2026-09-23).
+ReasoningEffort = Literal["max", "xhigh", "high", "medium", "low", "none"]
+_REASONING_EFFORTS: frozenset[str] = frozenset({"max", "xhigh", "high", "medium", "low", "none"})
+
 Role = Literal["system", "user", "assistant"]
 DeltaCallback = Callable[[str], Awaitable[None] | None]
+# Called once per attempt with (x-request-id, OpenRouter generation id) as soon as the
+# generation id is known, so an abandoned or failed call can still be reconciled.
+IdsCallback = Callable[[str | None, str], Awaitable[None]]
 Sleep = Callable[[float], Awaitable[None]]
 
 
@@ -41,6 +48,7 @@ class ProviderUsage:
     total_tokens: int | None
     cost_usd: Decimal | None
     cost_microusd: int | None
+    reasoning_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,12 +157,18 @@ def parse_usage(value: object) -> ProviderUsage | None:
     if not isinstance(value, Mapping):
         return None
     cost_usd, cost_microusd = _cost(value.get("cost"))
+    details = value.get("completion_tokens_details")
     usage = ProviderUsage(
         input_tokens=_nonnegative_int(value.get("prompt_tokens")),
         output_tokens=_nonnegative_int(value.get("completion_tokens")),
         total_tokens=_nonnegative_int(value.get("total_tokens")),
         cost_usd=cost_usd,
         cost_microusd=cost_microusd,
+        reasoning_tokens=(
+            _nonnegative_int(details.get("reasoning_tokens"))
+            if isinstance(details, Mapping)
+            else None
+        ),
     )
     if all(
         field is None
@@ -208,8 +222,7 @@ class OpenRouterClient:
         client: httpx.AsyncClient | None = None,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
-        if settings.openrouter_model != OPENROUTER_MODEL:
-            raise ValueError(f"OpenRouter model must remain {OPENROUTER_MODEL}")
+        # The model is pinned in code (OPENROUTER_MODEL); there is no setting to change it.
         if settings.openrouter_api_key is None:
             raise ProviderError("provider_not_configured", retryable=False)
         self._settings = settings
@@ -233,11 +246,14 @@ class OpenRouterClient:
         messages: Sequence[ProviderMessage],
         *,
         max_completion_tokens: int,
+        reasoning_effort: ReasoningEffort = "high",
     ) -> dict[str, object]:
         if not messages:
             raise ValueError("at least one provider message is required")
         if max_completion_tokens < 1:
             raise ValueError("max_completion_tokens must be positive")
+        if reasoning_effort not in _REASONING_EFFORTS:
+            raise ValueError("unsupported reasoning effort")
         serialized: list[dict[str, str]] = []
         for message in messages:
             if message.role not in {"system", "user", "assistant"}:
@@ -251,7 +267,7 @@ class OpenRouterClient:
             "stream": True,
             "stream_options": {"include_usage": True},
             "max_completion_tokens": max_completion_tokens,
-            "reasoning_effort": "high",
+            "reasoning_effort": reasoning_effort,
             "provider": dict(_PROVIDER_ROUTING),
         }
 
@@ -261,15 +277,22 @@ class OpenRouterClient:
         *,
         max_completion_tokens: int,
         on_delta: DeltaCallback,
+        reasoning_effort: ReasoningEffort = "high",
+        on_ids: IdsCallback | None = None,
+        deadline_seconds: float | None = None,
     ) -> ProviderCompletion:
         body = self.build_request_body(
             messages,
             max_completion_tokens=max_completion_tokens,
+            reasoning_effort=reasoning_effort,
         )
+        deadline = deadline_seconds or self._settings.provider_attempt_deadline_seconds
         attempts = self._settings.provider_retry_attempts
         for attempt in range(attempts):
             try:
-                return await self._stream_once(body, on_delta=on_delta)
+                return await self._stream_once(
+                    body, on_delta=on_delta, on_ids=on_ids, deadline_seconds=deadline
+                )
             except ProviderError as exc:
                 if not exc.retryable or exc.partial or attempt + 1 >= attempts:
                     raise
@@ -320,6 +343,8 @@ class OpenRouterClient:
         body: Mapping[str, object],
         *,
         on_delta: DeltaCallback,
+        on_ids: IdsCallback | None,
+        deadline_seconds: float,
     ) -> ProviderCompletion:
         url = f"{self._settings.openrouter_base_url.rstrip('/')}/chat/completions"
         headers = {
@@ -334,10 +359,27 @@ class OpenRouterClient:
         generation_id: str | None = None
         provider_name: str | None = None
         usage: ProviderUsage | None = None
+        finish_reason: str | None = None
         done = False
 
+        def failure(code: str, *, retryable: bool) -> ProviderError:
+            return ProviderError(
+                code,
+                retryable=retryable,
+                partial=emitted,
+                provider_request_id=request_id,
+                provider_generation_id=generation_id,
+                provider_name=provider_name,
+                usage=usage,
+            )
+
         try:
-            async with self._client.stream("POST", url, json=body, headers=headers) as response:
+            # OpenRouter keep-alive comments reset httpx's read timeout, so bound the whole
+            # attempt as well. Leaving the stream context aborts the upstream request.
+            async with (
+                asyncio.timeout(deadline_seconds),
+                self._client.stream("POST", url, json=body, headers=headers) as response,
+            ):
                 request_id = _safe_string(response.headers.get("x-request-id"))
                 if response.status_code < 200 or response.status_code >= 300:
                     raise _http_error(response.status_code, request_id=request_id)
@@ -351,21 +393,21 @@ class OpenRouterClient:
                         done = True
                         break
                     payload = self._decode_stream_payload(data)
+                    first_generation_id = generation_id is None
                     generation_id = _safe_string(payload.get("id")) or generation_id
+                    if first_generation_id and generation_id is not None and on_ids is not None:
+                        await on_ids(request_id, generation_id)
                     provider_name = _safe_string(payload.get("provider")) or provider_name
                     parsed_usage = parse_usage(payload.get("usage"))
                     if parsed_usage is not None:
                         usage = parsed_usage
                     if "error" in payload:
                         transient = _is_transient_code(_error_code(payload.get("error")))
-                        raise ProviderError(
+                        raise failure(
                             "provider_transient" if transient else "provider_rejected",
                             retryable=transient,
-                            provider_request_id=request_id,
-                            provider_generation_id=generation_id,
-                            provider_name=provider_name,
-                            usage=usage,
                         )
+                    finish_reason = self._finish_reason(payload) or finish_reason
                     for delta in self._content_deltas(payload):
                         parts.append(delta)
                         emitted = True
@@ -376,28 +418,21 @@ class OpenRouterClient:
             if emitted and not exc.partial:
                 raise exc.with_partial() from exc
             raise
+        except TimeoutError as exc:
+            # A stalled attempt is not replayed automatically: it may already be billed.
+            raise failure("provider_timeout", retryable=False) from exc
         except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
-            error = ProviderError(
-                "provider_network",
-                retryable=True,
-                partial=emitted,
-                provider_request_id=request_id,
-                provider_generation_id=generation_id,
-                provider_name=provider_name,
-                usage=usage,
-            )
-            raise error from exc
+            raise failure("provider_network", retryable=True) from exc
 
+        # A truncated or filtered response is final; replaying it would bill the same
+        # oversized work again. The caller reports it instead of treating it as a
+        # protocol error.
+        if finish_reason == "length":
+            raise failure("provider_output_limit", retryable=False)
+        if finish_reason == "content_filter":
+            raise failure("provider_content_filter", retryable=False)
         if not done:
-            raise ProviderError(
-                "provider_incomplete_stream",
-                retryable=True,
-                partial=emitted,
-                provider_request_id=request_id,
-                provider_generation_id=generation_id,
-                provider_name=provider_name,
-                usage=usage,
-            )
+            raise failure("provider_incomplete_stream", retryable=True)
         return ProviderCompletion(
             text="".join(parts),
             provider_request_id=request_id,
@@ -415,6 +450,18 @@ class OpenRouterClient:
         if not isinstance(payload, dict):
             raise ProviderError("provider_malformed_stream", retryable=False)
         return cast(dict[str, object], payload)
+
+    @staticmethod
+    def _finish_reason(payload: Mapping[str, object]) -> str | None:
+        choices = payload.get("choices")
+        if not isinstance(choices, list):
+            return None
+        for choice in choices:
+            if isinstance(choice, Mapping):
+                reason = choice.get("finish_reason")
+                if isinstance(reason, str) and reason:
+                    return reason
+        return None
 
     @staticmethod
     def _content_deltas(payload: Mapping[str, object]) -> tuple[str, ...]:

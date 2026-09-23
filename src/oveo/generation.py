@@ -66,7 +66,13 @@ from oveo.protocol import (
     ReplaceState,
     SourceOutputReplacement,
 )
-from oveo.provider import OpenRouterClient, ProviderMessage, count_input_tokens
+from oveo.provider import (
+    IdsCallback,
+    OpenRouterClient,
+    ProviderMessage,
+    ReasoningEffort,
+    count_input_tokens,
+)
 from oveo.provider import ProviderError as OpenRouterError
 from oveo.usage import append_usage_event
 
@@ -153,6 +159,8 @@ class ProviderRequest:
     purpose: str
     mode: str
     snapshot: Mapping[str, Any]
+    # Optional observer for the provider's call identifiers (see provider.IdsCallback).
+    on_provider_ids: IdsCallback | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,10 +190,34 @@ class UnavailableProvider:
         raise ProviderError("provider_not_configured")
 
 
+@dataclass(frozen=True, slots=True)
+class _PurposeLimits:
+    max_completion_tokens: int
+    reasoning_effort: ReasoningEffort
+    deadline_seconds: float | None = None
+
+
+# Maintenance calls get room for reasoning plus their small answers. A 2-6 word title
+# needs little reasoning, so it uses low effort with a short deadline. Summaries and
+# handoffs keep the chat effort because their quality carries into later turns.
+_MAINTENANCE_LIMITS: dict[str, _PurposeLimits] = {
+    "title": _PurposeLimits(512, "low", deadline_seconds=120.0),
+    "summary": _PurposeLimits(16_384, "high"),
+    "prompt_handoff": _PurposeLimits(16_384, "high"),
+}
+_PROVIDER_ERROR_CODES = {
+    "provider_incomplete_stream": "provider_stream_error",
+    "provider_malformed_stream": "provider_stream_error",
+    "provider_output_limit": "response_too_long",
+    "provider_content_filter": "provider_content_filtered",
+}
+
+
 class OpenRouterProvider:
     """Adapt the tested OpenRouter client to the generation-manager callback contract."""
 
     def __init__(self, settings: Settings) -> None:
+        self._settings = settings
         self._client = OpenRouterClient(settings)
 
     async def aclose(self) -> None:
@@ -204,6 +236,10 @@ class OpenRouterProvider:
         cancel_event: asyncio.Event,
     ) -> ProviderCompletion:
         messages = _snapshot_messages(request.snapshot, error_code="invalid_request_snapshot")
+        limits = _MAINTENANCE_LIMITS.get(
+            request.purpose,
+            _PurposeLimits(self._settings.chat_max_completion_tokens, "high"),
+        )
 
         async def on_delta(delta: str) -> None:
             if cancel_event.is_set():
@@ -211,21 +247,28 @@ class OpenRouterProvider:
             await emit(delta.encode("utf-8"))
 
         try:
-            token_limit = _COMPLETION_TOKEN_LIMITS.get(request.purpose, 32_000)
             completion = await self._client.stream_chat(
                 messages,
-                max_completion_tokens=token_limit,
+                max_completion_tokens=limits.max_completion_tokens,
+                reasoning_effort=limits.reasoning_effort,
                 on_delta=on_delta,
+                on_ids=request.on_provider_ids,
+                deadline_seconds=limits.deadline_seconds,
             )
         except OpenRouterError as exc:
             # OpenRouterClient has already exhausted safe pre-content retries.
-            code = (
-                "provider_stream_error"
-                if exc.code in {"provider_incomplete_stream", "provider_malformed_stream"}
-                else exc.code
-            )
+            if exc.code == "provider_output_limit":
+                # Content-free numbers that let an operator calibrate the output cap.
+                _LOGGER.error(
+                    "provider_output_limit purpose=%s max_completion_tokens=%s "
+                    "output_tokens=%s reasoning_tokens=%s",
+                    request.purpose,
+                    limits.max_completion_tokens,
+                    exc.usage.output_tokens if exc.usage else None,
+                    exc.usage.reasoning_tokens if exc.usage else None,
+                )
             raise ProviderError(
-                code,
+                _PROVIDER_ERROR_CODES.get(exc.code, exc.code),
                 provider_request_id=exc.provider_request_id,
                 provider_generation_id=exc.provider_generation_id,
                 cost_microusd=(exc.usage.cost_microusd if exc.usage else None),
@@ -245,7 +288,7 @@ class Submission:
 
 _TERMINAL = frozenset({"completed", "failed", "stopped"})
 _ACTIVE = frozenset({"queued", "running", "stopping"})
-_COMPLETION_TOKEN_LIMITS = {"title": 64, "summary": 2_048, "prompt_handoff": 4_096}
+_TRUNCATED_RESPONSE_CODES = frozenset({"response_too_long", "provider_content_filtered"})
 _MIN_RECENT_MESSAGES = 4
 _RECONCILE_BATCH_SIZE = 8
 _CANCEL_WAIT_SECONDS = 1.0
@@ -257,6 +300,12 @@ _ERROR_MESSAGES = {
     "provider_rejected": "The model provider rejected the request.",
     "provider_stream_error": (
         "The model provider returned an incomplete or invalid response stream."
+    ),
+    "provider_timeout": "The model provider did not finish this response in time.",
+    "provider_content_filtered": "The model provider's content filter stopped this response.",
+    "response_too_long": (
+        "This response reached the model's output limit before it was complete. "
+        "Shorten the document or split the request into smaller parts, then try again."
     ),
     "protocol_error": "The model returned an invalid response format.",
     "stale_state": (
@@ -320,28 +369,26 @@ def _append_text(base: str, addition: str, separator: str) -> str:
     return f"{base}{joiner}{addition}"
 
 
-def _validate_visible_state_correspondence(
-    document: ProtocolDocument,
-    *,
-    resulting_output: str,
-) -> None:
-    """Require one unambiguous visible representation for every mutation."""
+def _single_deliverable(document: ProtocolDocument) -> str:
+    """Return the one visible deliverable that every state mutation must carry."""
 
-    state = document.state
-    if isinstance(state, NoState):
-        return
     deliverables = [block.text for block in document.blocks if block.type == "deliverable"]
     if len(deliverables) != 1:
         raise ProtocolError("state_deliverable_count_mismatch")
-    visible = deliverables[0]
-    if isinstance(state, AppendState):
-        # Append deliberately displays just the new passage by default, while a user may
-        # explicitly request the complete updated document.
-        if visible not in {state.output_addition, resulting_output}:
-            raise ProtocolError("state_deliverable_mismatch")
-        return
-    if visible != resulting_output:
-        raise ProtocolError("state_deliverable_mismatch")
+    return deliverables[0]
+
+
+# Model mistakes in the state event that a strict protocol retry can repair.
+_REPAIRABLE_STATE_CODES = frozenset(
+    {
+        "state_deliverable_count_mismatch",
+        "state_deliverable_mismatch",
+        "state_source_missing",
+        "state_docx_source_mismatch",
+        "state_docx_output_mismatch",
+        "state_output_addition_missing",
+    }
+)
 
 
 def _parse_context_summary(raw: bytes) -> str:
@@ -1195,10 +1242,7 @@ class GenerationManager:
                             document=document,
                         )
                     except ProtocolError as exc:
-                        if exc.code in {
-                            "state_deliverable_count_mismatch",
-                            "state_deliverable_mismatch",
-                        }:
+                        if exc.code in _REPAIRABLE_STATE_CODES:
                             raise
                         if exc.code in {"state_base_missing", "state_base_mismatch"}:
                             raise StaleStateError from exc
@@ -1233,6 +1277,9 @@ class GenerationManager:
             raise ProtocolError("state_thread_missing")
         if isinstance(state, NoState):
             return
+        # The single visible deliverable is the canonical output (or append addition);
+        # the protocol no longer asks the model to repeat it in the state event.
+        visible = _single_deliverable(document)
 
         item = await db.scalar(
             select(WorkItem).where(
@@ -1280,8 +1327,7 @@ class GenerationManager:
             )
             db.add(item)
             await db.flush()
-            source = state.source
-            output = state.output
+            output = visible
             brief = state.brief
             version_no = 1
             parent_version_id = None
@@ -1290,12 +1336,18 @@ class GenerationManager:
                 if state_docx_blocks is None:
                     raise ProtocolError("state_docx_blocks_missing")
                 extracted = self._read_docx_template(source_docx)
-                if source != extracted.plain_text:
+                # The upload is the source. A redundant copy is accepted only if exact.
+                if state.source is not None and state.source != extracted.plain_text:
                     raise ProtocolError("state_docx_source_mismatch")
+                source = extracted.plain_text
                 docx_template_attachment_id = source_docx.id
                 template_blocks = extracted.blocks
-            elif state_docx_blocks is not None:
-                raise ProtocolError("state_docx_template_missing")
+            else:
+                if state_docx_blocks is not None:
+                    raise ProtocolError("state_docx_template_missing")
+                if state.source is None:
+                    raise ProtocolError("state_source_missing")
+                source = state.source
         else:
             if item is None or current is None:
                 raise ProtocolError("state_base_missing")
@@ -1331,7 +1383,20 @@ class GenerationManager:
 
             if isinstance(state, AppendState):
                 source = _append_text(source, state.source_addition, state.source_separator)
-                output = _append_text(output, state.output_addition, state.output_separator)
+                # Normally the deliverable is exactly the addition. When the user asked for
+                # the whole work, the state names the addition and the deliverable must be
+                # the complete joined output.
+                if state.output_addition is not None:
+                    addition = state.output_addition
+                elif visible.startswith(_append_text(output, "", state.output_separator)):
+                    # A complete joined document without the named addition would be
+                    # appended to itself.
+                    raise ProtocolError("state_output_addition_missing")
+                else:
+                    addition = visible
+                output = _append_text(output, addition, state.output_separator)
+                if visible not in {addition, output}:
+                    raise ProtocolError("state_deliverable_mismatch")
                 brief = state.brief if state.brief is not None else brief
             elif isinstance(state, ReplaceState):
                 source_replacements: list[tuple[str, str]] = []
@@ -1348,10 +1413,12 @@ class GenerationManager:
                     )
                 source = _apply_base_replacements(source, source_replacements, label="source")
                 output = _apply_base_replacements(output, output_replacements, label="output")
+                if visible != output:
+                    raise ProtocolError("state_deliverable_mismatch")
                 brief = state.brief if state.brief is not None else brief
             elif isinstance(state, FullState):
                 source = state.source if state.source is not None else source
-                output = state.output
+                output = visible
                 brief = state.brief if state.brief is not None else brief
             else:  # pragma: no cover - kept defensive for future protocol variants
                 raise ProtocolError("invalid_state_operation")
@@ -1369,7 +1436,6 @@ class GenerationManager:
                 raise ProtocolError("state_docx_output_mismatch")
             docx_blocks = [block.to_storage() for block in replacements]
 
-        _validate_visible_state_correspondence(document, resulting_output=output)
         if not source.strip() or not output.strip() or not brief:
             raise ProtocolError("invalid_canonical_state")
         source_word_count = count_words(source)
@@ -1756,6 +1822,9 @@ class GenerationManager:
                     exc,
                     purpose="summary",
                 )
+                if exc.code in _TRUNCATED_RESPONSE_CODES:
+                    # The user's turn is not what was cut off; report the compaction.
+                    raise ProviderError("context_compaction_failed") from exc
                 raise
 
             try:
@@ -1958,6 +2027,8 @@ class GenerationManager:
                 error,
                 purpose="prompt_handoff_compaction",
             )
+            if error.code in _TRUNCATED_RESPONSE_CODES:
+                raise ProviderError("context_compaction_failed") from exc
             raise error from exc
 
     async def _prepare_protocol_retry(self, generation_id: str, retry_number: int) -> bool:
@@ -1997,18 +2068,37 @@ class GenerationManager:
         guidance = {
             "state_deliverable_mismatch": (
                 "The visible deliverable differed from the canonical output. For "
-                "establish, full, or replace, make the deliverable exactly equal the "
-                "complete resulting output, character for character. For append, use "
-                "the exact output addition or the complete joined output."
+                "replace, make the deliverable exactly equal the complete output after "
+                "all replacements, character for character. For append, the deliverable "
+                "is the exact output addition, or the complete joined output together "
+                "with output_addition."
             ),
             "state_deliverable_count_mismatch": (
                 "A state mutation requires exactly one deliverable block. If you "
                 "present multiple alternatives, use operation none instead."
             ),
+            "state_source_missing": (
+                "An establish for text work must include the complete source. Only an "
+                "uploaded source DOCX lets the application supply the source."
+            ),
+            "state_docx_source_mismatch": (
+                "For an uploaded source DOCX, omit source: the application uses the "
+                "uploaded document."
+            ),
+            "state_docx_output_mismatch": (
+                "The deliverable must equal the returned docx_blocks' clean text: block "
+                "text joined in order with blank lines, keeping hyperlink display text "
+                "without its wrappers."
+            ),
+            "state_output_addition_missing": (
+                "The append deliverable showed the complete joined output, so the state "
+                "must name the exact output_addition."
+            ),
             "invalid_event_fields": (
                 "An event had missing or extra keys. Use only the exact keys for "
-                "each event and the chosen state operation in the protocol. Omit "
-                "unchanged optional state fields rather than adding null values."
+                "each event and the chosen state operation in the protocol. Never "
+                "repeat the deliverable as an output field. Omit unchanged optional "
+                "state fields rather than adding null values."
             ),
         }.get(error_code, "Check every event against the exact protocol schema.")
         reminder = (

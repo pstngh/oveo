@@ -49,20 +49,30 @@ class DocxBlockReplacement:
 
 @dataclass(frozen=True, slots=True)
 class EstablishState:
-    source: str
-    output: str
+    """A new work item whose complete output is the response's single deliverable.
+
+    ``source`` is omitted for an uploaded source DOCX; the server derives it from the
+    upload instead of asking the model to repeat the document.
+    """
+
     brief: dict[str, object]
+    source: str | None = None
     docx_blocks: tuple[DocxBlockReplacement, ...] | None = None
     operation: Literal["establish"] = "establish"
 
 
 @dataclass(frozen=True, slots=True)
 class AppendState:
+    """Exact additions; ``output_addition`` defaults to the visible deliverable.
+
+    It is required only when the deliverable shows the complete joined output.
+    """
+
     base_version: int
     source_addition: str
-    output_addition: str
     source_separator: AppendSeparator
     output_separator: AppendSeparator
+    output_addition: str | None = None
     brief: dict[str, object] | None = None
     operation: Literal["append"] = "append"
 
@@ -95,10 +105,11 @@ class ReplaceState:
 
 @dataclass(frozen=True, slots=True)
 class FullState:
+    """Replace the complete output with the response's single deliverable."""
+
     base_version: int
-    output: str
-    source: str | None
-    brief: dict[str, object] | None
+    source: str | None = None
+    brief: dict[str, object] | None = None
     docx_blocks: tuple[DocxBlockReplacement, ...] | None = None
     operation: Literal["full"] = "full"
 
@@ -328,7 +339,10 @@ class ProtocolDecoder:
         ):
             raise ValueError("protocol limits must be positive")
         self._utf8 = codecs.getincrementaldecoder("utf-8")("strict")
-        self._buffer = ""
+        # Pieces of the current unfinished line. Keeping them separate (rather than
+        # re-concatenating one growing string) makes decoding linear in stream size.
+        self._pending: list[str] = []
+        self._pending_bytes = 0
         self._max_line_bytes = max_line_bytes
         self._max_blocks = max_blocks
         self._max_text_chars = max_text_chars
@@ -353,20 +367,19 @@ class ProtocolDecoder:
         if self._completed and chunk:
             raise ProtocolError("data_after_response_end")
         try:
-            self._buffer += self._utf8.decode(chunk, final=False)
+            text = self._utf8.decode(chunk, final=False)
         except UnicodeDecodeError as exc:
             raise ProtocolError("invalid_utf8") from exc
-        return self._drain_complete_lines()
+        return self._drain_complete_lines(text)
 
     def finish(self) -> ProtocolDocument:
         try:
-            self._buffer += self._utf8.decode(b"", final=True)
+            text = self._utf8.decode(b"", final=True)
         except UnicodeDecodeError as exc:
             raise ProtocolError("invalid_utf8") from exc
-        self._drain_complete_lines()
-        if self._buffer:
-            line = self._buffer
-            self._buffer = ""
+        self._drain_complete_lines(text)
+        if self._pending:
+            line = self._take_pending()
             self._consume_line(line.removesuffix("\r"))
         if not self._completed:
             raise ProtocolError("incomplete_response")
@@ -382,13 +395,26 @@ class ProtocolDecoder:
             state=self._state,
         )
 
-    def _drain_complete_lines(self) -> tuple[ProtocolEvent, ...]:
+    def _take_pending(self) -> str:
+        line = "".join(self._pending)
+        self._pending.clear()
+        self._pending_bytes = 0
+        return line
+
+    def _drain_complete_lines(self, text: str) -> tuple[ProtocolEvent, ...]:
         events: list[ProtocolEvent] = []
-        while "\n" in self._buffer:
-            line, self._buffer = self._buffer.split("\n", 1)
-            events.append(self._consume_line(line.removesuffix("\r")))
-        if len(self._buffer.encode("utf-8")) > self._max_line_bytes:
-            raise ProtocolError("event_too_large")
+        start = 0
+        # Scan only newly decoded text; earlier pieces are known to contain no newline.
+        while (newline := text.find("\n", start)) >= 0:
+            self._pending.append(text[start:newline])
+            events.append(self._consume_line(self._take_pending().removesuffix("\r")))
+            start = newline + 1
+        if start < len(text):
+            rest = text[start:]
+            self._pending.append(rest)
+            self._pending_bytes += len(rest.encode("utf-8"))
+            if self._pending_bytes > self._max_line_bytes:
+                raise ProtocolError("event_too_large")
         return tuple(events)
 
     def _consume_line(self, line: str) -> ProtocolEvent:
@@ -529,13 +555,18 @@ class ProtocolDecoder:
             return NoState()
 
         if operation == "establish":
+            # The deliverable is the output, so the state never repeats it. The server
+            # requires ``source`` for text work and derives it for an uploaded DOCX.
             _require_keys(
                 payload,
-                required=frozenset({"v", "event", "operation", "source", "output", "brief"}),
-                optional=frozenset({"docx_blocks"}),
+                required=frozenset({"v", "event", "operation", "brief"}),
+                optional=frozenset({"source", "docx_blocks"}),
             )
-            source = _validated_text(payload.get("source"), complete=True)
-            output = _validated_text(payload.get("output"), complete=True)
+            source = (
+                _validated_text(payload.get("source"), complete=True)
+                if "source" in payload
+                else None
+            )
             brief = _validated_brief(payload.get("brief"), max_bytes=self._max_brief_bytes)
             docx_blocks = (
                 self._validated_docx_blocks(payload.get("docx_blocks"))
@@ -543,13 +574,11 @@ class ProtocolDecoder:
                 else None
             )
             self._validate_state_size(
-                source,
-                output,
+                *(value for value in (source,) if value is not None),
                 *(block.text for block in docx_blocks or ()),
             )
             return EstablishState(
                 source=source,
-                output=output,
                 brief=brief,
                 docx_blocks=docx_blocks,
             )
@@ -564,16 +593,19 @@ class ProtocolDecoder:
                         "operation",
                         "base_version",
                         "source_addition",
-                        "output_addition",
                         "source_separator",
                         "output_separator",
                     }
                 ),
-                optional=frozenset({"brief"}),
+                optional=frozenset({"output_addition", "brief"}),
             )
             base_version = _validated_base_version(payload.get("base_version"))
             source_addition = _validated_text(payload.get("source_addition"), complete=True)
-            output_addition = _validated_text(payload.get("output_addition"), complete=True)
+            output_addition = (
+                _validated_text(payload.get("output_addition"), complete=True)
+                if "output_addition" in payload
+                else None
+            )
             source_separator = self._validated_append_separator(payload.get("source_separator"))
             output_separator = self._validated_append_separator(payload.get("output_separator"))
             append_brief = (
@@ -581,7 +613,10 @@ class ProtocolDecoder:
                 if "brief" in payload
                 else None
             )
-            self._validate_state_size(source_addition, output_addition)
+            self._validate_state_size(
+                source_addition,
+                *(value for value in (output_addition,) if value is not None),
+            )
             return AppendState(
                 base_version=base_version,
                 source_addition=source_addition,
@@ -673,11 +708,10 @@ class ProtocolDecoder:
         if operation == "full":
             _require_keys(
                 payload,
-                required=frozenset({"v", "event", "operation", "base_version", "output"}),
+                required=frozenset({"v", "event", "operation", "base_version"}),
                 optional=frozenset({"source", "brief", "docx_blocks"}),
             )
             base_version = _validated_base_version(payload.get("base_version"))
-            output = _validated_text(payload.get("output"), complete=True)
             full_source_raw = payload.get("source")
             full_source = (
                 _validated_text(full_source_raw, complete=True) if "source" in payload else None
@@ -693,13 +727,11 @@ class ProtocolDecoder:
                 else None
             )
             self._validate_state_size(
-                output,
                 *(value for value in (full_source,) if value is not None),
                 *(block.text for block in docx_blocks or ()),
             )
             return FullState(
                 base_version=base_version,
-                output=output,
                 source=full_source,
                 brief=full_brief,
                 docx_blocks=docx_blocks,

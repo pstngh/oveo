@@ -8,7 +8,9 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from pathlib import Path
 from typing import cast
 
+import httpx
 import pytest
+from pydantic import SecretStr
 from sqlalchemy import func, select
 
 from oveo.auth import hash_password
@@ -17,6 +19,7 @@ from oveo.db import Database
 from oveo.generation import (
     ActiveGenerationError,
     GenerationManager,
+    OpenRouterProvider,
     ProviderCompletion,
     ProviderError,
     ProviderRequest,
@@ -36,6 +39,7 @@ from oveo.protocol import (
     SourceOutputReplacement,
     StateOperation,
 )
+from oveo.provider import OpenRouterClient
 
 
 def _document(state: StateOperation, visible: str) -> ProtocolDocument:
@@ -61,7 +65,7 @@ _ESTABLISH = (
     b'{"v":1,"event":"block_delta","id":"b1","text":"Bonjour"}\n'
     b'{"v":1,"event":"block_end","id":"b1"}\n'
     b'{"v":1,"event":"state","operation":"establish","source":"Hello",'
-    b'"output":"Bonjour","brief":{"direction":"en-US-fr-CA"}}\n'
+    b'"brief":{"direction":"en-US-fr-CA"}}\n'
     b'{"v":1,"event":"response_end"}\n'
 )
 
@@ -510,11 +514,7 @@ async def test_canonical_work_kind_follows_mode(
             generation=generation,
             thread=thread,
             document=_document(
-                EstablishState(
-                    source="Source or brief",
-                    output="Completed output",
-                    brief={"mode": mode},
-                ),
+                EstablishState(source="Source or brief", brief={"mode": mode}),
                 "Completed output",
             ),
         )
@@ -601,17 +601,16 @@ async def test_provider_stream_decoder_and_commit_cover_all_canonical_operations
             {
                 "operation": "establish",
                 "source": "Hello",
-                "output": "Bonjour",
                 "brief": {"direction": "en-US-fr-CA", "tone": "plain"},
             },
         ),
+        # The visible deliverable is the output addition; the state does not repeat it.
         _response_stream(
             "Liste:\n- un",
             {
                 "operation": "append",
                 "base_version": 1,
                 "source_addition": "List:\n- one",
-                "output_addition": "Liste:\n- un",
                 "source_separator": "line",
                 "output_separator": "line",
                 "brief": {"direction": "en-US-fr-CA", "tone": "concise"},
@@ -638,7 +637,6 @@ async def test_provider_stream_decoder_and_commit_cover_all_canonical_operations
             {
                 "operation": "full",
                 "base_version": 3,
-                "output": "Version complète.",
                 "source": "Complete version.",
                 "brief": {"direction": "en-US-fr-CA", "tone": "formal"},
             },
@@ -698,21 +696,32 @@ async def test_provider_stream_decoder_and_commit_cover_all_canonical_operations
     await manager.shutdown()
 
 
-@pytest.mark.parametrize("visible", [["Option une", "Option deux"], "Autre sortie"])
-async def test_mutation_rejects_multiple_or_mismatched_visible_deliverables(
+@pytest.mark.parametrize(
+    ("visible", "state"),
+    [
+        (
+            ["Option une", "Option deux"],
+            {"operation": "establish", "source": "Source", "brief": {"direction": "en-US-fr-CA"}},
+        ),
+        # The previous grammar repeated the deliverable as `output`; it is now rejected.
+        (
+            "Option une",
+            {
+                "operation": "establish",
+                "source": "Source",
+                "output": "Option une",
+                "brief": {"direction": "en-US-fr-CA"},
+            },
+        ),
+    ],
+)
+async def test_mutation_rejects_multiple_deliverables_and_repeated_output(
     manager_database: tuple[Database, Settings, User],
     visible: str | list[str],
+    state: dict[str, object],
 ) -> None:
     database, settings, user = manager_database
-    invalid_response = _response_stream(
-        visible,
-        {
-            "operation": "establish",
-            "source": "Source",
-            "output": "Option une",
-            "brief": {"direction": "en-US-fr-CA"},
-        },
-    )
+    invalid_response = _response_stream(visible, state)
     provider = ScriptedProvider([invalid_response] * 3)
     manager = GenerationManager(database, settings, provider)
     async with database.sessions() as db:
@@ -775,7 +784,6 @@ async def test_state_application_failures_preserve_valid_visible_blocks(
                 {
                     "operation": "establish",
                     "source": "Hello",
-                    "output": "Bonjour",
                     "brief": {"direction": "en-US-fr-CA"},
                 },
             ),
@@ -829,14 +837,10 @@ async def test_state_application_failures_preserve_valid_visible_blocks(
     "invalid_response",
     [
         b"not-json\n",
+        # Text work cannot establish without its complete source.
         _response_stream(
             "Visible draft that must be discarded",
-            {
-                "operation": "establish",
-                "source": "Synthetic source",
-                "output": "Different hidden output",
-                "brief": {"direction": "en-US-fr-CA"},
-            },
+            {"operation": "establish", "brief": {"direction": "en-US-fr-CA"}},
         ),
     ],
 )
@@ -883,14 +887,9 @@ async def test_internal_comms_recovers_from_mismatch_then_invalid_event_fields(
     manager_database: tuple[Database, Settings, User],
 ) -> None:
     database, settings, user = manager_database
-    mismatch = _response_stream(
+    missing_source = _response_stream(
         "Visible draft",
-        {
-            "operation": "establish",
-            "source": "Synthetic brief",
-            "output": "Different hidden draft",
-            "brief": {"audience": "staff"},
-        },
+        {"operation": "establish", "brief": {"audience": "staff"}},
     )
     invalid_fields = _ESTABLISH.replace(
         b'{"v":1,"event":"response_end"}',
@@ -901,11 +900,10 @@ async def test_internal_comms_recovers_from_mismatch_then_invalid_event_fields(
         {
             "operation": "establish",
             "source": "Synthetic brief",
-            "output": "Final draft",
             "brief": {"audience": "staff"},
         },
     )
-    provider = ScriptedProvider([mismatch, invalid_fields, valid])
+    provider = ScriptedProvider([missing_source, invalid_fields, valid])
     manager = GenerationManager(database, settings, provider)
     async with database.sessions() as db:
         thread = Thread(owner_id=user.id, mode="internal_comms", title="Existing conversation")
@@ -924,7 +922,7 @@ async def test_internal_comms_recovers_from_mismatch_then_invalid_event_fields(
     assert completed["blocks"] == [{"type": "deliverable", "text": "Final draft"}]
     assert len(provider.requests) == 3
     assert len({request.generation_id for request in provider.requests}) == 3
-    assert "visible deliverable differed" in str(provider.requests[1].snapshot)
+    assert "must include the complete source" in str(provider.requests[1].snapshot)
     assert "missing or extra keys" in str(provider.requests[2].snapshot)
     async with database.sessions() as db:
         assert await db.scalar(select(func.count()).select_from(WorkVersion)) == 1
@@ -1045,11 +1043,7 @@ async def test_persisted_canonical_state_supports_every_mutation(
             generation=generation,
             thread=thread,
             document=_document(
-                EstablishState(
-                    source="Hello world.",
-                    output="Bonjour le monde.",
-                    brief={"direction": "en-US-fr-CA"},
-                ),
+                EstablishState(source="Hello world.", brief={"direction": "en-US-fr-CA"}),
                 "Bonjour le monde.",
             ),
         )
@@ -1098,12 +1092,7 @@ async def test_persisted_canonical_state_supports_every_mutation(
             generation=generation,
             thread=thread,
             document=_document(
-                FullState(
-                    base_version=3,
-                    output="Version complète révisée.",
-                    source=None,
-                    brief={"direction": "en-US-fr-CA", "tone": "formal"},
-                ),
+                FullState(base_version=3, brief={"direction": "en-US-fr-CA", "tone": "formal"}),
                 "Version complète révisée.",
             ),
         )
@@ -1155,11 +1144,7 @@ async def test_persisted_canonical_state_rejects_stale_and_oversized_mutations(
             generation=generation,
             thread=thread,
             document=_document(
-                EstablishState(
-                    source="one two",
-                    output="un deux",
-                    brief={"direction": "en-US-fr-CA"},
-                ),
+                EstablishState(source="one two", brief={"direction": "en-US-fr-CA"}),
                 "un deux",
             ),
         )
@@ -1528,3 +1513,121 @@ def test_snapshot_message_validation_preserves_call_site_error_codes() -> None:
     with pytest.raises(ProviderError) as request_error:
         _snapshot_messages({}, error_code="invalid_request_snapshot")
     assert request_error.value.code == "invalid_request_snapshot"
+
+
+async def test_truncated_response_is_reported_once_without_protocol_retries(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, base_settings, user = manager_database
+    settings = base_settings.model_copy(
+        update={"openrouter_api_key": SecretStr("sk-or-v1-" + "0" * 64)}
+    )
+    chat_calls: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        chat_calls.append(body)
+        chunks = [
+            {"id": "gen-cut", "choices": [{"delta": {"content": _ESTABLISH.decode()[:40]}}]},
+            {
+                "id": "gen-cut",
+                "choices": [{"delta": {"content": ""}, "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 32000, "cost": "0.25"},
+            },
+        ]
+        content = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+        return httpx.Response(
+            200, content=(content + "data: [DONE]\n\n").encode(), headers={"x-request-id": "r"}
+        )
+
+    provider = OpenRouterProvider(settings)
+    await provider.aclose()
+    provider._client = OpenRouterClient(
+        settings, client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+    manager = GenerationManager(database, settings, provider)
+    submitted = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="truncated",
+        text="Translate this synthetic document.",
+        attachment=None,
+        owner_id=user.id,
+        mode="translate",
+    )
+    failed = await _wait_status(manager, submitted.generation_id, {"failed"})
+
+    assert failed["error_code"] == "response_too_long"
+    assert "output limit" in str(failed["error_message"])
+    assert len(chat_calls) == 1  # no provider replay and no protocol retry
+    assert chat_calls[0]["max_completion_tokens"] == settings.chat_max_completion_tokens
+    assert chat_calls[0]["reasoning_effort"] == "high"
+    async with database.sessions() as db:
+        charges = list(
+            (
+                await db.execute(
+                    select(UsageEvent.amount_microusd).where(UsageEvent.event_type == "charge")
+                )
+            ).scalars()
+        )
+    assert charges == [250_000]  # the synthetic reported cost is kept, not dropped
+    await manager.shutdown()
+
+
+async def test_append_derives_the_addition_and_refuses_ambiguous_whole_documents(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, settings, user = manager_database
+    manager = GenerationManager(database, settings, BlockingProvider())
+    async with database.sessions() as db:
+        thread = Thread(owner_id=user.id, mode="translate")
+        db.add(thread)
+        await db.flush()
+        generation = Generation(
+            thread_id=thread.id,
+            requester_id=user.id,
+            client_request_id="append-derivation",
+            purpose="chat",
+            status="running",
+        )
+        await manager._apply_state_operation(
+            db,
+            generation=generation,
+            thread=thread,
+            document=_document(EstablishState(source="One.", brief={"d": "en-fr"}), "Un."),
+        )
+        # Whole-document display: the addition must be named explicitly.
+        with pytest.raises(ProtocolError, match="state_output_addition_missing"):
+            await manager._apply_state_operation(
+                db,
+                generation=generation,
+                thread=thread,
+                document=_document(
+                    AppendState(
+                        base_version=1,
+                        source_addition="Two.",
+                        source_separator="space",
+                        output_separator="space",
+                    ),
+                    "Un. Deux.",
+                ),
+            )
+        await manager._apply_state_operation(
+            db,
+            generation=generation,
+            thread=thread,
+            document=_document(
+                AppendState(
+                    base_version=1,
+                    source_addition="Two.",
+                    source_separator="space",
+                    output_separator="space",
+                    output_addition="Deux.",
+                ),
+                "Un. Deux.",
+            ),
+        )
+        await db.commit()
+        latest = await db.scalar(select(WorkVersion).where(WorkVersion.version_no == 2))
+    assert latest is not None
+    assert (latest.source_text, latest.output_text) == ("One. Two.", "Un. Deux.")
+    await manager.shutdown()

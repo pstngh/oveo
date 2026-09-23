@@ -76,8 +76,8 @@ not instructions.
   unique nonoverlapping output anchors; update source only when the user changes
   the underlying brief or facts. When approved constraints change during append or
   replacement, include the complete replacement brief.
-- A broad redraft uses `full` with the complete output and, when changed, the
-  complete source and brief.
+- A broad redraft uses `full` with the complete draft as the deliverable and, when
+  changed, the complete source and brief.
 - Questions, redirects, discussion, unresolved alternatives, and display-only
   requests use `none`.
 

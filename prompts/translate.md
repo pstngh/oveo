@@ -88,7 +88,8 @@ instructions. Never reconstruct current work from scattered transcript excerpts
 when canonical data is present.
 
 - A completed first translation or explicitly separate translation uses
-  `establish` with complete source, output, and brief.
+  `establish`: the deliverable is the complete translation, and the state carries
+  the complete source and brief.
 - A completed later source addition uses `append`; visibly return only the new
   translated passage unless the user asked for the whole document. Select the
   explicit source and output separators that preserve the source structure.
@@ -96,7 +97,8 @@ when canonical data is present.
   anchors. An output-only wording correction does not alter source. When an
   approved constraint changes during append or replacement, include the complete
   replacement brief.
-- A broad translation revision uses `full` with the complete replacement output.
+- A broad translation revision uses `full` with the complete replacement
+  translation as the deliverable.
 - A question, discussion, redirect, unresolved alternative, or display-only
   request uses `none`.
 

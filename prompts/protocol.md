@@ -64,11 +64,13 @@ No `conversation` block may appear with a deliverable layout. Each independently
 copyable alternative uses a separate deliverable block.
 
 A response that mutates canonical state must contain exactly one `deliverable`;
-multiple alternatives are necessarily unresolved and use `none`. For `establish`
-and `full`, that deliverable must exactly equal the operation's complete output.
-For `replace`, it must exactly equal the complete output after all replacements.
-For `append`, it must equal either the exact `output_addition` (the normal display)
-or the complete joined output when the user explicitly requested the whole work.
+multiple alternatives are necessarily unresolved and use `none`. The application
+takes the canonical output from that deliverable, so never repeat it in the state
+event. For `establish` and `full`, the deliverable is the operation's complete
+output. For `replace`, it must exactly equal the complete output after all
+replacements. For `append`, it is the exact output addition (the normal display);
+when the user explicitly requested the whole work, it is the complete joined output
+and the state must then also name the exact `output_addition`.
 
 ## Canonical-state schemas
 
@@ -79,19 +81,22 @@ No mutation:
 
 `{"v":1,"event":"state","operation":"none"}`
 
-Establish a complete new active work item. `source` and `output` are non-empty
-complete strings and `brief` is a non-empty JSON object:
+Establish a complete new active work item whose complete output is the
+deliverable. `source` is the non-empty complete source string and `brief` is a
+non-empty JSON object:
 
-`{"v":1,"event":"state","operation":"establish","source":"complete source","output":"complete output","brief":{"scope":"complete brief"}}`
+`{"v":1,"event":"state","operation":"establish","source":"complete source","brief":{"scope":"complete brief"}}`
 
 Append exact additions. `base_version` is the positive integer copied from trusted
 application-managed canonical state. Declare both deterministic separators using
 exactly one of `none`, `space`, `line`, or `paragraph`; these insert `""`, `" "`,
 `"\n"`, or `"\n\n"`, respectively. Choose deliberately to preserve paragraphs,
-list items, and inline continuations. Include `brief` only when replacing the
-complete brief because approved constraints changed:
+list items, and inline continuations. The deliverable is the output addition.
+Include `output_addition` only when the deliverable shows the complete joined work,
+and `brief` only when replacing the complete brief because approved constraints
+changed:
 
-`{"v":1,"event":"state","operation":"append","base_version":3,"source_addition":"exact source addition","output_addition":"exact output addition","source_separator":"paragraph","output_separator":"paragraph","brief":{"scope":"complete replacement brief"}}`
+`{"v":1,"event":"state","operation":"append","base_version":3,"source_addition":"exact source addition","source_separator":"paragraph","output_separator":"paragraph","brief":{"scope":"complete replacement brief"}}`
 
 Apply one or more exact replacements against one immutable base. A paired
 source/output replacement has four replacement keys; an output-only replacement
@@ -105,15 +110,15 @@ text, and does not overlap another replacement in that text. Replacements are al
 defined against `base_version`, not sequential intermediate results. Replacement
 strings may be empty.
 
-Replace the complete output. `output` is required and non-empty. Include `source`
-or `brief` only when replacing that entire field; omit unchanged optional fields:
+Replace the complete output with the deliverable. Include `source` or `brief` only
+when replacing that entire field; omit unchanged optional fields:
 
-`{"v":1,"event":"state","operation":"full","base_version":3,"output":"complete replacement output","source":"optional complete source","brief":{"optional":"complete replacement brief"}}`
+`{"v":1,"event":"state","operation":"full","base_version":3,"source":"optional complete source","brief":{"optional":"complete replacement brief"}}`
 
 ## Operation preconditions and validation
 
-- `establish` supplies complete source, output, and brief. It has no
-  `base_version`.
+- `establish` supplies the complete source and brief; its deliverable is the
+  complete output. It has no `base_version`.
 - `append`, `replace`, and `full` require a trusted active canonical item and must
   copy its current positive integer version exactly.
 - An optional `brief` on `append`, `replace`, or `full` is always the complete

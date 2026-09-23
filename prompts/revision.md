@@ -124,7 +124,8 @@ not place critique, explanations, or labels in `output`.
   nonoverlapping anchors; change canonical source only when the user corrected the
   supplied source itself. When approved constraints change during append or
   replacement, include the complete replacement brief.
-- A broad revision or rewrite uses `full` with the complete output.
+- A broad revision or rewrite uses `full` with the complete edited text as the
+  deliverable.
 - Questions, redirects, discussion, unresolved alternatives, and display-only
   requests use `none`.
 

@@ -19,8 +19,8 @@ On `establish`, `replace`, or `full`, add a complete `docx_blocks` array:
 
 `"docx_blocks":[{"id":"p000001","text":"complete replacement block"}]`
 
-For a `source` DOCX attachment, `source` is the uploaded blocks' clean text.
-`output` and the visible deliverable are the returned blocks' clean text: block
-text joined in order with blank lines, retaining hyperlink display text but
+For a `source` DOCX attachment, omit `source` on `establish`: the application uses
+the uploaded document. The visible deliverable is the output: the returned blocks'
+clean text joined in order with blank lines, retaining hyperlink display text but
 removing its wrappers. The server requires exact equality. DOCX-backed work
 cannot use `append`. Omit `docx_blocks` for non-DOCX work.

@@ -37,8 +37,12 @@ class Settings(BaseSettings):
     context_recent_messages: int = Field(default=12, ge=4, le=100)
     openrouter_api_key: SecretStr | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    openrouter_model: str = "openai/gpt-6-luna"
     openrouter_timeout_seconds: float = Field(default=300.0, ge=10, le=900)
+    # Output-token cap for visible chat responses. OpenRouter publishes 128,000 as the
+    # pinned model's maximum completion; the default keeps the established 32,000.
+    chat_max_completion_tokens: int = Field(default=32_000, ge=1_000, le=128_000)
+    # Wall-clock bound for one provider attempt; keep-alives cannot extend it.
+    provider_attempt_deadline_seconds: float = Field(default=1_800.0, ge=60, le=7_200)
     provider_metadata_timeout_seconds: float = Field(default=3.0, ge=0.1, le=10)
     provider_retry_attempts: int = Field(default=3, ge=1, le=5)
     session_cookie_name: str = "oveo_session"

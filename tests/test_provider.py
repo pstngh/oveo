@@ -1,4 +1,6 @@
+import asyncio
 import json
+from collections.abc import AsyncIterator
 from decimal import Decimal
 from pathlib import Path
 
@@ -211,6 +213,153 @@ def test_usage_parser_rejects_estimates_and_invalid_values() -> None:
     assert usage.cost_microusd == 2
 
 
-def test_model_is_fail_closed(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match=OPENROUTER_MODEL):
-        OpenRouterClient(settings(tmp_path, openrouter_model="another/model"))
+def test_model_is_pinned_in_code_even_if_the_environment_names_another(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OVEO_OPENROUTER_MODEL", "another/model")
+    client = OpenRouterClient(settings(tmp_path))
+    body = client.build_request_body(
+        [ProviderMessage("user", "synthetic")], max_completion_tokens=10, reasoning_effort="low"
+    )
+    assert body["model"] == OPENROUTER_MODEL == "openai/gpt-6-luna"
+    assert body["reasoning_effort"] == "low"
+    assert body["provider"] == {
+        "order": ["azure/eu"],
+        "allow_fallbacks": True,
+        "data_collection": "deny",
+        "zdr": True,
+    }
+    with pytest.raises(ValueError, match="reasoning effort"):
+        client.build_request_body(
+            [ProviderMessage("user", "synthetic")],
+            max_completion_tokens=10,
+            reasoning_effort="minimal",  # type: ignore[arg-type]
+        )
+
+
+def _finishing_stream(finish_reason: str) -> bytes:
+    return b"".join(
+        (
+            sse(
+                {
+                    "id": "generation-cut",
+                    "choices": [{"delta": {"content": "partial"}, "finish_reason": None}],
+                }
+            ),
+            sse(
+                {
+                    "id": "generation-cut",
+                    "choices": [{"delta": {"content": ""}, "finish_reason": finish_reason}],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 32,
+                        "completion_tokens_details": {"reasoning_tokens": 30},
+                        "cost": "0.000009",
+                    },
+                }
+            ),
+            b"data: [DONE]\n\n",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "code"),
+    [("length", "provider_output_limit"), ("content_filter", "provider_content_filter")],
+)
+@pytest.mark.asyncio
+async def test_truncated_or_filtered_response_is_final_and_keeps_usage(
+    tmp_path: Path, finish_reason: str, code: str
+) -> None:
+    calls = 0
+    ids: list[tuple[str | None, str]] = []
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200, content=_finishing_stream(finish_reason), headers={"x-request-id": "req-cut"}
+        )
+
+    async def on_ids(request_id: str | None, generation_id: str) -> None:
+        ids.append((request_id, generation_id))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        provider = OpenRouterClient(settings(tmp_path), client=http_client)
+        with pytest.raises(ProviderError) as caught:
+            await provider.stream_chat(
+                [ProviderMessage("user", "synthetic")],
+                max_completion_tokens=32,
+                on_delta=lambda _delta: None,
+                on_ids=on_ids,
+            )
+
+    assert calls == 1  # never replayed, although three attempts are configured
+    assert caught.value.code == code
+    assert caught.value.retryable is False
+    assert caught.value.provider_generation_id == "generation-cut"
+    assert caught.value.usage is not None
+    assert caught.value.usage.cost_microusd == 9
+    assert caught.value.usage.reasoning_tokens == 30
+    assert ids == [("req-cut", "generation-cut")]
+
+
+@pytest.mark.asyncio
+async def test_provider_ids_are_reported_before_a_stream_fails(tmp_path: Path) -> None:
+    ids: list[tuple[str | None, str]] = []
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        # One content chunk, then the connection ends without [DONE].
+        return httpx.Response(
+            200,
+            content=sse({"id": "generation-early", "choices": [{"delta": {"content": "x"}}]}),
+            headers={"x-request-id": "req-early"},
+        )
+
+    async def on_ids(request_id: str | None, generation_id: str) -> None:
+        ids.append((request_id, generation_id))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        provider = OpenRouterClient(settings(tmp_path), client=http_client)
+        with pytest.raises(ProviderError, match="provider_incomplete_stream"):
+            await provider.stream_chat(
+                [ProviderMessage("user", "synthetic")],
+                max_completion_tokens=32,
+                on_delta=lambda _delta: None,
+                on_ids=on_ids,
+            )
+    assert ids == [("req-early", "generation-early")]
+
+
+@pytest.mark.asyncio
+async def test_keep_alives_cannot_extend_an_attempt_past_its_deadline(tmp_path: Path) -> None:
+    calls = 0
+
+    async def keep_alive_forever() -> AsyncIterator[bytes]:
+        yield sse({"id": "generation-stalled", "choices": [{"delta": {"content": "x"}}]})
+        while True:
+            await asyncio.sleep(0.02)
+            yield b": OPENROUTER PROCESSING\n\n"
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=keep_alive_forever())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        provider = OpenRouterClient(settings(tmp_path), client=http_client)
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(ProviderError) as caught:
+            await provider.stream_chat(
+                [ProviderMessage("user", "synthetic")],
+                max_completion_tokens=32,
+                on_delta=lambda _delta: None,
+                deadline_seconds=0.3,
+            )
+        elapsed = asyncio.get_running_loop().time() - started
+
+    assert caught.value.code == "provider_timeout"
+    assert caught.value.retryable is False
+    assert caught.value.partial is True
+    assert calls == 1
+    assert elapsed < 3
