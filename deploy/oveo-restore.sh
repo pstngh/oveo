@@ -7,6 +7,10 @@ tool=/usr/local/lib/oveo/backup_tool.py
 compose_file=/opt/oveo/compose.yml
 deploy_env=/etc/oveo/deploy.env
 live_dir=/var/lib/oveo
+# Both are shared with every other service on the host (normally mode 1777): used,
+# never created or changed.
+lock_dir=/run/lock
+scratch_dir=/var/tmp
 
 die() {
   echo "oveo-restore: $*" >&2
@@ -14,8 +18,8 @@ die() {
 }
 
 usage() {
-  echo "usage: $0 BACKUP.age --destination EMPTY_PATH" >&2
-  echo "       $0 BACKUP.age --live --confirm RESTORE" >&2
+  echo "usage: $0 BACKUP.age --destination EMPTY_PATH [--allow-incomplete]" >&2
+  echo "       $0 BACKUP.age --live --confirm RESTORE [--allow-incomplete]" >&2
   exit 2
 }
 
@@ -39,8 +43,9 @@ mode=$1
 shift
 destination=
 if [ "$mode" = "--destination" ]; then
-  [ "$#" -eq 1 ] || usage
+  [ "$#" -ge 1 ] || usage
   destination=$1
+  shift
   case "$destination" in
     /*) ;;
     *) die "destination must be an absolute path" ;;
@@ -49,16 +54,24 @@ if [ "$mode" = "--destination" ]; then
     || die "use --live for the production data directory"
   [ ! -e "$destination" ] || die "destination already exists"
 elif [ "$mode" = "--live" ]; then
-  [ "$#" -eq 2 ] && [ "$1" = "--confirm" ] && [ "$2" = "RESTORE" ] || usage
+  [ "$#" -ge 2 ] && [ "$1" = "--confirm" ] && [ "$2" = "RESTORE" ] || usage
+  shift 2
 else
   usage
 fi
+# A backup that lacks attachments is restored only when this is asked for explicitly.
+incomplete=
+if [ "$#" -eq 1 ] && [ "$1" = "--allow-incomplete" ]; then
+  incomplete=--allow-incomplete
+  shift
+fi
+[ "$#" -eq 0 ] || usage
 
-install -d -m 0700 /var/tmp /run/lock
-temporary=$(mktemp -d /var/tmp/oveo-restore.XXXXXX)
+[ -d "$scratch_dir" ] && [ -d "$lock_dir" ] || die "$scratch_dir or $lock_dir is missing"
+temporary=$(mktemp -d "$scratch_dir/oveo-restore.XXXXXX")
 cleanup() {
   case "$temporary" in
-    /var/tmp/oveo-restore.*) rm -rf -- "$temporary" ;;
+    "$scratch_dir"/oveo-restore.*) rm -rf -- "$temporary" ;;
     *) echo "Refusing unsafe temporary cleanup: $temporary" >&2 ;;
   esac
 }
@@ -67,41 +80,59 @@ plain=$temporary/backup.tar.gz
 age --decrypt --identity "$AGE_IDENTITY_FILE" --output "$plain" "$backup"
 
 if [ -n "$destination" ]; then
-  python3 "$tool" restore --archive "$plain" --destination "$destination"
+  python3 "$tool" restore ${incomplete:+"$incomplete"} --archive "$plain" \
+    --destination "$destination"
   echo "Restored and verified backup in disposable destination: $destination"
   exit 0
 fi
 
 [ -f "$compose_file" ] || die "$compose_file is missing"
 [ -f "$deploy_env" ] || die "$deploy_env is missing"
-exec 9>/run/lock/oveo-maintenance.lock
+exec 9>"$lock_dir/oveo-maintenance.lock"
 flock -w 600 9 || die "timed out waiting for the host maintenance lock"
 
+compose() {
+  docker compose --project-name oveo --env-file "$deploy_env" -f "$compose_file" "$@"
+}
+
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-candidate=/var/lib/oveo.restore.$stamp
-previous=/var/lib/oveo.pre-restore.$stamp
-failed=/var/lib/oveo.failed-restore.$stamp
+candidate=$live_dir.restore.$stamp
+previous=$live_dir.pre-restore.$stamp
+failed=$live_dir.failed-restore.$stamp
 [ ! -e "$candidate" ] && [ ! -e "$previous" ] && [ ! -e "$failed" ] \
   || die "a restore path for this timestamp already exists"
-python3 "$tool" restore --archive "$plain" --destination "$candidate"
+python3 "$tool" restore ${incomplete:+"$incomplete"} --archive "$plain" \
+  --destination "$candidate"
+# Error logs and the deployed-image record describe this host, not the backup, so the
+# restored directory keeps the current ones (the pre-restore directory keeps them too).
+if [ -d "$live_dir/logs" ]; then
+  cp -a -- "$live_dir/logs" "$candidate/logs"
+fi
+if [ -f "$live_dir/deployed-image" ]; then
+  cp -p -- "$live_dir/deployed-image" "$candidate/deployed-image"
+fi
+# The restored data accepts no writes until the application passed its readiness check.
+: >"$candidate/maintenance-mode"
 chown -R 10001:10001 "$candidate"
 find "$candidate" -type d -exec chmod 0700 {} +
 find "$candidate" -type f -exec chmod 0600 {} +
 
-docker compose --project-name oveo --env-file "$deploy_env" -f "$compose_file" stop app
+# Downtime starts here: everything written after the backup was taken stays only in
+# the pre-restore directory.
+compose stop app
 mv "$live_dir" "$previous"
 mv "$candidate" "$live_dir"
-if docker compose --project-name oveo --env-file "$deploy_env" -f "$compose_file" \
-    up --detach app \
+if compose up --detach app \
   && curl --retry 30 --retry-delay 2 --retry-connrefused --fail --silent --show-error \
     --max-time 5 http://127.0.0.1:8000/health/ready >/dev/null; then
+  rm -f -- "$live_dir/maintenance-mode"
   echo "Live restore succeeded. Pre-restore data retained at: $previous"
   exit 0
 fi
 
 echo "Restored data failed readiness; reverting to the pre-restore data." >&2
-docker compose --project-name oveo --env-file "$deploy_env" -f "$compose_file" stop app || true
+compose stop app || true
 mv "$live_dir" "$failed"
 mv "$previous" "$live_dir"
-docker compose --project-name oveo --env-file "$deploy_env" -f "$compose_file" up --detach app
+compose up --detach app
 die "live restore failed; rejected data retained at $failed"

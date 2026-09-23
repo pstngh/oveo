@@ -60,3 +60,6 @@ packages = ["oveo"]
 [tool.coverage.run]
 source = ["oveo"]
 branch = true
+# Code after an awaited SQLAlchemy call runs in a greenlet; without this it is
+# reported as never executed.
+concurrency = ["thread", "greenlet"]

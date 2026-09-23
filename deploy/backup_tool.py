@@ -1,26 +1,51 @@
 #!/usr/bin/env python3
+"""Create, check and restore Oveo backups, and take pre-deployment snapshots.
+
+Runs on the host as root with only the Python standard library.
+"""
+
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
 import shutil
 import sqlite3
 import stat
+import sys
 import tarfile
 import tempfile
-from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
 MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
 SCHEMA_VERSION = 1
+# `create --allow-incomplete` exits with this status after writing an archive that is
+# missing referenced attachments.
+EXIT_INCOMPLETE = 3
+# Besides the database and attachments, a pre-deployment snapshot keeps these.
+_SNAPSHOT_FILES = ("deployed-image",)
+_SNAPSHOT_DIRECTORIES = ("logs",)
 
 
 class BackupError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class BackupResult:
+    """What a backup contains: `missing` lists referenced attachments left out."""
+
+    missing: tuple[str, ...]
+    unreferenced: int
+
+    @property
+    def complete(self) -> bool:
+        return not self.missing
 
 
 def sha256_file(path: Path) -> str:
@@ -42,35 +67,23 @@ def _safe_storage_name(value: str) -> bool:
     )
 
 
-def _walk_regular_files(root: Path) -> Iterator[Path]:
+def _regular_files(root: Path) -> set[str]:
+    """Relative names of every regular file below `root`; links and devices are refused."""
+
     if not root.exists():
-        return
+        return set()
+    found: set[str] = set()
     for current, directories, files in os.walk(root, followlinks=False):
         current_path = Path(current)
         for name in directories:
-            path = current_path / name
-            if path.is_symlink():
-                raise BackupError(f"symlink is not allowed in attachments: {path}")
+            if (current_path / name).is_symlink():
+                raise BackupError(f"symlink is not allowed in attachments: {current_path / name}")
         for name in files:
             path = current_path / name
-            mode = path.lstat().st_mode
-            if not stat.S_ISREG(mode):
+            if not stat.S_ISREG(path.lstat().st_mode):
                 raise BackupError(f"non-regular attachment is not allowed: {path}")
-            yield path
-
-
-def _copy_attachments(source: Path, destination: Path) -> None:
-    destination.mkdir(parents=True, mode=0o700)
-    if not source.exists():
-        return
-    if source.is_symlink() or not source.is_dir():
-        raise BackupError("attachment source must be a real directory")
-    for path in _walk_regular_files(source):
-        relative = path.relative_to(source)
-        target = destination / relative
-        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        shutil.copyfile(path, target, follow_symlinks=False)
-        target.chmod(0o600)
+            found.add(path.relative_to(root).as_posix())
+    return found
 
 
 def _open_readonly_database(path: Path) -> sqlite3.Connection:
@@ -94,32 +107,60 @@ def _check_database(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def _validate_attachment_rows(database: sqlite3.Connection, attachment_root: Path) -> None:
+def _referenced_attachments(database: sqlite3.Connection) -> list[tuple[str, int, str]]:
     has_table = database.execute(
         "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='attachments'"
     ).fetchone()
     if has_table is None:
         raise BackupError("attachments table is missing")
-    referenced: set[str] = set()
+    rows: list[tuple[str, int, str]] = []
     for storage_name, byte_count, expected_sha256 in database.execute(
         "SELECT storage_name, byte_count, sha256 FROM attachments"
     ):
         if not isinstance(storage_name, str) or not _safe_storage_name(storage_name):
             raise BackupError("database contains an unsafe attachment storage name")
-        path = attachment_root / storage_name
-        if not path.is_file() or path.is_symlink():
-            raise BackupError(f"referenced attachment is missing: {storage_name}")
-        if path.stat().st_size != byte_count:
-            raise BackupError(f"attachment size mismatch: {storage_name}")
-        if sha256_file(path) != expected_sha256:
-            raise BackupError(f"attachment digest mismatch: {storage_name}")
-        referenced.add(storage_name)
-    actual = {
-        path.relative_to(attachment_root).as_posix()
-        for path in _walk_regular_files(attachment_root)
-    }
-    if actual != referenced:
-        raise BackupError("attachment tree contains files not referenced by the database")
+        rows.append((storage_name, byte_count, expected_sha256))
+    return rows
+
+
+def _intact(path: Path, byte_count: int, expected_sha256: str) -> bool:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISREG(mode)
+        and path.stat().st_size == byte_count
+        and sha256_file(path) == expected_sha256
+    )
+
+
+def _copy_referenced(
+    references: list[tuple[str, int, str]], source: Path, destination: Path
+) -> tuple[str, ...]:
+    """Copy each referenced attachment that can be verified; return the ones that cannot."""
+
+    destination.mkdir(mode=0o700)
+    if source.exists() and (source.is_symlink() or not source.is_dir()):
+        raise BackupError("attachment source must be a real directory")
+    missing: list[str] = []
+    for storage_name, byte_count, expected_sha256 in references:
+        original = source / storage_name
+        target = destination / storage_name
+        try:
+            if not stat.S_ISREG(original.lstat().st_mode):
+                missing.append(storage_name)
+                continue
+            shutil.copyfile(original, target, follow_symlinks=False)
+        except FileNotFoundError:
+            missing.append(storage_name)
+            continue
+        target.chmod(0o600)
+        # Checked on the copy, so the archive holds exactly the bytes that were verified.
+        if not _intact(target, byte_count, expected_sha256):
+            target.unlink()
+            missing.append(storage_name)
+    return tuple(sorted(missing))
 
 
 def _normalized_tar_info(info: tarfile.TarInfo) -> tarfile.TarInfo:
@@ -132,7 +173,21 @@ def _normalized_tar_info(info: tarfile.TarInfo) -> tarfile.TarInfo:
     return info
 
 
-def create_archive(database_path: Path, attachments_path: Path, archive_path: Path) -> None:
+def create_archive(
+    database_path: Path,
+    attachments_path: Path,
+    archive_path: Path,
+    *,
+    allow_incomplete: bool = False,
+) -> BackupResult:
+    """Archive a consistent database snapshot and the attachments its rows reference.
+
+    Files no row references (for example an upload whose transaction never committed)
+    are left out instead of failing the backup. A referenced attachment that is missing
+    or damaged fails the backup, unless `allow_incomplete` asks for an archive that
+    says in its manifest which attachments it lacks.
+    """
+
     if not database_path.is_file() or database_path.is_symlink():
         raise BackupError("database must be a regular file")
     if archive_path.exists():
@@ -145,6 +200,8 @@ def create_archive(database_path: Path, attachments_path: Path, archive_path: Pa
         snapshot = payload / "oveo.sqlite3"
         copied_attachments = payload / "attachments"
 
+        # Holding the write lock keeps the database and the attachment directory
+        # consistent with each other while both are copied.
         locker = sqlite3.connect(database_path, timeout=30, isolation_level=None)
         locker.execute("PRAGMA busy_timeout=30000")
         try:
@@ -157,16 +214,21 @@ def create_archive(database_path: Path, attachments_path: Path, archive_path: Pa
                 target.close()
                 source.close()
             snapshot.chmod(0o600)
-            _copy_attachments(attachments_path, copied_attachments)
             checked = _check_database(snapshot)
             try:
-                _validate_attachment_rows(checked, copied_attachments)
+                references = _referenced_attachments(checked)
             finally:
                 checked.close()
+            missing = _copy_referenced(references, attachments_path, copied_attachments)
+            referenced_names = {storage_name for storage_name, _, _ in references}
+            unreferenced = len(_regular_files(attachments_path) - referenced_names)
         finally:
             if locker.in_transaction:
                 locker.rollback()
             locker.close()
+
+        if missing and not allow_incomplete:
+            raise BackupError(f"{len(missing)} referenced attachment(s) are missing or damaged")
 
         files: dict[str, dict[str, int | str]] = {
             "oveo.sqlite3": {
@@ -174,14 +236,20 @@ def create_archive(database_path: Path, attachments_path: Path, archive_path: Pa
                 "sha256": sha256_file(snapshot),
             }
         }
-        for path in sorted(_walk_regular_files(copied_attachments)):
-            name = (Path("attachments") / path.relative_to(copied_attachments)).as_posix()
-            files[name] = {"size": path.stat().st_size, "sha256": sha256_file(path)}
-        manifest = {
+        for name in sorted(_regular_files(copied_attachments)):
+            path = copied_attachments / name
+            files[f"attachments/{name}"] = {
+                "size": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        manifest: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
             "created_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+            "complete": not missing,
             "files": files,
         }
+        if missing:
+            manifest["missing_attachments"] = list(missing)
         manifest_path = payload / "manifest.json"
         manifest_path.write_text(
             json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
@@ -199,6 +267,7 @@ def create_archive(database_path: Path, attachments_path: Path, archive_path: Pa
                 filter=_normalized_tar_info,
             )
         archive_path.chmod(0o600)
+    return BackupResult(missing=missing, unreferenced=unreferenced)
 
 
 def _validate_member(member: tarfile.TarInfo, seen: set[str]) -> None:
@@ -241,7 +310,7 @@ def _extract_archive(archive_path: Path, destination: Path) -> None:
             target.chmod(0o600)
 
 
-def validate_restored_tree(destination: Path) -> None:
+def validate_restored_tree(destination: Path, *, allow_incomplete: bool = False) -> None:
     manifest_path = destination / "manifest.json"
     database_path = destination / "oveo.sqlite3"
     attachments_path = destination / "attachments"
@@ -254,13 +323,25 @@ def validate_restored_tree(destination: Path) -> None:
     files = manifest.get("files")
     if not isinstance(files, dict) or "oveo.sqlite3" not in files:
         raise BackupError("backup manifest has no database entry")
+    # Backups made before incomplete archives existed have no flag and were complete.
+    complete = manifest.get("complete", True)
+    missing = manifest.get("missing_attachments", [])
+    if complete is not True:
+        if (
+            not isinstance(missing, list)
+            or not missing
+            or not all(isinstance(name, str) and _safe_storage_name(name) for name in missing)
+        ):
+            raise BackupError("incomplete backup manifest does not list its missing attachments")
+        if not allow_incomplete:
+            raise BackupError(
+                f"this backup is INCOMPLETE: {len(missing)} attachment(s) are missing; "
+                "restore it only deliberately, with --allow-incomplete"
+            )
+    elif missing:
+        raise BackupError("complete backup manifest lists missing attachments")
 
-    actual_files = {
-        path.relative_to(destination).as_posix()
-        for path in _walk_regular_files(destination)
-        if path != manifest_path
-    }
-    if actual_files != set(files):
+    if _regular_files(destination) - {"manifest.json"} != set(files):
         raise BackupError("archive membership does not match the manifest")
     for name, metadata in files.items():
         if not isinstance(name, str) or not isinstance(metadata, dict):
@@ -273,21 +354,156 @@ def validate_restored_tree(destination: Path) -> None:
 
     checked = _check_database(database_path)
     try:
-        _validate_attachment_rows(checked, attachments_path)
+        references = _referenced_attachments(checked)
     finally:
         checked.close()
+    expected_missing = set(missing) if complete is not True else set()
+    present: set[str] = set()
+    for storage_name, byte_count, expected_sha256 in references:
+        if storage_name in expected_missing:
+            continue
+        if not _intact(attachments_path / storage_name, byte_count, expected_sha256):
+            raise BackupError(f"referenced attachment is missing or damaged: {storage_name}")
+        present.add(storage_name)
+    if _regular_files(attachments_path) != present:
+        raise BackupError("attachment tree contains files not referenced by the database")
+    if not expected_missing <= {storage_name for storage_name, _, _ in references}:
+        raise BackupError("manifest lists missing attachments the database does not reference")
 
 
-def restore_archive(archive_path: Path, destination: Path) -> None:
+def restore_archive(
+    archive_path: Path, destination: Path, *, allow_incomplete: bool = False
+) -> None:
     if destination.exists():
         raise BackupError("restore destination must not already exist")
     try:
         _extract_archive(archive_path, destination)
-        validate_restored_tree(destination)
+        validate_restored_tree(destination, allow_incomplete=allow_incomplete)
     except Exception:
         if destination.exists():
             shutil.rmtree(destination)
         raise
+
+
+def database_revision(database_path: Path) -> str | None:
+    """The Alembic revision a database is at, or None when there is no database yet."""
+
+    if not database_path.exists():
+        return None
+    if not database_path.is_file() or database_path.is_symlink():
+        raise BackupError("database must be a regular file")
+    connection = _open_readonly_database(database_path)
+    try:
+        has_table = connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='alembic_version'"
+        ).fetchone()
+        rows = (
+            connection.execute("SELECT version_num FROM alembic_version").fetchall()
+            if has_table is not None
+            else []
+        )
+    finally:
+        connection.close()
+    if has_table is None:
+        return None
+    if len(rows) != 1 or not isinstance(rows[0][0], str):
+        raise BackupError("the database does not record exactly one schema revision")
+    return str(rows[0][0])
+
+
+def _same_owner(path: Path, reference: os.stat_result) -> None:
+    os.chown(path, reference.st_uid, reference.st_gid, follow_symlinks=False)
+
+
+def _link_or_copy(source: Path, target: Path) -> None:
+    try:
+        # Attachment files are written once and never modified, so a hard link is an
+        # exact, instant copy that later deletions in the live tree do not affect.
+        os.link(source, target, follow_symlinks=False)
+    except OSError as error:
+        if error.errno not in {errno.EXDEV, errno.EPERM, errno.EMLINK}:
+            raise
+        shutil.copy2(source, target, follow_symlinks=False)
+        _same_owner(target, source.lstat())
+
+
+def snapshot_data_dir(data_dir: Path, destination: Path) -> int:
+    """Copy a stopped deployment's data directory so it can be put back whole.
+
+    The database goes through SQLite's backup API, attachments are hard-linked,
+    `logs/` and the deployed-image record are copied, and the maintenance marker is
+    left out. Returns the number of attachment files.
+    """
+
+    if destination.exists():
+        raise BackupError("snapshot destination must not already exist")
+    if data_dir.is_symlink() or not data_dir.is_dir():
+        raise BackupError("data directory must be a real directory")
+    destination.mkdir(mode=0o700)
+    try:
+        _same_owner(destination, data_dir.stat())
+        database = data_dir / "oveo.sqlite3"
+        if database.exists():
+            if database.is_symlink() or not database.is_file():
+                raise BackupError("database must be a regular file")
+            copied = destination / "oveo.sqlite3"
+            locker = sqlite3.connect(database, timeout=30, isolation_level=None)
+            try:
+                locker.execute("PRAGMA busy_timeout=30000")
+                locker.execute("BEGIN IMMEDIATE")
+                source = _open_readonly_database(database)
+                target = sqlite3.connect(copied)
+                try:
+                    source.backup(target)
+                finally:
+                    target.close()
+                    source.close()
+            finally:
+                if locker.in_transaction:
+                    locker.rollback()
+                locker.close()
+            copied.chmod(0o600)
+            _same_owner(copied, database.stat())
+            _check_database(copied).close()
+
+        attachments = data_dir / "attachments"
+        linked = 0
+        if attachments.exists():
+            names = _regular_files(attachments)
+            if any("/" in name for name in names):
+                raise BackupError("attachments must not contain subdirectories")
+            target_dir = destination / "attachments"
+            target_dir.mkdir(mode=0o700)
+            _same_owner(target_dir, attachments.stat())
+            for name in sorted(names):
+                _link_or_copy(attachments / name, target_dir / name)
+                linked += 1
+            if _regular_files(target_dir) != names:
+                raise BackupError("attachment snapshot does not match the data directory")
+
+        for directory_name in _SNAPSHOT_DIRECTORIES:
+            directory = data_dir / directory_name
+            if not directory.exists():
+                continue
+            if directory.is_symlink() or not directory.is_dir():
+                raise BackupError(f"{directory_name} must be a real directory")
+            target_dir = destination / directory_name
+            target_dir.mkdir(mode=0o700)
+            _same_owner(target_dir, directory.stat())
+            for name in sorted(_regular_files(directory)):
+                if "/" in name:
+                    continue
+                shutil.copy2(directory / name, target_dir / name, follow_symlinks=False)
+                _same_owner(target_dir / name, (directory / name).lstat())
+        for file_name in _SNAPSHOT_FILES:
+            record = data_dir / file_name
+            if record.is_file() and not record.is_symlink():
+                shutil.copy2(record, destination / file_name, follow_symlinks=False)
+                _same_owner(destination / file_name, record.lstat())
+    except BaseException:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+    return linked
 
 
 def main() -> int:
@@ -297,19 +513,60 @@ def main() -> int:
     create.add_argument("--database", type=Path, required=True)
     create.add_argument("--attachments", type=Path, required=True)
     create.add_argument("--archive", type=Path, required=True)
+    create.add_argument(
+        "--allow-incomplete",
+        action="store_true",
+        help=f"write an archive marked incomplete (exit {EXIT_INCOMPLETE}) when attachments "
+        "are missing",
+    )
     restore = subparsers.add_parser("restore")
     restore.add_argument("--archive", type=Path, required=True)
     restore.add_argument("--destination", type=Path, required=True)
+    restore.add_argument("--allow-incomplete", action="store_true")
     verify = subparsers.add_parser("verify-tree")
     verify.add_argument("--destination", type=Path, required=True)
+    verify.add_argument("--allow-incomplete", action="store_true")
+    revision = subparsers.add_parser("revision", help="print the database schema revision")
+    revision.add_argument("--database", type=Path, required=True)
+    snapshot = subparsers.add_parser("snapshot", help="copy a stopped data directory")
+    snapshot.add_argument("--data-dir", type=Path, required=True)
+    snapshot.add_argument("--destination", type=Path, required=True)
     arguments = parser.parse_args()
     try:
         if arguments.command == "create":
-            create_archive(arguments.database, arguments.attachments, arguments.archive)
+            result = create_archive(
+                arguments.database,
+                arguments.attachments,
+                arguments.archive,
+                allow_incomplete=arguments.allow_incomplete,
+            )
+            if result.unreferenced:
+                print(
+                    f"{result.unreferenced} unreferenced attachment file(s) were not archived",
+                    file=sys.stderr,
+                )
+            if not result.complete:
+                print(
+                    f"INCOMPLETE backup: {len(result.missing)} referenced attachment(s) "
+                    "are missing or damaged",
+                    file=sys.stderr,
+                )
+                return EXIT_INCOMPLETE
         elif arguments.command == "restore":
-            restore_archive(arguments.archive, arguments.destination)
+            restore_archive(
+                arguments.archive,
+                arguments.destination,
+                allow_incomplete=arguments.allow_incomplete,
+            )
+        elif arguments.command == "verify-tree":
+            validate_restored_tree(
+                arguments.destination, allow_incomplete=arguments.allow_incomplete
+            )
+        elif arguments.command == "revision":
+            print(database_revision(arguments.database) or "none")
         else:
-            validate_restored_tree(arguments.destination)
+            count = snapshot_data_dir(arguments.data_dir, arguments.destination)
+            print(f"Snapshot holds the database and {count} attachment file(s).")
     except BackupError as error:
         parser.exit(1, f"backup validation failed: {error}\n")
     return 0

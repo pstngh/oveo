@@ -54,10 +54,12 @@ Copy the deployment artifacts with root ownership:
 /usr/local/sbin/oveo-deploy                  <- deploy/oveo-deploy.sh
 /usr/local/sbin/oveo-backup                  <- deploy/oveo-backup.sh
 /usr/local/sbin/oveo-restore                 <- deploy/oveo-restore.sh
+/usr/local/sbin/oveo-backup-alert            <- deploy/oveo-backup-alert.sh
 /usr/local/lib/oveo/backup_tool.py            <- deploy/backup_tool.py
 /usr/local/lib/oveo/validate_staging.py       <- deploy/validate_staging.py
 /opt/oveo/rehearsal.env                       <- exact-image CI rehearsal attestation
 /etc/systemd/system/oveo-backup.service       <- deploy/systemd/oveo-backup.service
+/etc/systemd/system/oveo-backup-failure.service <- deploy/systemd/oveo-backup-failure.service
 /etc/systemd/system/oveo-backup.timer         <- deploy/systemd/oveo-backup.timer
 ```
 
@@ -84,7 +86,19 @@ Keep the repository variable `OVEO_DEPLOY_ENABLED=true` after the host prerequis
 
 ## Deployment and rollback
 
-Every passing push to `main` builds off-host, publishes a SHA-tagged image, resolves its immutable digest, and calls `oveo-deploy`. The host script serializes maintenance with `flock`, validates the exact repository/digest, pulls it, starts the service, and requires both loopback and public HTTPS readiness. If startup or health fails, it restores the preceding digest, pulling it from GHCR when necessary. After success it removes only superseded digest references from `ghcr.io/pstngh/oveo`; there is no global prune.
+Every passing push to `main` builds off-host, publishes a SHA-tagged image, resolves its immutable digest, and calls `oveo-deploy`. The host script serializes maintenance with `flock`, validates the exact repository/digest, pulls it, starts the service, and requires both loopback and public HTTPS readiness. After success it removes only superseded digest references from `ghcr.io/pstngh/oveo`; there is no global prune.
+
+Before starting a candidate, `oveo-deploy` compares the database's schema revision with the migrations the candidate image lists (`oveo-admin schema-revisions`, read from the image without starting it):
+
+- **No migration (the usual case).** The candidate replaces the running release directly. If it fails to start or to pass readiness, the preceding digest is started again on the same, unchanged database. Writes are never paused.
+- **The candidate migrates the database** (or is too old to list its migrations). The previous image cannot run on a migrated database, so the script: creates the write gate `/var/lib/oveo/maintenance-mode` (while it exists the application answers state-changing requests, including sign-in, with 503, and still serves pages, reads and health checks); stops the running release; copies the whole data directory to `/var/lib/oveo.predeploy.TIMESTAMP` (the database through SQLite's backup API, attachments as hard links, error logs and the deployed-image record as copies); starts the candidate, which migrates and must pass both readiness checks behind the gate; and only then removes the gate. If the candidate fails, the script stops it, moves the migrated data directory aside to `/var/lib/oveo.failed-deploy.TIMESTAMP`, moves the snapshot back into place as a whole directory, and starts the preceding image. Because the candidate never accepted writes, the set-aside directory normally differs from the snapshot only by the migration; it is kept for review. Oveo is unavailable from the stop until the candidate passed its checks (or until the preceding image is back): the container's 30-second stop grace period, the snapshot, the migration, and up to about two minutes of readiness checks. The database is never rewound on its own: a database-only rewind would lose, and let the startup sweep delete, attachments written after the snapshot.
+- A database at a revision the candidate does not know (an older release deployed onto a newer schema) is refused before anything changes.
+
+After a verified migrating deployment, remove only the exact `/var/lib/oveo.predeploy.TIMESTAMP` directory the script printed; it holds pre-release copies of all user data. Remove a `failed-deploy` directory only after reviewing it. Never glob or prune `/var/lib`.
+
+If `oveo-deploy` refuses to start because `/var/lib/oveo/maintenance-mode` exists, an earlier deployment was interrupted. Check which image runs (`docker compose ... ps`, `cat /etc/oveo/deploy.env`), that `curl --fail http://127.0.0.1:8000/health/ready` passes, and that the database revision matches that image (`python3 /usr/local/lib/oveo/backup_tool.py revision --database /var/lib/oveo/oveo.sqlite3`); then remove the marker by its exact path. If the running release is not healthy, stop it and put back the printed `predeploy` directory as described above before starting the preceding image.
+
+Prefer backward-compatible, expand-only migrations (new nullable or defaulted columns and tables, with drops or renames in a later release): they keep every deployment short even though the gated path above makes any migration safe to roll back.
 
 CI gives the deployment job read-only package permission. Its short-lived GHCR login uses a private temporary `DOCKER_CONFIG` inside the staged bundle and is removed afterward, so it never reads, overwrites, or logs out any pre-existing root Docker credentials on the shared VPS.
 
@@ -125,7 +139,9 @@ systemctl enable --now oveo-backup.timer
 systemctl list-timers oveo-backup.timer
 ```
 
-The backup helper holds a SQLite writer lock, uses SQLite's online backup API, copies only regular attachment files, rejects any file not referenced by the snapshot, validates attachment sizes and SHA-256 values, runs SQLite quick/foreign-key checks, encrypts with `age`, decrypts and restores into a disposable directory for verification, and only then publishes the backup. The seven newest successful encrypted backups are retained. Deleted content can therefore remain for at most seven successful daily rotations.
+The backup helper holds a SQLite writer lock, uses SQLite's online backup API, copies exactly the attachment files the snapshot's rows reference (files no row references, such as an upload whose transaction never committed, are left out and counted in the log instead of failing the backup), validates attachment sizes and SHA-256 values on the copies, runs SQLite quick/foreign-key checks, encrypts with `age`, decrypts and restores into a disposable directory for verification, and only then publishes the backup. The seven newest successful encrypted backups are retained. Deleted content can therefore remain for at most seven successful daily rotations.
+
+If a referenced attachment is missing or damaged, the run still saves what it could verify, as a visibly incomplete backup: `/var/backups/oveo/incomplete/oveo-INCOMPLETE-TIMESTAMP.tar.gz.age`, whose manifest says `"complete": false` and lists the missing attachments. Incomplete backups live outside the rotation of complete backups (the newest seven incomplete ones are kept separately), so they never replace, prune or count as a complete backup, and the run fails. Every failed run triggers `oveo-backup-failure.service`, which sends nothing off the host: it writes `/var/backups/oveo/BACKUP-FAILED` and a critical journal entry (`journalctl -p crit -t oveo-backup`). The next complete backup removes the record. Check for it after maintenance, or connect it to a notification channel of your choice.
 
 Test a restore at any time with `--destination`. A live restore is intentionally explicit and keeps both the pre-restore tree and any rejected restored tree:
 
@@ -133,7 +149,32 @@ Test a restore at any time with `--destination`. A live restore is intentionally
 /usr/local/sbin/oveo-restore /var/backups/oveo/oveo-TIMESTAMP.tar.gz.age --live --confirm RESTORE
 ```
 
+A live restore stops Oveo, moves the whole current data directory aside to `/var/lib/oveo.pre-restore.TIMESTAMP`, puts the verified backup in its place with the current error logs and deployed-image record, and starts the application behind the write gate until readiness passes. Everything written after the backup was taken exists only in the pre-restore directory; a restore never merges it back. If readiness fails, the restored tree is kept as `/var/lib/oveo.failed-restore.TIMESTAMP` and the previous data directory is put back. An incomplete backup is refused unless `--allow-incomplete` is added deliberately; its restored conversations lack the attachments its manifest lists.
+
 After successful application-level verification, remove only the exact timestamped `/var/lib/oveo.pre-restore.TIMESTAMP` directory. Never glob or prune `/var/lib`.
+
+## Shared host directories
+
+`/run/lock` and `/var/tmp` belong to the whole host and are normally mode `1777` (systemd-tmpfiles). Earlier versions of the Oveo deploy, backup and restore scripts ran `install -d -m 0700` on them, which made them root-only until the next boot; the scripts no longer create or change either directory. Check them once without changing anything:
+
+```bash
+stat -c '%a %n' /run/lock /var/tmp
+```
+
+If either shows `700`, restore the systemd default in a maintenance window with `systemd-tmpfiles --create` (or `chmod 1777` on that exact directory) after confirming the host's tmpfiles configuration expects `1777`.
+
+## Stored request context
+
+Finished generations no longer keep the full model context they were sent. Rows finished before that change still hold it; nothing reads it after a generation finishes. Report, then optionally clear, only that column on finished rows (messages, documents, attachments, usage records and content-free diagnostics are unchanged):
+
+```bash
+docker compose --project-name oveo --env-file /etc/oveo/deploy.env \
+  -f /opt/oveo/compose.yml exec app oveo-admin clear-terminal-snapshots
+docker compose --project-name oveo --env-file /etc/oveo/deploy.env \
+  -f /opt/oveo/compose.yml exec app oveo-admin clear-terminal-snapshots --apply
+```
+
+The command works in small batches beside the running application and is never run automatically. The database file keeps its size until a `VACUUM`; that is optional, needs free disk space of about the database size, and must run only in a maintenance window with Oveo stopped and a fresh backup taken. Old encrypted backups keep their copies until they rotate out.
 
 ## Request limits and client addresses
 

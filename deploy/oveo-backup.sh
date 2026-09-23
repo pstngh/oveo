@@ -6,7 +6,14 @@ config=/etc/oveo/backup.env
 database=/var/lib/oveo/oveo.sqlite3
 attachments=/var/lib/oveo/attachments
 backup_dir=/var/backups/oveo
+# Backups that lack attachments live apart from the rotation of complete backups, so
+# they can never displace one or be mistaken for the newest restorable backup.
+incomplete_dir=$backup_dir/incomplete
+# Written by oveo-backup-alert when a run fails; a complete backup clears it.
+failure_record=$backup_dir/BACKUP-FAILED
 tool=/usr/local/lib/oveo/backup_tool.py
+# Shared with every other service on the host: used, never created or changed.
+lock_dir=/run/lock
 
 die() {
   echo "oveo-backup: $*" >&2
@@ -32,8 +39,9 @@ for command in age flock python3; do
   command -v "$command" >/dev/null 2>&1 || die "$command is not installed"
 done
 
-install -d -m 0700 "$backup_dir" /run/lock
-exec 9>/run/lock/oveo-maintenance.lock
+install -d -m 0700 "$backup_dir"
+[ -d "$lock_dir" ] || die "$lock_dir is missing"
+exec 9>"$lock_dir/oveo-maintenance.lock"
 flock -w 600 9 || die "timed out waiting for the host maintenance lock"
 
 # An unclean shutdown can leave plaintext only in an exact private staging directory.
@@ -61,12 +69,41 @@ encrypted=$staging/oveo-$stamp.tar.gz.age
 verified=$staging/verified.tar.gz
 final=$backup_dir/oveo-$stamp.tar.gz.age
 
-python3 "$tool" create --database "$database" --attachments "$attachments" --archive "$plain"
+# Exit status 3: the archive was written but lacks referenced attachments.
+status=0
+python3 "$tool" create --allow-incomplete --database "$database" \
+  --attachments "$attachments" --archive "$plain" || status=$?
+case "$status" in
+  0) complete=true ;;
+  3) complete=false ;;
+  *) die "the backup could not be created" ;;
+esac
 age --recipient "$AGE_RECIPIENT" --output "$encrypted" "$plain"
 age --decrypt --identity "$AGE_IDENTITY_FILE" --output "$verified" "$encrypted"
 verify_dir=$staging/verified
-python3 "$tool" restore --archive "$verified" --destination "$verify_dir"
+if [ "$complete" = true ]; then
+  python3 "$tool" restore --archive "$verified" --destination "$verify_dir"
+else
+  python3 "$tool" restore --allow-incomplete --archive "$verified" --destination "$verify_dir"
+fi
 chmod 0600 "$encrypted"
+
+if [ "$complete" = false ]; then
+  install -d -m 0700 "$incomplete_dir"
+  kept=$incomplete_dir/oveo-INCOMPLETE-$stamp.tar.gz.age
+  mv "$encrypted" "$kept"
+  find "$incomplete_dir" -mindepth 1 -maxdepth 1 -type f -name 'oveo-INCOMPLETE-*.tar.gz.age' -print \
+    | sort -r | sed -n '8,$p' \
+    | while IFS= read -r stale; do
+        [ "$(dirname "$stale")" = "$incomplete_dir" ] || die "unsafe rotation path"
+        basename "$stale" | grep -Eq '^oveo-INCOMPLETE-[0-9]{8}T[0-9]{6}Z\.tar\.gz\.age$' \
+          || die "unsafe rotation filename"
+        rm -f -- "$stale"
+      done
+  # Fail the run so the failure alert fires; the complete backups were not touched.
+  die "INCOMPLETE backup kept at $kept: referenced attachments are missing or damaged (see OPERATIONS.md)"
+fi
+
 mv "$encrypted" "$final"
 
 # Keep the seven newest successful encrypted backups. Only exact Oveo backup names qualify.
@@ -79,4 +116,5 @@ find "$backup_dir" -mindepth 1 -maxdepth 1 -type f -name 'oveo-*.tar.gz.age' -pr
       rm -f -- "$stale"
     done
 
+rm -f -- "$failure_record"
 echo "Created and verified encrypted backup: $final"

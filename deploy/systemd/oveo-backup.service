@@ -2,6 +2,8 @@
 Description=Create and verify Oveo encrypted local backup
 RequiresMountsFor=/var/lib/oveo /var/backups/oveo
 After=docker.service
+# A failed or incomplete backup leaves a record and a critical journal entry.
+OnFailure=oveo-backup-failure.service
 
 [Service]
 Type=oneshot
