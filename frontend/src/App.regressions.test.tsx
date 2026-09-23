@@ -111,7 +111,8 @@ describe("M-2 / F-1: every sign-in starts from nothing", () => {
     await screen.findByRole("form", { name: "Sign in to Oveo" });
     expect(FakeEventSource.instances[0].readyState).toBe(FakeEventSource.CLOSED);
     expect(document.title).toBe("Oveo");
-    expect(window.location.pathname).toBe("/");
+    // The address is normalized by an effect right after the first render.
+    await waitFor(() => expect(window.location.pathname).toBe("/"));
 
     await user.type(screen.getByLabelText("Username"), "yousra");
     await user.type(screen.getByLabelText("Password"), "synthetic");
@@ -120,7 +121,7 @@ describe("M-2 / F-1: every sign-in starts from nothing", () => {
     expect(await screen.findByRole("heading", { name: "What would you like to do?" })).toBeInTheDocument();
     expect(screen.getByRole("navigation", { name: "Conversations" })).not.toHaveTextContent("Charles private layoff memo");
     expect(screen.queryByText("Private draft")).not.toBeInTheDocument();
-    expect(window.location.pathname).toBe("/new");
+    await waitFor(() => expect(window.location.pathname).toBe("/new"));
   });
 
   it("closes the workspace and its streams when the session ends elsewhere (401)", async () => {
@@ -509,7 +510,7 @@ describe("L-14 / F-4: identifiers never address another route", () => {
     const thread = vi.spyOn(api, "thread");
     render(<App />);
     expect(await screen.findByRole("heading", { name: "What would you like to do?" })).toBeInTheDocument();
-    expect(window.location.pathname).toBe("/new");
+    await waitFor(() => expect(window.location.pathname).toBe("/new"));
     expect(thread).not.toHaveBeenCalled();
   });
 
