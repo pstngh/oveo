@@ -48,7 +48,7 @@ async def test_streaming_request_locks_model_privacy_and_parses_actual_cost(
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert body == {
-            "model": "openai/gpt-5.6-luna",
+            "model": "openai/gpt-6-luna",
             "messages": [
                 {"role": "system", "content": "system"},
                 {"role": "user", "content": "synthetic request"},

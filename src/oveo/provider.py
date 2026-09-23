@@ -15,7 +15,7 @@ from tiktoken import Encoding
 
 from .config import Settings
 
-OPENROUTER_MODEL = "openai/gpt-5.6-luna"
+OPENROUTER_MODEL = "openai/gpt-6-luna"
 _PROVIDER_ROUTING: dict[str, object] = {
     "order": ["azure/eu"],
     "allow_fallbacks": True,
@@ -54,7 +54,9 @@ class ProviderCompletion:
 
 @lru_cache(maxsize=1)
 def _model_encoding() -> Encoding:
-    return tiktoken.encoding_for_model(OPENROUTER_MODEL.partition("/")[2])
+    # tiktoken does not yet map GPT-6 Luna by model name. Use the established
+    # o200k_base encoding for local estimates until a mapping is published.
+    return tiktoken.get_encoding("o200k_base")
 
 
 def warm_tokenizer() -> None:
@@ -67,9 +69,8 @@ def count_input_tokens(messages: Sequence[ProviderMessage]) -> int:
     """Count model input tokens with a small allowance for chat framing.
 
     OpenRouter does not expose OpenAI's preflight input-token endpoint. The content and
-    roles use Luna's model tokenizer exactly; the framing allowance is deliberately
-    conservative and the default 32K-token margin absorbs provider serialization
-    differences.
+    roles use o200k_base as an estimate. The framing allowance is conservative,
+    and the default 32K-token margin absorbs provider serialization differences.
     """
 
     encoding = _model_encoding()

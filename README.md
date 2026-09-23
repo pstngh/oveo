@@ -104,10 +104,11 @@ current modes and work kinds, and runs an Alembic schema drift check.
 All settings use the `OVEO_` prefix. See `.env.example`. Production requires the
 two account-specific Argon2id hashes, the OpenRouter key,
 `OVEO_ENVIRONMENT=production`, the trusted public origin/host, secure cookies,
-persistent data paths, and the fixed `openai/gpt-5.6-luna` privacy-eligible routing.
+persistent data paths, and the fixed `openai/gpt-6-luna` privacy-eligible routing.
 
-Conversation and handoff inputs are counted with Luna's tokenizer. Oveo compacts
-at 240,000 input tokens by default, leaving a 32,000-token margin below Luna's
+Conversation and handoff inputs are estimated with `o200k_base` while `tiktoken`
+does not map GPT-6 Luna by model name. Oveo compacts at 240,000 input tokens by
+default, leaving a 32,000-token margin below Luna's
 long-context pricing boundary. Oversized handoffs are reduced in user-only chunks;
 assistant turns, internal summaries, canonical work, and application prompts never
 enter those chunks.
