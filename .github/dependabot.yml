@@ -1,0 +1,18 @@
+# Actions and base images are pinned to exact commits and digests; these updates keep
+# the pins current. Each proposal runs the full CI, including the image rehearsal.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      base-images:
+        patterns: ["*"]

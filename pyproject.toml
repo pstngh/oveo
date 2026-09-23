@@ -21,7 +21,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "mypy>=1.17,<2",
-  "pytest>=8.4,<9",
+  # 9.0.3 fixes GHSA-6w46-j5rx-g56g (CVE-2025-71176): predictable /tmp/pytest-of-{user}.
+  "pytest>=9.0.3,<10",
   "pytest-asyncio>=1.1,<2",
   "pytest-cov>=6.2,<7",
   "ruff>=0.12,<1",

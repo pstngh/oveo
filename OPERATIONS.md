@@ -100,6 +100,8 @@ If `oveo-deploy` refuses to start because `/var/lib/oveo/maintenance-mode` exist
 
 Prefer backward-compatible, expand-only migrations (new nullable or defaulted columns and tables, with drops or renames in a later release): they keep every deployment short even though the gated path above makes any migration safe to roll back.
 
+Every third-party GitHub Action is pinned to a full commit SHA and every base image (and the Dockerfile syntax frontend) to a content digest, with the human-readable version in a comment. Dependabot proposes weekly updates for both; each proposal runs the same checks and exact-image rehearsal before it can be merged.
+
 CI gives the deployment job read-only package permission. Its short-lived GHCR login uses a private temporary `DOCKER_CONFIG` inside the staged bundle and is removed afterward, so it never reads, overwrites, or logs out any pre-existing root Docker credentials on the shared VPS.
 
 Manual status and health checks:
