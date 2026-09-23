@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from decimal import Decimal
 from pathlib import Path
@@ -363,3 +364,25 @@ async def test_keep_alives_cannot_extend_an_attempt_past_its_deadline(tmp_path: 
     assert caught.value.partial is True
     assert calls == 1
     assert elapsed < 3
+
+
+def test_token_counts_are_cached_under_a_digest_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    # L-6: compaction and preflight count the same prompt and transcript text repeatedly.
+    import oveo.provider as provider_module
+
+    counted: list[str] = []
+
+    class CountingEncoding:
+        def encode(self, text: str, disallowed_special: object = ()) -> list[int]:
+            counted.append(text)
+            return [0] * len(text.split())
+
+    monkeypatch.setattr(provider_module, "_model_encoding", CountingEncoding)
+    monkeypatch.setattr(provider_module, "_token_cache", OrderedDict())
+    text = "Synthetic transcript text. " * 40
+
+    assert provider_module.count_text_tokens(text) == 120
+    assert provider_module.count_text_tokens(text) == 120
+    assert counted == [text]
+    # Keys are SHA-256 digests: the cache never holds conversation text.
+    assert [len(key) for key in provider_module._token_cache] == [32]

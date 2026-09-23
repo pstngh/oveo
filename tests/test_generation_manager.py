@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
 from collections.abc import AsyncGenerator
 from typing import cast
 
@@ -16,7 +17,7 @@ from sqlalchemy import func, select
 from oveo.attachments import ValidatedAttachment
 from oveo.config import Settings
 from oveo.db import Database
-from oveo.docx import DocxBlock
+from oveo.docx import DocxBlock, docx_uncompressed_limit, extract_docx
 from oveo.generation import (
     ActiveGenerationError,
     GenerationManager,
@@ -41,7 +42,7 @@ from oveo.protocol import (
     StateOperation,
 )
 from oveo.provider import OpenRouterClient
-from tests.docx_fixtures import make_docx, textbox_document
+from tests.docx_fixtures import W, make_docx, textbox_document
 
 
 def _document(state: StateOperation, visible: str) -> ProtocolDocument:
@@ -1670,4 +1671,80 @@ async def test_outdated_stored_docx_map_fails_closed_and_keeps_the_response(
     assert len(provider.requests) == 1
     async with database.sessions() as db:
         assert await db.scalar(select(func.count()).select_from(WorkVersion)) == 0
+    await manager.shutdown()
+
+
+async def test_docx_template_is_parsed_before_the_commit_takes_the_write_lock(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    # L-6: parsing a template can take a while; other writers must not wait for it.
+    database, settings, user = manager_database
+    package = make_docx(
+        document_xml=(
+            f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<w:document xmlns:w="{W}"><w:body>'
+            "<w:p><w:r><w:t>First paragraph.</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>Second paragraph.</w:t></w:r></w:p>"
+            "<w:sectPr/></w:body></w:document>"
+        )
+    )
+    blocks = extract_docx(
+        package, max_uncompressed_bytes=docx_uncompressed_limit(settings.max_upload_bytes)
+    ).blocks
+    attachment = ValidatedAttachment(
+        original_name="plain.docx",
+        content=package,
+        byte_count=len(package),
+        word_count=4,
+        sha256=hashlib.sha256(package).hexdigest(),
+        document_blocks=blocks,
+    )
+    translated = [block.text.upper() for block in blocks]
+    provider = ScriptedProvider(
+        [
+            _response_stream(
+                "\n\n".join(translated),
+                {
+                    "operation": "establish",
+                    "brief": {"direction": "en-fr"},
+                    "docx_blocks": [
+                        {"id": block.id, "text": text}
+                        for block, text in zip(blocks, translated, strict=True)
+                    ],
+                },
+            )
+        ]
+    )
+    manager = GenerationManager(database, settings, provider)
+    database_path = settings.database_url.split(":///", 1)[1]
+    observed: list[str] = []
+    original = manager._load_docx_template
+
+    def load_while_checking_the_lock(template: object) -> object:
+        other = sqlite3.connect(database_path, timeout=0.2)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            other.rollback()
+            observed.append("write lock free")
+        except sqlite3.OperationalError:
+            observed.append("write lock held")
+        finally:
+            other.close()
+        return original(template)  # type: ignore[arg-type]
+
+    manager._load_docx_template = load_while_checking_the_lock  # type: ignore[assignment,method-assign]
+    submitted = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="plain-docx",
+        text="Translate the attached document.",
+        attachment=attachment,
+        owner_id=user.id,
+        mode="translate",
+    )
+    final = await _wait_status(manager, submitted.generation_id, {"completed", "failed"})
+
+    assert final["status"] == "completed", final
+    assert observed == ["write lock free"]
+    async with database.sessions() as db:
+        assert await db.scalar(select(func.count()).select_from(WorkVersion)) == 1
     await manager.shutdown()
