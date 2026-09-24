@@ -58,7 +58,7 @@ const MODE_COPY: Record<Mode, { label: string; heading: string; guidance: string
   internal_comms: {
     label: "Communications",
     heading: "What internal communication do you need?",
-    guidance: "Share the brief, known facts, audience, desired locale, and any practical constraints. Oveo will not invent missing details.",
+    guidance: "Share the brief, known facts, audience, desired locale (or both English and French), and any practical constraints. Oveo will not invent missing details.",
   },
 };
 

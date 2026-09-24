@@ -41,9 +41,9 @@ load the visible response protocol. Prompt handoff compaction continues to use i
 separate user-only extraction contract.
 
 The conflict policy is explicit: runtime security/protocol invariants; mode scope,
-semantics, and preservation; mandatory Alithya terminology/names/protected content;
-permitted explicit user choices; then default brand/style. Prompt ordering is not
-the conflict-resolution mechanism.
+semantics, and preservation; permitted explicit user choices (the user has the final
+say on wording); Alithya terminology/names/protected content; then default
+brand/style. Prompt ordering is not the conflict-resolution mechanism.
 
 Conversation, source, attachment, quoted, summary, prior assistant, brief, and
 canonical document text is serialized in one separately delimited JSON data
@@ -144,9 +144,9 @@ validated map, and commits the map in the same transaction as the assistant mess
 and `work_version`. An `establish` that returns a block map uses the conversation's
 most recent source DOCX, so Oveo can ask a clarifying question (such as the French
 variety) before translating an upload. Reference block IDs are never accepted as the
-working map. Export is an authenticated, private/no-store GET that selects the latest active
-canonical version and patches the original OOXML package in memory. Generated
-exports are not persisted.
+working map. Export is an authenticated, private/no-store GET that selects the
+latest active canonical version and patches the original OOXML package in memory.
+Generated exports are not persisted.
 
 ## Browser application
 

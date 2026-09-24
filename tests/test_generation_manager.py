@@ -16,6 +16,7 @@ from sqlalchemy import func, select
 
 from oveo.attachments import ValidatedAttachment
 from oveo.config import Settings
+from oveo.context import build_provider_messages
 from oveo.db import Database
 from oveo.docx import DocxBlock, docx_uncompressed_limit, extract_docx
 from oveo.generation import (
@@ -41,7 +42,7 @@ from oveo.protocol import (
     SourceOutputReplacement,
     StateOperation,
 )
-from oveo.provider import OpenRouterClient
+from oveo.provider import OpenRouterClient, count_input_tokens
 from tests.docx_fixtures import W, make_docx, textbox_document
 
 
@@ -1191,14 +1192,29 @@ async def test_persisted_canonical_state_rejects_stale_and_oversized_mutations(
     await manager.shutdown()
 
 
+# Room for the latest turns of the compaction tests' threads but not the whole thread.
+# Their budgets add it to the prompts' own size, so editing a prompt cannot break them.
+_TRANSCRIPT_ALLOWANCE = 6_500
+
+
+def _chat_prompt_tokens() -> int:
+    """Tokens a Translate chat request spends before any conversation data."""
+
+    thread = Thread(id="calibration", owner_id="calibration", mode="translate", title="Calibration")
+    return count_input_tokens(
+        build_provider_messages(thread, purpose="chat", recent_messages=[], actor_labels={})
+    )
+
+
 async def test_automatic_compaction_preserves_recent_transcript_and_accounts_cost(
     manager_database: tuple[Database, Settings, User],
 ) -> None:
     database, base_settings, user = manager_database
-    # Calibrated to the version-controlled prompts: above the prompts plus the latest
-    # turns, below the whole thread. Growing the prompts can require raising it.
     settings = base_settings.model_copy(
-        update={"context_compaction_tokens": 11_500, "context_recent_messages": 4}
+        update={
+            "context_compaction_tokens": _chat_prompt_tokens() + _TRANSCRIPT_ALLOWANCE,
+            "context_recent_messages": 4,
+        }
     )
     async with database.sessions() as db:
         thread = Thread(
@@ -1254,10 +1270,11 @@ async def test_malformed_summary_is_retried_once_without_killing_user_turn(
     manager_database: tuple[Database, Settings, User],
 ) -> None:
     database, base_settings, user = manager_database
-    # Calibrated to the version-controlled prompts: above the prompts plus the latest
-    # turns, below the whole thread. Growing the prompts can require raising it.
     settings = base_settings.model_copy(
-        update={"context_compaction_tokens": 11_500, "context_recent_messages": 4}
+        update={
+            "context_compaction_tokens": _chat_prompt_tokens() + _TRANSCRIPT_ALLOWANCE,
+            "context_recent_messages": 4,
+        }
     )
     async with database.sessions() as db:
         thread = Thread(owner_id=user.id, mode="translate", title="Existing thread")

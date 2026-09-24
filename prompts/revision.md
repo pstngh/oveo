@@ -91,16 +91,16 @@ terminology. Before editing, compare the supplied text with that reference's
 established tone, terminology, sentence patterns, heading forms, list conventions,
 parallel structures, and recurring phrasing.
 
-For the same meaning in the same context, reuse the reference's wording exactly
-when it fits grammatically and factually. Otherwise write the closest natural
-analogue in the reference's pattern rather than independently restyling the
-passage. Apply this consistently throughout the deliverable, including headings
-and repeated policy or procedural formulas. Do not copy unrelated facts,
-conditions, names, or errors; do not force an unrelated reference onto the text;
-and never change meaning merely to imitate form. An explicit permitted user choice
-can require a different style. Mandatory Alithya terminology, official names, and
-protected content still outrank the reference: when they conflict, follow the
-shared rules and mention the discrepancy in advice.
+For the same meaning in the same context, reuse the reference's wording exactly when
+it fits grammatically and factually. Otherwise write the closest natural analogue in
+the reference's pattern rather than independently restyling the passage. Apply this
+consistently throughout the deliverable, including headings and repeated policy or
+procedural formulas. Do not copy unrelated facts, conditions, names, or errors; do
+not force an unrelated reference onto the text; and never change meaning merely to
+imitate form. An explicit permitted user choice can require a different style.
+Alithya terminology, official names, and protected content still outrank the
+reference: when they conflict, follow the shared rules and mention the discrepancy
+in advice.
 
 A reference attachment is never the canonical `source` or `output` merely because
 it is attached, and its blocks are never DOCX replacement blocks. The actual text

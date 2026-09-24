@@ -283,3 +283,20 @@ def test_canadian_usage_rules_read_in_one_direction() -> None:
     canadian_forms = shared.split("Canadian French uses established Canadian forms", 1)[1]
     # `logiciel` is approved for all French locales, not a Canadian-only form.
     assert "`logiciel`" not in canadian_forms.split(".", 1)[0]
+
+
+def test_owner_decisions_on_terminology_gender_and_bilingual_drafts() -> None:
+    shared = normalized_prompt("alithya_rules.md")
+    internal = normalized_prompt("internal_communications.md")
+    # The user has the final say on wording; Oveo mentions the rule it departs from.
+    assert "The user has the final say" in shared
+    # Approved organizational terms and titles also apply from French to English.
+    assert "For French→English, render an approved French form" in shared
+    assert "(for example, `PACH` becomes `HCBP`)" in shared
+    # Outside translation a user's own wording is flagged, never silently replaced.
+    assert "keep it, flag it in advice, and ask before replacing it" in shared
+    assert "only when the user asks for it" in shared
+    assert "ask whether the feminine form applies. Never infer it from a name." in shared
+    assert "(English, French, or both)" in internal
+    assert "When the user asks for both English and French" in internal
+    assert "French first unless the user asks otherwise" in internal
