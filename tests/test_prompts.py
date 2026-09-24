@@ -192,7 +192,13 @@ def test_protocol_has_closed_technical_grammar_without_mode_behavior() -> None:
         assert f"`{block_type}`" in protocol
     for operation in ("none", "establish", "append", "replace", "full"):
         assert f'"operation":"{operation}"' in protocol
-    assert "roughly 20" in protocol and "200 characters" in protocol
+    normalized = " ".join(protocol.split())
+    # generation._DELTA_CHARS mirrors the upper end of this range.
+    assert "roughly 200\u2013600 characters per delta" in normalized
+    assert "at most 16 blocks" in normalized
+    assert "Headings, tables, horizontal rules, and code fences do not render" in normalized
+    assert "never from the transcript or from memory" in normalized
+    assert "copy `active_canonical_work.application_state.version` exactly" in normalized
     assert "mode prompt decides response meaning" in protocol
     for forbidden in (
         "French→US English",

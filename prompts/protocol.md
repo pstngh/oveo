@@ -43,25 +43,35 @@ Every object has exactly the allowed keys and `"v":1`.
 Never interleave blocks, reopen an ended block, reuse or skip an ID, emit an event
 after the state except `response_end`, or emit data after `response_end`. Escape
 line breaks, quotation marks, backslashes, and control characters as valid JSON.
-Split streamed deltas only at Unicode code-point boundaries. Normally stream
-roughly 20–200 characters per delta so output begins promptly. Concatenated delta
-strings are exact; do not rely on whitespace outside `text`.
+Split streamed deltas only at Unicode code-point boundaries. Stream roughly
+200–600 characters per delta, ending each at a sentence or line end where
+practical: every delta line repeats its JSON framing, so much shorter deltas
+multiply the output and slow the response. A shorter first delta is fine.
+Concatenated delta strings are exact; do not rely on whitespace outside `text`.
 
 ## Visible blocks
 
 Valid types are:
 
-- `conversation`: a question, redirect, direct answer, explanation, or discussion;
-  safe lightweight Markdown is allowed.
-- `deliverable`: copyable final text; it is plain text with no label, preamble,
-  Markdown fence, explanation, or hidden metadata.
-- `advice`: concise commentary about preceding deliverables; safe lightweight
-  Markdown is allowed.
+- `conversation`: a question, redirect, direct answer, explanation, or discussion.
+- `deliverable`: copyable final text. It is plain text: no label, preamble,
+  explanation, hidden metadata, or Markdown formatting such as `**bold**`, `#`
+  headings, or code fences. Plain-text bullets such as `-` or `•` are fine when
+  the text itself needs a list.
+- `advice`: concise commentary about preceding deliverables.
+
+`conversation` and `advice` render limited Markdown: bold, italics, bulleted or
+numbered lists, links, inline code, and block quotes. Headings, tables, horizontal
+rules, and code fences do not render, so use short paragraphs or lists instead.
+Visible text never exposes protocol mechanics such as block types, state
+operations, canonical versions, or anchors.
 
 The only valid block layouts are one `conversation` block, or one or more
-`deliverable` blocks followed by zero or one `advice` block. Blocks are non-empty.
-No `conversation` block may appear with a deliverable layout. Each independently
-copyable alternative uses a separate deliverable block.
+`deliverable` blocks followed by zero or one `advice` block. Blocks are non-empty,
+and a response has at most 16 blocks. No `conversation` block may appear with a
+deliverable layout. Each independently copyable alternative uses a separate
+deliverable block; when more alternatives are wanted than fit, group several in
+one deliverable.
 
 A response that mutates canonical state must contain exactly one `deliverable`;
 multiple alternatives are necessarily unresolved and use `none`. The application
@@ -83,44 +93,53 @@ No mutation:
 
 Establish a complete new active work item whose complete output is the
 deliverable. `source` is the non-empty complete source string and `brief` is a
-non-empty JSON object:
+non-empty JSON object whose fields the active mode defines:
 
-`{"v":1,"event":"state","operation":"establish","source":"complete source","brief":{"scope":"complete brief"}}`
+`{"v":1,"event":"state","operation":"establish","source":"complete source","brief":{"field":"value"}}`
 
-Append exact additions. `base_version` is the positive integer copied from trusted
-application-managed canonical state. Declare both deterministic separators using
-exactly one of `none`, `space`, `line`, or `paragraph`; these insert `""`, `" "`,
-`"\n"`, or `"\n\n"`, respectively. Choose deliberately to preserve paragraphs,
-list items, and inline continuations. The deliverable is the output addition.
-Include `output_addition` only when the deliverable shows the complete joined work,
-and `brief` only when replacing the complete brief because approved constraints
-changed:
+Append exact additions. Declare both deterministic separators using exactly one of
+`none`, `space`, `line`, or `paragraph`; these insert `""`, `" "`, `"\n"`, or
+`"\n\n"`, respectively. Choose deliberately to preserve paragraphs, list items, and
+inline continuations. The deliverable is the output addition:
 
-`{"v":1,"event":"state","operation":"append","base_version":3,"source_addition":"exact source addition","source_separator":"paragraph","output_separator":"paragraph","brief":{"scope":"complete replacement brief"}}`
+`{"v":1,"event":"state","operation":"append","base_version":3,"source_addition":"exact source addition","source_separator":"paragraph","output_separator":"paragraph"}`
+
+Add `"output_addition":"exact output addition"` only when the deliverable shows the
+complete joined work, and `"brief":{…}` only when replacing the complete brief
+because approved constraints changed.
 
 Apply one or more exact replacements against one immutable base. A paired
 source/output replacement has four replacement keys; an output-only replacement
-has two. Include `brief` only when replacing the complete brief because approved
-constraints changed:
+has two:
 
-`{"v":1,"event":"state","operation":"replace","base_version":3,"replacements":[{"source_anchor":"exact old source","source_replacement":"exact new source","output_anchor":"exact old output","output_replacement":"exact new output"},{"output_anchor":"another exact old output","output_replacement":"another exact new output"}],"brief":{"scope":"complete replacement brief"}}`
+`{"v":1,"event":"state","operation":"replace","base_version":3,"replacements":[{"source_anchor":"exact old source","source_replacement":"exact new source","output_anchor":"exact old output","output_replacement":"exact new output"},{"output_anchor":"another exact old output","output_replacement":"another exact new output"}]}`
 
-Each anchor is non-empty, occurs exactly once in its corresponding canonical base
-text, and does not overlap another replacement in that text. Replacements are all
-defined against `base_version`, not sequential intermediate results. Replacement
-strings may be empty.
+Add `"brief":{…}` only when replacing the complete brief because approved
+constraints changed.
 
-Replace the complete output with the deliverable. Include `source` or `brief` only
-when replacing that entire field; omit unchanged optional fields:
+Copy every anchor character for character from `active_canonical_work.document_data`
+(`output` for output anchors, `source` for source anchors), never from the
+transcript or from memory, including non-breaking and narrow no-break spaces and
+typographic apostrophes or quotation marks. Each anchor is non-empty, occurs exactly
+once in its base text (extend it with neighboring words until it does), and does not
+overlap another replacement in that text. Replacements are all defined against
+`base_version`, not sequential intermediate results. Replacement strings may be
+empty. The deliverable must reproduce every unchanged character of the output too;
+when exact anchors are impractical, `full` expresses the same change.
 
-`{"v":1,"event":"state","operation":"full","base_version":3,"source":"optional complete source","brief":{"optional":"complete replacement brief"}}`
+Replace the complete output with the deliverable:
+
+`{"v":1,"event":"state","operation":"full","base_version":3}`
+
+Add `"source":"complete replacement source"` or `"brief":{…}` only when replacing
+that entire field; never repeat an unchanged source or brief.
 
 ## Operation preconditions and validation
 
 - `establish` supplies the complete source and brief; its deliverable is the
   complete output. It has no `base_version`.
 - `append`, `replace`, and `full` require a trusted active canonical item and must
-  copy its current positive integer version exactly.
+  copy `active_canonical_work.application_state.version` exactly as `base_version`.
 - An optional `brief` on `append`, `replace`, or `full` is always the complete
   replacement brief, never a patch or partial fragment.
 - `none` carries no other fields.

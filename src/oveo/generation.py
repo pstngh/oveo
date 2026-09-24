@@ -353,9 +353,10 @@ _WRITE_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 # Title input comes from the first request only, bounded to this many characters.
 _TITLE_INPUT_CHARS = 2_000
 # Framing measured with o200k_base: 18 tokens per NDJSON delta line around its text
-# (at the largest recommended delta size), 11 per DOCX block entry, ~100 for the rest.
+# (at the largest delta size protocol.md recommends), 11 per DOCX block entry, ~100
+# for the rest.
 _DELTA_FRAMING_TOKENS = 18
-_DELTA_CHARS = 200
+_DELTA_CHARS = 600
 _STATE_FRAMING_TOKENS = 100
 _DOCX_BLOCK_FRAMING_TOKENS = 11
 
