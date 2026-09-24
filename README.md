@@ -64,27 +64,31 @@ already-saved canonical work version.
 ## Source attachments and DOCX export
 
 Each user message accepts one standard `.docx` file, selected as either the source
-document to transform or a style reference, subject to the configured byte and
-word limits. DOCX uploads are validated as bounded, non-encrypted, non-macro OOXML
-packages (including element and paragraph counts, checked before the document
-tree is built) and extracted as stable paragraph and table-cell blocks on a single
+document to transform or a style reference, subject to the configured byte and word
+limits. DOCX uploads are validated as bounded, non-encrypted, non-macro OOXML
+packages (including element and paragraph counts, checked before the document tree
+is built) and extracted as stable paragraph and table-cell blocks on a single
 background worker that turns new uploads away while it is busy. Tracked changes and
 field-code hyperlinks are rejected because they cannot be rewritten safely in v1.
 Text inside text boxes and shapes is never extracted or rewritten, like headers and
-footers. A document imported before text boxes were handled this way must be
-uploaded again before it can be edited or exported; Oveo refuses instead of
-producing a damaged file. The latest style reference remains available after
-conversation compaction but never becomes the canonical document or export template.
+footers. Line breaks, tabs, and non-breaking and soft hyphens inside a paragraph are
+kept, and a paragraph whose text runs across a page or column break is left
+untouched. A document imported before text boxes, line breaks, and tabs were handled
+this way must be uploaded again before it can be edited or exported; Oveo refuses
+instead of producing a damaged file. The latest style reference remains available
+after conversation compaction but never becomes the canonical document or export
+template.
 
-For DOCX-backed canonical work, Oveo preserves the uploaded package as the
-template and stores a complete validated block replacement map on every committed
-version. **Download DOCX** reproduces only the latest committed version by copying
-the template package and patching `word/document.xml`; styles, numbering, tables,
-images, headers, footers, relationships, margins, and section settings remain in
-the original package. Paragraph order and table/list structure cannot change in
-v1. Mixed inline formatting inside replaced ordinary text may collapse to the
-formatting of its first original run, while protected hyperlinks keep their
-original targets and may change display text.
+For DOCX-backed canonical work, Oveo preserves the uploaded package as the template
+and stores a complete validated block replacement map on every committed version.
+**Download DOCX** reproduces only the latest committed version by copying the
+template package and patching `word/document.xml`; styles, numbering, tables,
+images, headers, footers, relationships, margins, and section settings remain in the
+original package. Paragraph order and table/list structure cannot change in v1.
+Unchanged paragraphs are not rewritten, so they keep their formatting exactly; mixed
+inline formatting inside a changed paragraph may collapse to the formatting of its
+first original run, while protected hyperlinks keep their original targets and may
+change display text.
 
 ## Quality gate
 

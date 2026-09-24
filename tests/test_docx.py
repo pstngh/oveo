@@ -310,3 +310,102 @@ def test_representative_large_document_is_processed_within_bounds() -> None:
         extracted.plain_text.upper()
     )
     assert elapsed < 10
+
+
+def _body(paragraphs: str) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:document xmlns:w="{W}" xmlns:r="{R}"><w:body>{paragraphs}<w:sectPr/></w:body>'
+        "</w:document>"
+    )
+
+
+def _paragraph_xml(document: bytes) -> list[bytes]:
+    with zipfile.ZipFile(io.BytesIO(document)) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    return [etree.tostring(paragraph) for paragraph in root.iter(f"{{{W}}}p")]
+
+
+# An address with a soft line break, a form line with a tab and a tab stop in the
+# paragraph properties, a bold name, and non-breaking and soft hyphens.
+_INLINE_LAYOUT = _body(
+    "<w:p><w:r><w:t>123 Main St</w:t><w:br/><w:t>Montreal</w:t></w:r></w:p>"
+    '<w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="2880"/></w:tabs></w:pPr>'
+    "<w:r><w:t>Nom :</w:t></w:r><w:r><w:tab/></w:r>"
+    "<w:r><w:rPr><w:b/></w:rPr><w:t>Jean</w:t></w:r></w:p>"
+    "<w:p><w:r><w:t>Jean</w:t><w:noBreakHyphen/><w:t>Pierre, bien</w:t><w:softHyphen/>"
+    "<w:t>tôt</w:t></w:r></w:p>"
+)
+
+
+def test_line_breaks_tabs_and_hyphens_inside_a_paragraph_are_kept_as_text() -> None:
+    extracted = extract_docx(make_docx(document_xml=_INLINE_LAYOUT))
+    assert [block.text for block in extracted.blocks] == [
+        "123 Main St\nMontreal",
+        "Nom :\tJean",
+        "Jean\u2011Pierre, bien\u00adtôt",
+    ]
+
+
+def test_unchanged_paragraphs_export_exactly_with_their_formatting() -> None:
+    template = make_docx(document_xml=_INLINE_LAYOUT)
+    blocks = extract_docx(template).blocks
+    exported = render_docx(template, [DocxReplacement(id=b.id, text=b.text) for b in blocks])
+    # Previously the break and the tab moved after the text and "Jean" lost its bold.
+    assert _paragraph_xml(exported) == _paragraph_xml(template)
+
+
+def test_rewritten_text_restores_breaks_tabs_and_hyphens_where_it_starts() -> None:
+    template = make_docx(document_xml=_INLINE_LAYOUT)
+    rewritten = ["123, rue Main\nMontréal", "Name:\tJean", "Jean\u2011Pierre, soon"]
+    exported = render_docx(
+        template,
+        [
+            DocxReplacement(id=f"p{index:06d}", text=text)
+            for index, text in enumerate(rewritten, start=1)
+        ],
+    )
+    assert [block.text for block in extract_docx(exported).blocks] == rewritten
+    address, form, name = _paragraph_xml(exported)
+    assert b"<w:t>123, rue Main</w:t><w:br/><w:t>Montr" in address
+    assert b"<w:t>Name:</w:t><w:tab/><w:t>Jean</w:t>" in form
+    assert b'w:pos="2880"' in form  # The tab stop is not text and stays.
+    assert b"<w:noBreakHyphen/>" in name
+
+
+def test_page_breaks_stay_where_they_are() -> None:
+    template = make_docx(
+        document_xml=_body(
+            '<w:p><w:r><w:br w:type="page"/><w:t>Chapter two</w:t></w:r></w:p>'
+            '<w:p><w:r><w:t>Before</w:t><w:br w:type="page"/><w:t>after</w:t></w:r></w:p>'
+        )
+    )
+    # Text on both sides of a page break cannot be rewritten without moving the break,
+    # so that paragraph stays untouched.
+    assert [block.text for block in extract_docx(template).blocks] == ["Chapter two"]
+    exported = render_docx(template, [DocxReplacement(id="p000001", text="Chapitre deux")])
+    chapter, untouched = _paragraph_xml(exported)
+    assert chapter.index(b'w:type="page"') < chapter.index(b"Chapitre deux")
+    assert untouched == _paragraph_xml(template)[1]
+
+
+def test_stored_maps_that_glued_breaks_and_tabs_fail_closed() -> None:
+    template = make_docx(document_xml=_INLINE_LAYOUT)
+    # What the previous extractor stored for this package.
+    legacy = [
+        {"id": "p000001", "kind": "paragraph", "text": "123 Main StMontreal"},
+        {"id": "p000002", "kind": "paragraph", "text": "Nom :Jean"},
+        {"id": "p000003", "kind": "paragraph", "text": "JeanPierre, bientôt"},
+    ]
+    with pytest.raises(DocxError) as caught:
+        require_matching_blocks(extract_docx(template).blocks, legacy)
+    assert caught.value.code == "docx_template_outdated"
+
+
+def test_a_paragraph_with_only_layout_characters_is_not_a_block() -> None:
+    template = make_docx(
+        document_xml=_body(
+            "<w:p><w:r><w:tab/><w:br/></w:r></w:p><w:p><w:r><w:t>Text</w:t></w:r></w:p>"
+        )
+    )
+    assert [block.text for block in extract_docx(template).blocks] == ["Text"]

@@ -130,12 +130,15 @@ lifecycle. Upload validation bounds ZIP members, expanded size, compression rati
 and XML part size; rejects unsafe paths, encryption, macros, malformed OOXML,
 tracked changes, and complex field hyperlinks; and extracts only main-document
 paragraph and table-cell text. Element and paragraph counts are bounded before the
-document tree is built, and parsing runs on a dedicated single-thread worker with
-an admission limit. The immutable extracted block map is stored with the
-attachment so transcript reconstruction does not repeatedly parse the OOXML
-package; every later parse must reproduce that map exactly or the operation fails
-closed. Headers, footers, text boxes and shapes, fields that are not safely
-editable, and non-text drawing content remain untouched.
+document tree is built, and parsing runs on a dedicated single-thread worker with an
+admission limit. The immutable extracted block map is stored with the attachment so
+transcript reconstruction does not repeatedly parse the OOXML package; every later
+parse must reproduce that map exactly or the operation fails closed. Headers,
+footers, text boxes and shapes, fields that are not safely editable, and non-text
+drawing content remain untouched. Line breaks, tabs, and non-breaking and soft
+hyphens inside a paragraph travel as characters and are restored on export,
+unchanged paragraphs are never rewritten, and a paragraph whose text runs across a
+page or column break stays untouched.
 
 For a source DOCX, the model receives application-generated block IDs and protected
 hyperlink tokens. The server requires every expected working-document block and

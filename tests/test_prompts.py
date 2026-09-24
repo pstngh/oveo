@@ -130,7 +130,7 @@ def test_docx_protocol_excludes_reference_blocks_from_working_document_state() -
     assert "build every later change from the canonical `docx_blocks`" in prompt
     assert "most recent `source` attachment" in prompt
     assert "the only valid mutation is `establish`" in prompt
-    assert "never contains a line break" in prompt
+    assert "inside it, `\\n` is a line break within the paragraph" in prompt
 
 
 def test_internal_communications_redirects_external_editing_but_refines_own_draft() -> None:

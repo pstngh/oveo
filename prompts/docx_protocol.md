@@ -9,15 +9,16 @@ every later change from the canonical `docx_blocks`.
 
 Return every working-document block ID exactly once and in order. Do not add,
 remove, split, merge, or reorder paragraphs, list items, table rows, or table cells.
-Each block is one Word paragraph, so its text never contains a line break. An empty
-string clears a paragraph's text but leaves the paragraph in the layout, and it
-still takes part in the blank-line join below; mention a cleared paragraph in
-advice. An `active_reference_document` and any attachment whose role is
-`reference` are precedent only: never use their block set as the returned
-replacement map, use them as the template, or make their text canonical source or
-output. Reference and working documents number their blocks the same way
-(`p000001`, `p000002`, …), so every returned ID denotes the working document's
-block and must contain that working block's replacement text.
+Each block is one Word paragraph: inside it, `\n` is a line break within the
+paragraph and `\t` is a tab. Keep them where the layout needs them, and never use
+them to stand in for new paragraphs. An empty string clears a paragraph's text but
+leaves the paragraph in the layout, and it still takes part in the blank-line join
+below; mention a cleared paragraph in advice. An `active_reference_document` and any
+attachment whose role is `reference` are precedent only: never use their block set
+as the returned replacement map, use them as the template, or make their text
+canonical source or output. Reference and working documents number their blocks the
+same way (`p000001`, `p000002`, …), so every returned ID denotes the working
+document's block and must contain that working block's replacement text.
 
 Preserve every paired protected hyperlink wrapper and ID exactly once and in its
 original order, such as

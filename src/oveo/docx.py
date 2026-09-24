@@ -36,7 +36,30 @@ _MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 _XML = "http://www.w3.org/XML/1998/namespace"
 _NS = {"w": _W, "r": _R, "pr": _PKG_REL}
 _P_TAG = f"{{{_W}}}p"
+_R_TAG = f"{{{_W}}}r"
 _T_TAG = f"{{{_W}}}t"
+_TAB_TAG = f"{{{_W}}}tab"
+_BR_TAG = f"{{{_W}}}br"
+_CR_TAG = f"{{{_W}}}cr"
+_NO_BREAK_HYPHEN_TAG = f"{{{_W}}}noBreakHyphen"
+_SOFT_HYPHEN_TAG = f"{{{_W}}}softHyphen"
+_BREAK_TYPE = f"{{{_W}}}type"
+# Run content that a block's text shows as a character, restored on export. Page and
+# column breaks are layout rather than text, so they never appear in block text.
+_INLINE_CHARACTERS = {
+    _TAB_TAG: "\t",
+    _BR_TAG: "\n",
+    _CR_TAG: "\n",
+    _NO_BREAK_HYPHEN_TAG: "\u2011",
+    _SOFT_HYPHEN_TAG: "\u00ad",
+}
+_CHARACTER_ELEMENTS = {
+    "\t": _TAB_TAG,
+    "\n": _BR_TAG,
+    "\u2011": _NO_BREAK_HYPHEN_TAG,
+    "\u00ad": _SOFT_HYPHEN_TAG,
+}
+_INLINE_TAGS = (_T_TAG, *_INLINE_CHARACTERS)
 _HYPERLINK_TAG = f"{{{_W}}}hyperlink"
 _PPR_TAG = f"{{{_W}}}pPr"
 _ALTERNATE_CONTENT_TAG = f"{{{_MC}}}AlternateContent"
@@ -306,8 +329,49 @@ def _own_text_nodes(node: etree._Element, paragraph: etree._Element) -> list[etr
     return [text for text in candidates if _belongs_to(text, paragraph)]
 
 
+def _is_layout_break(element: etree._Element) -> bool:
+    return element.tag == _BR_TAG and element.get(_BREAK_TYPE) in {"page", "column"}
+
+
+def _is_inline_item(element: etree._Element, paragraph: etree._Element) -> bool:
+    """True for the paragraph's own text: runs' text, tabs, line breaks, and hyphens."""
+
+    if element.tag != _T_TAG:
+        parent = element.getparent()
+        # Tab stops live in paragraph properties, not in runs.
+        if parent is None or parent.tag != _R_TAG or _is_layout_break(element):
+            return False
+    return _belongs_to(element, paragraph)
+
+
+def _own_inline_items(node: etree._Element, paragraph: etree._Element) -> list[etree._Element]:
+    candidates = [node] if node.tag in _INLINE_TAGS else list(node.iter(*_INLINE_TAGS))
+    return [item for item in candidates if _is_inline_item(item, paragraph)]
+
+
+def _item_text(item: etree._Element) -> str:
+    if item.tag == _T_TAG:
+        return str(item.text or "")
+    return _INLINE_CHARACTERS[item.tag]
+
+
 def _text(node: etree._Element, paragraph: etree._Element) -> str:
-    return "".join(text.text or "" for text in _own_text_nodes(node, paragraph))
+    return "".join(_item_text(item) for item in _own_inline_items(node, paragraph))
+
+
+def _has_interior_layout_break(paragraph: etree._Element) -> bool:
+    """True when a page or column break sits between pieces of the paragraph's text."""
+
+    text_seen = False
+    break_after_text = False
+    for element in paragraph.iter(*_INLINE_TAGS):
+        if _is_layout_break(element) and _belongs_to(element, paragraph):
+            break_after_text = break_after_text or text_seen
+        elif _is_inline_item(element, paragraph) and _item_text(element):
+            if break_after_text:
+                return True
+            text_seen = True
+    return False
 
 
 def _has_own_alternate_content(paragraph: etree._Element) -> bool:
@@ -340,6 +404,10 @@ def _paragraph_block(
     if _has_own_alternate_content(paragraph):
         # Alternative renderings of the same text (for example a symbol with a legacy
         # fallback) cannot be rewritten consistently, so the paragraph stays untouched.
+        return None, link_number
+    if _has_interior_layout_break(paragraph):
+        # Rewritten text is written where the paragraph's text starts, which would move
+        # a page or column break that sits between pieces of it.
         return None, link_number
     direct_hyperlinks = [child for child in paragraph if child.tag == _HYPERLINK_TAG]
     own_hyperlinks = [
@@ -381,7 +449,8 @@ def _paragraph_block(
         link_id = f"l{link_number:06d}"
         parts.append(f"{{{{OVEO_LINK_{link_id}}}}}{display}{{{{/OVEO_LINK_{link_id}}}}}")
     text = "".join(parts)
-    if not text:
+    if not any(node.text for node in _own_text_nodes(paragraph, paragraph)):
+        # Tabs or line breaks without any text are layout, not content to edit.
         return None, link_number
     kind = "table_cell" if _IN_TABLE_CELL(paragraph) else "paragraph"
     return DocxBlock(id=f"p{block_number:06d}", kind=kind, text=text), link_number
@@ -573,11 +642,46 @@ def _set_text(node: etree._Element, value: str) -> None:
         node.attrib.pop(xml_space, None)
 
 
-def _write_text_nodes(nodes: Sequence[etree._Element], value: str) -> None:
-    if nodes:
-        _set_text(nodes[0], value)
-        for node in nodes[1:]:
-            _set_text(node, "")
+def _inline_elements(value: str) -> list[etree._Element]:
+    """Run content for ``value``: text nodes, with tabs, line breaks and hyphens restored."""
+
+    elements: list[etree._Element] = []
+    pending: list[str] = []
+
+    def flush() -> None:
+        if pending:
+            text = etree.Element(_T_TAG)
+            _set_text(text, "".join(pending))
+            elements.append(text)
+            pending.clear()
+
+    for character in value:
+        tag = _CHARACTER_ELEMENTS.get(character)
+        if tag is None:
+            pending.append(character)
+        else:
+            flush()
+            elements.append(etree.Element(tag))
+    flush()
+    return elements
+
+
+def _rewrite_items(items: Sequence[etree._Element], value: str) -> None:
+    """Replace a stretch of paragraph text where it starts; unchanged text is left alone.
+
+    Leaving unchanged text untouched keeps its runs, so its mixed formatting survives.
+    Changed text takes the formatting of the run where the stretch starts.
+    """
+
+    if "".join(_item_text(item) for item in items) == value:
+        return
+    first = items[0]
+    run = first.getparent()
+    position = run.index(first)
+    for item in items:
+        item.getparent().remove(item)
+    for offset, element in enumerate(_inline_elements(value)):
+        run.insert(position + offset, element)
 
 
 def _insert_plain_run(
@@ -588,9 +692,8 @@ def _insert_plain_run(
 ) -> None:
     if not value:
         return
-    run = etree.Element(f"{{{_W}}}r")
-    text = etree.SubElement(run, f"{{{_W}}}t")
-    _set_text(text, value)
+    run = etree.Element(_R_TAG)
+    run.extend(_inline_elements(value))
     if before is None:
         paragraph.append(run)
     else:
@@ -610,20 +713,20 @@ def _patch_paragraph(paragraph: etree._Element, replacement: DocxReplacement) ->
             segments.append([])
         else:
             # Only the paragraph's own text: text boxes anchored here keep theirs.
-            segments[-1].extend(_own_text_nodes(child, paragraph))
+            segments[-1].extend(_own_inline_items(child, paragraph))
     if len(segments) != len(plain_parts):
         raise DocxError("invalid_docx_blocks", "The DOCX template no longer matches its blocks.")
-    for index, (nodes, value) in enumerate(zip(segments, plain_parts, strict=True)):
-        if nodes:
-            _write_text_nodes(nodes, value)
+    for index, (items, value) in enumerate(zip(segments, plain_parts, strict=True)):
+        if items:
+            _rewrite_items(items, value)
         else:
             before = hyperlinks[index] if index < len(hyperlinks) else None
             _insert_plain_run(paragraph, value, before=before)
     for hyperlink, (_, display) in zip(hyperlinks, replacement_links, strict=True):
-        nodes = _own_text_nodes(hyperlink, paragraph)
-        if not nodes:
+        items = _own_inline_items(hyperlink, paragraph)
+        if not items:
             raise DocxError("invalid_docx_blocks", "The DOCX hyperlink has no editable text.")
-        _write_text_nodes(nodes, display)
+        _rewrite_items(items, display)
 
 
 _OUTDATED_TEMPLATE_MESSAGE = (
