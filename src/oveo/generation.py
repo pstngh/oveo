@@ -153,6 +153,28 @@ def _prepared_template(
     return extracted
 
 
+async def _latest_source_docx(db: AsyncSession, thread_id: str) -> Attachment | None:
+    """Return the conversation's most recent source Word document.
+
+    An `establish` that returns a block map works from this document even when it
+    arrived on an earlier turn, for example before Oveo asked which French variety
+    to translate into.
+    """
+
+    attachment: Attachment | None = await db.scalar(
+        select(Attachment)
+        .join(Message, Attachment.message_id == Message.id)
+        .where(
+            Message.thread_id == thread_id,
+            Attachment.role == "source",
+            Attachment.media_type == DOCX_MEDIA_TYPE,
+        )
+        .order_by(Message.ordinal.desc())
+        .limit(1)
+    )
+    return attachment
+
+
 class SummaryFormatError(ValueError):
     """A maintenance summary did not satisfy its closed response schema."""
 
@@ -2046,15 +2068,18 @@ class GenerationManager:
             version_no = 1
             parent_version_id = None
             operation = "establish"
-            if source_docx is not None:
+            establish_docx = source_docx
+            if establish_docx is None and state_docx_blocks is not None:
+                establish_docx = await _latest_source_docx(db, thread.id)
+            if establish_docx is not None:
                 if state_docx_blocks is None:
                     raise ProtocolError("state_docx_blocks_missing")
-                extracted = _prepared_template(templates, source_docx.id)
+                extracted = _prepared_template(templates, establish_docx.id)
                 # The upload is the source. A redundant copy is accepted only if exact.
                 if state.source is not None and state.source != extracted.plain_text:
                     raise ProtocolError("state_docx_source_mismatch")
                 source = extracted.plain_text
-                docx_template_attachment_id = source_docx.id
+                docx_template_attachment_id = establish_docx.id
                 template_blocks = extracted.blocks
             else:
                 if state_docx_blocks is not None:
@@ -2183,12 +2208,18 @@ class GenerationManager:
                 return {}
             attachment: Attachment | None
             if isinstance(document.state, EstablishState):
-                if generation.source_message_id is None:
-                    return {}
-                attachment = await db.scalar(
-                    select(Attachment).where(Attachment.message_id == generation.source_message_id)
-                )
-                if attachment is None or attachment.role != "source":
+                attachment = None
+                if generation.source_message_id is not None:
+                    attachment = await db.scalar(
+                        select(Attachment).where(
+                            Attachment.message_id == generation.source_message_id
+                        )
+                    )
+                    if attachment is not None and attachment.role != "source":
+                        attachment = None
+                if attachment is None and document.state.docx_blocks is not None:
+                    attachment = await _latest_source_docx(db, generation.thread_id)
+                if attachment is None:
                     return {}
             else:
                 current = await db.scalar(

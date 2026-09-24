@@ -750,6 +750,15 @@ async def test_mutation_rejects_multiple_deliverables_and_repeated_output(
             },
             "state_persistence_failed",
         ),
+        # A block map with no Word document anywhere in the conversation.
+        (
+            {
+                "operation": "establish",
+                "brief": {"direction": "en-US-fr-CA"},
+                "docx_blocks": [{"id": "p000001", "text": "Suite"}],
+            },
+            "state_persistence_failed",
+        ),
     ],
 )
 async def test_state_application_failures_preserve_valid_visible_blocks(

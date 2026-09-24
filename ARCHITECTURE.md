@@ -141,8 +141,10 @@ For a source DOCX, the model receives application-generated block IDs and protec
 hyperlink tokens. The server requires every expected working-document block and
 hyperlink exactly once and in order, derives clean canonical output from the
 validated map, and commits the map in the same transaction as the assistant message
-and `work_version`. Reference block IDs are never accepted as the working map.
-Export is an authenticated, private/no-store GET that selects the latest active
+and `work_version`. An `establish` that returns a block map uses the conversation's
+most recent source DOCX, so Oveo can ask a clarifying question (such as the French
+variety) before translating an upload. Reference block IDs are never accepted as the
+working map. Export is an authenticated, private/no-store GET that selects the latest active
 canonical version and patches the original OOXML package in memory. Generated
 exports are not persisted.
 

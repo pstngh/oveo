@@ -110,6 +110,41 @@ class DocxProvider:
         return ProviderCompletion(cost_microusd=1)
 
 
+class ClarifyingDocxProvider:
+    """Asks which French variety first, then establishes the earlier upload."""
+
+    def __init__(self) -> None:
+        self.chat_requests: list[ProviderRequest] = []
+
+    async def generate(
+        self, request: ProviderRequest, emit: object, cancel_event: asyncio.Event
+    ) -> ProviderCompletion:
+        del cancel_event
+        if request.purpose == "title":
+            await emit(b"DOCX Translation")  # type: ignore[operator]
+            return ProviderCompletion(cost_microusd=1)
+        self.chat_requests.append(request)
+        if len(self.chat_requests) > 1:
+            await emit(_docx_protocol_response(second_version=False))  # type: ignore[operator]
+            return ProviderCompletion(cost_microusd=1)
+        events = [
+            {"v": 1, "event": "response_start"},
+            {"v": 1, "event": "block_start", "id": "b1", "type": "conversation"},
+            {
+                "v": 1,
+                "event": "block_delta",
+                "id": "b1",
+                "text": "Which French variety: Canadian, France, or International?",
+            },
+            {"v": 1, "event": "block_end", "id": "b1"},
+            {"v": 1, "event": "state", "operation": "none"},
+            {"v": 1, "event": "response_end"},
+        ]
+        payload = "\n".join(json.dumps(event) for event in events) + "\n"
+        await emit(payload.encode())  # type: ignore[operator]
+        return ProviderCompletion(cost_microusd=1)
+
+
 class ReferenceProvider:
     def __init__(self) -> None:
         self.chat_requests: list[ProviderRequest] = []
@@ -592,6 +627,47 @@ def test_docx_upload_latest_canonical_export_and_ownership(
     )
     assert deleted.status_code == 204
     assert not list(api_client.app.state.settings.attachments_dir.glob("*.docx"))
+
+
+def test_docx_uploaded_before_a_clarifying_question_becomes_the_template(
+    api_client: TestClient,
+) -> None:
+    # Translate asks which French variety an English source needs; the answer arrives
+    # on a later turn that carries no attachment.
+    provider = ClarifyingDocxProvider()
+    api_client.app.state.generation_manager.provider = provider
+    _, csrf = _login(api_client, "charles", "charles password")
+    headers = {"X-CSRF-Token": csrf, "Origin": "http://testserver"}
+
+    submitted = api_client.post(
+        "/api/threads",
+        data={
+            "mode": "translate",
+            "text": "Translate the attached Word document.",
+            "client_request_id": "docx-question",
+        },
+        files={"attachment": ("source.docx", make_docx(), DOCX_MEDIA_TYPE)},
+        headers=headers,
+    )
+    assert submitted.status_code == 200
+    ids = submitted.json()
+    assert _wait_generation(api_client, ids["generation_id"])["status"] == "completed"
+    assert api_client.get(f"/api/threads/{ids['thread_id']}").json()["docx_exportable"] is False
+
+    answered = api_client.post(
+        f"/api/threads/{ids['thread_id']}/messages",
+        data={"text": "Canadian French.", "client_request_id": "docx-answer"},
+        headers=headers,
+    )
+    assert answered.status_code == 200
+    assert _wait_generation(api_client, answered.json()["generation_id"])["status"] == "completed"
+    trusted = provider.chat_requests[1].snapshot["provider_messages"][0]["content"]
+    assert "DOCX protocol extension" in trusted
+
+    assert api_client.get(f"/api/threads/{ids['thread_id']}").json()["docx_exportable"] is True
+    downloaded = api_client.get(f"/api/threads/{ids['thread_id']}/document.docx")
+    assert downloaded.status_code == 200
+    assert extract_docx(downloaded.content).plain_text == "Bonjour portail!\n\nTexte de cellule"
 
 
 def test_reference_docx_guides_plain_text_without_becoming_the_template(
