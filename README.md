@@ -59,7 +59,8 @@ A normal global terminology or language-rule change is one edit to
 `alithya_rules.md`, plus focused tests and deployment. It does not require a schema
 or UI change. New prompt rules apply when a future generation is composed,
 including a future turn in an existing conversation. They never rewrite an
-already-saved canonical work version.
+already-saved canonical work version. Before deploying a prompt change, run the live
+prompt evaluations described under the quality gate.
 
 ## Source attachments and DOCX export
 
@@ -107,6 +108,17 @@ npm run build
 
 Migration verification additionally performs a fresh upgrade, validates all three
 current modes and work kinds, and runs an Alembic schema drift check.
+
+`tests/live_evals.py` holds prompt evaluation scenarios (Word uploads, local edits,
+terminology, OQLF formats, bilingual drafts, summaries, and more) that run through
+the real generation path. The normal test suite checks each scenario offline against
+a known-good and a known-bad answer. Before deploying a prompt change, run them
+against the pinned model; this bills real model calls and takes several minutes:
+
+```bash
+OVEO_LIVE_EVALS=1 OVEO_OPENROUTER_API_KEY=sk-or-... \
+  uv run --frozen pytest -m live tests/test_live_evals.py
+```
 
 ## Configuration and runtime
 
