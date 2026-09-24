@@ -529,3 +529,16 @@ def test_the_user_has_the_final_say_and_titles_are_english() -> None:
         _thread(), purpose="title", recent_messages=[], actor_labels={}
     )[0].content
     assert "Write it in English, even when the request is in French." in title
+
+
+def test_maintenance_prompts_know_the_mode_and_what_its_summary_must_keep() -> None:
+    summary = build_provider_messages(
+        _thread(mode="internal_comms"), purpose="summary", recent_messages=[], actor_labels={}
+    )[0].content
+    assert "mode=internal_comms" in summary
+    assert "keep above all the audience, channel, draft locale or locales" in summary
+    title = build_provider_messages(
+        _thread(mode="revision"), purpose="title", recent_messages=[], actor_labels={}
+    )[0].content
+    assert "mode=revision" in title
+    assert "keep above all" not in title
