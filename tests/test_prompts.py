@@ -122,8 +122,13 @@ def test_docx_protocol_excludes_reference_blocks_from_working_document_state() -
     normalized = " ".join(prompt.split())
     assert "A `source` attachment" in prompt
     assert "never use their block set as the returned replacement map" in normalized
-    assert "overlapping ID strings" in normalized
+    assert "number their blocks the same way" in normalized
     assert "make their text canonical source or output" in normalized
+    # The working text after the first version, and uploads before a question.
+    assert "build every later change from the canonical `docx_blocks`" in normalized
+    assert "most recent `source` attachment" in normalized
+    assert "the only valid mutation is `establish`" in normalized
+    assert "never contains a line break" in normalized
 
 
 def test_internal_communications_redirects_external_editing_but_refines_own_draft() -> None:
