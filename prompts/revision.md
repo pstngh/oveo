@@ -129,8 +129,10 @@ not place critique, explanations, or labels in `output`.
   document; a new self-contained text is a separate document.
 - A local approved edit to canonical output uses `replace` with exact unique
   nonoverlapping anchors; change canonical source only when the user corrected the
-  supplied source itself. When approved constraints change during append or
-  replacement, include the complete replacement brief.
+  supplied source itself. Include the follow-on fixes the shared rules on
+  follow-up edits require as further replacements, or use `full`. When approved
+  constraints change during append or replacement, include the complete
+  replacement brief.
 - A broad revision or rewrite uses `full` with the complete edited text as the
   deliverable.
 - Questions, redirects, discussion, unresolved alternatives, and display-only

@@ -47,8 +47,9 @@ Prompt ownership is intentionally explicit:
   independently own their section's scope, intake, locale selection, preservation,
   redirects, canonical meanings, and advisory triggers.
 - [`prompts/alithya_rules.md`](prompts/alithya_rules.md) is the single shared place
-  for authorized terminology, brand/naming, locale conventions, official names,
-  protected content, and the compact professional-adviser posture.
+  for authorized terminology, brand/naming, natural and connected writing, dates
+  and follow-up edits, locale conventions, official names, protected content, and
+  the compact professional-adviser posture.
 - [`prompts/protocol.md`](prompts/protocol.md) owns only the typed NDJSON grammar,
   block mechanics, state schemas, validation rules, and operation preconditions.
 - [`prompts/docx_protocol.md`](prompts/docx_protocol.md) is loaded only for a DOCX

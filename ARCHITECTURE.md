@@ -30,14 +30,16 @@ locale. Internal communications owns draft-locale selection and alone applies th
 For an ordinary visible chat generation, the system message contains exactly:
 
 1. machine-generated trusted application context with canonical mode, generation
-   purpose, instruction/data boundary, and explicit conflict policy;
+   purpose, today's date in `OVEO_TIMEZONE` (default `America/Toronto`),
+   instruction/data boundary, and explicit conflict policy;
 2. the shared technical `protocol.md`;
    for DOCX-backed work, the conditional `docx_protocol.md` extension;
 3. exactly one active mode prompt;
 4. exactly one shared `alithya_rules.md`.
 
 Title and summary generations retain safe purpose-specific contracts but do not
-load the visible response protocol. Prompt handoff compaction continues to use its
+load the visible response protocol; a summary also receives today's date so it can
+record relative time references as explicit dates. Prompt handoff compaction continues to use its
 separate user-only extraction contract.
 
 The conflict policy is explicit: runtime security/protocol invariants; mode scope,
@@ -47,7 +49,9 @@ brand/style. Prompt ordering is not the conflict-resolution mechanism.
 
 Conversation, source, attachment, quoted, summary, prior assistant, brief, and
 canonical document text is serialized in one separately delimited JSON data
-envelope. Raw angle brackets are escaped during serialization and decode to the
+envelope. Each transcript turn carries the date it was written in the same time
+zone, so the model can tell past from future and resolve references such as `last
+weekend`. Raw angle brackets are escaped during serialization and decode to the
 exact original text. Canonical provenance separates application-managed version,
 word-count, and last-operation metadata from document data. A model may copy the
 version for a state precondition, but neither that metadata nor document text can

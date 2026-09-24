@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -26,6 +27,9 @@ class Settings(BaseSettings):
     error_log_backup_count: int = Field(default=5, ge=1, le=20)
     frontend_dir: Path = Path("frontend/dist")
     prompts_dir: Path = Path("prompts")
+    # The model is told today's date in this zone so it can place dates in the past or
+    # future. Alithya's users work in Montréal.
+    timezone: str = "America/Toronto"
     secure_cookies: bool = True
     session_days: int = Field(default=30, ge=1, le=90)
     login_attempts: int = Field(default=5, ge=2, le=20)
@@ -62,6 +66,15 @@ class Settings(BaseSettings):
     @classmethod
     def strip_origin_slash(cls, value: str) -> str:
         return value.rstrip("/")
+
+    @field_validator("timezone")
+    @classmethod
+    def known_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("timezone must be an IANA time zone name") from exc
+        return value
 
     @property
     def production(self) -> bool:

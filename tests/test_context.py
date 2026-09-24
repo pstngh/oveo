@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 
 import pytest
+from pydantic import ValidationError
 
+from oveo.config import Settings
 from oveo.context import (
     TRUSTED_CONTEXT_BEGIN,
     TRUSTED_CONTEXT_END,
@@ -542,3 +546,61 @@ def test_maintenance_prompts_know_the_mode_and_what_its_summary_must_keep() -> N
     )[0].content
     assert "mode=revision" in title
     assert "keep above all" not in title
+
+
+def test_chat_and_summary_know_today_and_when_each_turn_was_written() -> None:
+    # 02:30 UTC on September 21 is still the evening of September 20 in Montréal.
+    aware = _message(
+        message_id="message-1", ordinal=1, role="user", actor_user_id="charles-id", text="Hi"
+    )
+    aware.created_at = datetime(2026, 9, 21, 2, 30, tzinfo=UTC)
+    # SQLite hands the stored UTC time back without a zone.
+    naive = _message(
+        message_id="message-2", ordinal=2, role="user", actor_user_id="charles-id", text="Hi"
+    )
+    naive.created_at = datetime(2026, 9, 21, 2, 30)
+
+    def build(purpose: str) -> list:
+        return build_provider_messages(
+            _thread(mode="internal_comms"),
+            purpose=purpose,  # type: ignore[arg-type]
+            recent_messages=[aware, naive],
+            actor_labels={"charles-id": "Charles"},
+            timezone="America/Toronto",
+            today=date(2026, 9, 24),
+        )
+
+    today = "Today is Thursday, September 24, 2026 (2026-09-24) in the users' time zone."
+    for purpose in ("chat", "summary"):
+        messages = build(purpose)
+        system = messages[0].content
+        assert today in system
+        assert "is past or future" in system
+        assert [turn["date"] for turn in _payload(messages)["recent_transcript"]] == [
+            "2026-09-20",
+            "2026-09-20",
+        ]
+    assert "date is the day a turn was written" in build("chat")[0].content
+    assert "as the date it refers to" in build("summary")[0].content
+    assert "CURRENT DATE" not in build("title")[0].content
+    handoff = build("prompt_handoff")
+    assert "CURRENT DATE" not in handoff[0].content
+    assert "2026-09-20" not in handoff[1].content
+
+
+def test_today_defaults_to_the_current_date_in_the_given_zone() -> None:
+    # These zones are 25 hours apart, so their dates always differ.
+    for zone in ("Pacific/Kiritimati", "Pacific/Pago_Pago"):
+        before = datetime.now(ZoneInfo(zone)).date()
+        system = build_provider_messages(
+            _thread(), purpose="chat", recent_messages=[], actor_labels={}, timezone=zone
+        )[0].content
+        after = datetime.now(ZoneInfo(zone)).date()
+        assert f"({before.isoformat()})" in system or f"({after.isoformat()})" in system
+
+
+def test_the_time_zone_setting_must_name_a_real_zone() -> None:
+    assert Settings(timezone="Europe/Paris").timezone == "Europe/Paris"
+    for bad in ("", "Nope/Zone", "../etc/passwd", "/etc/localtime"):
+        with pytest.raises(ValidationError):
+            Settings(timezone=bad)

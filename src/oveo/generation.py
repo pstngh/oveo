@@ -1170,6 +1170,7 @@ class GenerationManager:
             active_reference_document=active_reference_document,
             canonical_state=canonical,
             prompt_loader=self._prompts,
+            timezone=self.settings.timezone,
         )
         return {
             "schema_version": 1,

@@ -15,7 +15,9 @@ import json
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 
@@ -391,6 +393,37 @@ def _check_word_layout(outcome: Outcome) -> None:
     expect([block.text for block in exported] == texts, "the export differs", outcome)
 
 
+_FUTURE_EVENT = re.compile(
+    r"\bwill (?:take place|be held|run|ride)\b|\blooking ahead\b|\bmark your calendars?\b"
+    r"|\bconsider joining\b|\bregister\b|\bsign up\b|\bbook (?:a|your)\b",
+    re.IGNORECASE,
+)
+
+
+def _check_past_event_is_a_recap(outcome: Outcome) -> None:
+    completed(outcome)
+    text = outcome.deliverable()
+    expect("38,000" in text, "the amount raised is missing", outcome)
+    found = _FUTURE_EVENT.search(text)
+    expect(found is None, f"the past event reads as upcoming: {found}", outcome)
+
+
+def _check_correction_is_applied(outcome: Outcome) -> None:
+    completed(outcome)
+    text = outcome.deliverable()
+    expect("42" in text, "the correction's new fact is missing", outcome)
+    found = _FUTURE_EVENT.search(text)
+    expect(found is None, f"the draft still announces the event: {found}", outcome)
+
+
+def _check_user_wording_is_merged(outcome: Outcome) -> None:
+    completed(outcome)
+    text = outcome.deliverable()
+    expect("see you next year" in text.casefold(), "the user's wording was dropped", outcome)
+    thanking = [part for part in re.split(r"\n\s*\n", text) if "thank" in part.casefold()]
+    expect(len(thanking) == 1, f"{len(thanking)} paragraphs thank people", outcome)
+
+
 def _check_side_text_keeps_word_work(outcome: Outcome) -> None:
     completed(outcome)
     latest = outcome.latest
@@ -398,6 +431,60 @@ def _check_side_text_keeps_word_work(outcome: Outcome) -> None:
     expect(outcome.work_items == 1, "the side text became the working document", outcome)
     expect(bool(outcome.deliverable(-1)), "the side text was not translated", outcome)
 
+
+_MONTHS = (
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+)
+
+
+def _spoken(day: date) -> str:
+    return f"{_MONTHS[day.month - 1]} {day.day}, {day.year}"
+
+
+# The date scenarios need an event that is really past when the model runs, so they
+# use the latest finished Friday-to-Sunday weekend in the users' default time zone.
+_TODAY = datetime.now(ZoneInfo("America/Toronto")).date()
+_RIDE_END = _TODAY - timedelta(days=(_TODAY.weekday() - 6) % 7 or 7)
+_RIDE = f"{_spoken(_RIDE_END - timedelta(days=2))} to {_spoken(_RIDE_END)}"
+_RIDE_NOTES = (
+    f"Make-A-Wish 48-Hour Ride, 18th edition, {_RIDE}, Aerocity of Mirabel. Alithya team: "
+    "19 cyclists, 11th consecutive year, captains Sébastien Trudel and Kathryn Potvin. "
+    "Over $38,000 raised."
+)
+_RIDE_BODY = (
+    f"From {_RIDE}, 19 Alithya colleagues rode in the 18th Make-A-Wish® 48-Hour Ride at "
+    "Aerocity of Mirabel, led by team captains Sébastien Trudel and Kathryn Potvin. It was "
+    "our 11th consecutive year in the event, and together the team raised over $38,000 to "
+    "help make wishes come true for children facing serious illnesses."
+)
+_RIDE_THANKS = (
+    "Thank you to everyone who rode, donated, and supported this initiative. Your "
+    "generosity shows what we can achieve together."
+)
+_RIDE_INVITE = "Next year's edition is a chance for more of us to ride. We hope you join us!"
+_RIDE_MERGED = (
+    "Thank you to our 19 cycling colleagues, and to everyone who donated and supported "
+    "them, for their commitment and generosity. See you next year!"
+)
+_RIDE_USER_THANKS = (
+    "Thank you to our 19 cycling colleagues for their commitment and generosity. See you next year!"
+)
+_DRIVE_DAY = _TODAY - timedelta(days=3)
+_DRIVE = (
+    f"The Montréal office blood drive with Héma-Québec takes place on {_spoken(_DRIVE_DAY)} "
+    "in room 4B, from 9 a.m. to 3 p.m. Book your slot with Alex Martin."
+)
 
 _EN_TO_CA = "Translate into Canadian French: "
 _NOTE = f"Remarque{NBSP}: la réunion commence à 14{NBSP}h{NBSP}30 dans la grande salle."
@@ -689,6 +776,94 @@ SCENARIOS: tuple[Scenario, ...] = (
                     ("deliverable", _BILINGUAL.split("\n\n---\n\n")[0]),
                 ],
                 {"operation": "none"},
+            ),
+        ),
+    ),
+    Scenario(
+        name="past-event-is-reported-as-done",
+        mode="internal_comms",
+        turns=(Turn("Draft a short employee news item from these notes. " + _RIDE_NOTES),),
+        check=_check_past_event_is_a_recap,
+        good=(_establish(f"{_RIDE_BODY}\n\n{_RIDE_MERGED}", _RIDE_NOTES),),
+        bad=(
+            _establish(
+                "Last weekend, 19 cycling colleagues took part in the Make-A-Wish® 48-Hour "
+                "Ride and raised over $38,000.\n\nLooking ahead, the 18th edition of the "
+                f"48-Hour Ride will take place from {_RIDE} at Aerocity of Mirabel. Mark "
+                "your calendar and consider joining us.",
+                _RIDE_NOTES,
+            ),
+        ),
+    ),
+    Scenario(
+        name="terse-correction-rewrites-the-draft",
+        mode="internal_comms",
+        turns=(
+            Turn("Draft a short announcement: " + _DRIVE),
+            Turn("It already took place. Make it a thank-you instead: 42 colleagues donated."),
+        ),
+        check=_check_correction_is_applied,
+        good=(
+            _answer(
+                f"{_spoken(_DRIVE_DAY)} has already passed. Should this be a thank-you "
+                "note instead? If so, how many colleagues donated?"
+            ),
+            _establish(
+                "Thank you to the 42 colleagues who gave blood at the Montréal office drive "
+                f"with Héma-Québec on {_spoken(_DRIVE_DAY)}. Your donations help patients "
+                "across Québec.",
+                _DRIVE + " It already took place; 42 colleagues donated.",
+            ),
+        ),
+        bad=(
+            _establish(
+                f"Give blood on {_spoken(_DRIVE_DAY)}: the Montréal office blood drive with "
+                "Héma-Québec runs from 9 a.m. to 3 p.m. in room 4B. Book your slot with "
+                "Alex Martin.",
+                _DRIVE,
+            ),
+            ndjson(
+                [
+                    (
+                        "deliverable",
+                        f"Give blood on {_spoken(_DRIVE_DAY)}: the Montréal office blood drive "
+                        "with Héma-Québec runs from 9 a.m. to 3 p.m. in room 4B. Book your "
+                        "slot with Alex Martin.",
+                    )
+                ],
+                {"operation": "full", "base_version": 1},
+            ),
+        ),
+    ),
+    Scenario(
+        name="user-wording-is-merged-not-duplicated",
+        mode="internal_comms",
+        turns=(
+            Turn(
+                "Draft a short employee news item from these notes. "
+                + _RIDE_NOTES
+                + " End with a paragraph thanking everyone who rode, donated, and supported "
+                "the initiative, then a final paragraph inviting colleagues to next year's "
+                "edition."
+            ),
+            Turn(
+                "Replace the last paragraph with something like this: Thank you to our 19 "
+                "cycling colleagues for their commitment and generosity... see you next year!"
+            ),
+        ),
+        check=_check_user_wording_is_merged,
+        good=(
+            _establish(f"{_RIDE_BODY}\n\n{_RIDE_THANKS}\n\n{_RIDE_INVITE}", _RIDE_NOTES),
+            ndjson(
+                [("deliverable", f"{_RIDE_BODY}\n\n{_RIDE_MERGED}")],
+                {"operation": "full", "base_version": 1},
+            ),
+        ),
+        bad=(
+            _establish(f"{_RIDE_BODY}\n\n{_RIDE_THANKS}\n\n{_RIDE_INVITE}", _RIDE_NOTES),
+            ndjson(
+                [("deliverable", f"{_RIDE_BODY}\n\n{_RIDE_THANKS}\n\n{_RIDE_USER_THANKS}")],
+                {"operation": "full", "base_version": 1},
             ),
         ),
     ),

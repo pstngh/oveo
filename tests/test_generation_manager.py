@@ -7,7 +7,9 @@ import logging
 import re
 import sqlite3
 from collections.abc import AsyncGenerator
+from datetime import datetime
 from typing import cast
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -1595,6 +1597,40 @@ async def test_handoff_provider_request_contains_only_user_authored_material(
     assert "# Oveo Translate" not in serialized
     assert "VERSION-CONTROLLED MODE PROMPT" not in serialized
     assert "VERSION-CONTROLLED RESPONSE PROTOCOL" not in serialized
+    await manager.shutdown()
+
+
+async def test_chat_requests_carry_the_date_in_the_configured_zone(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, base_settings, user = manager_database
+    zone = "Pacific/Kiritimati"
+    settings = base_settings.model_copy(update={"timezone": zone})
+    provider = ScriptedProvider(
+        [
+            _response_stream(
+                "Bonjour.",
+                {"operation": "establish", "source": "Hello.", "brief": {"direction": "en-fr-CA"}},
+            )
+        ]
+    )
+    manager = GenerationManager(database, settings, provider)
+    before = datetime.now(ZoneInfo(zone)).date().isoformat()
+    submission = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="dated-request",
+        text="Translate into Canadian French: Hello.",
+        attachment=None,
+        owner_id=user.id,
+        mode="translate",
+    )
+    await _wait_status(manager, submission.generation_id, {"completed"})
+    after = datetime.now(ZoneInfo(zone)).date().isoformat()
+    system, envelope = (
+        message["content"] for message in provider.requests[0].snapshot["provider_messages"]
+    )
+    assert f"({before})" in system or f"({after})" in system
+    assert f'"date":"{before}"' in envelope or f'"date":"{after}"' in envelope
     await manager.shutdown()
 
 

@@ -53,6 +53,13 @@ missing item would materially change or misrepresent the communication, ask a
 focused question or use an explicit neutral placeholder only if the user asked
 for placeholders. Otherwise proceed with what is safely known.
 
+Place every supplied date against today's date. A communication about an event
+that has already happened reports it as done, not as something to attend or
+register for. Prefer an explicit date (`from September 18 to 20`) to a
+relative reference such as `last weekend` or `next Tuesday`, which becomes
+unclear once employees read the communication on another day; use a relative
+reference only alongside the date or when the user asks for it.
+
 Write like a person communicating with colleagues, not a company broadcasting.
 Lead with the purpose or essential announcement, give practical details and
 required actions, and make timing, impact, resources, and ownership easy to find.
@@ -82,8 +89,10 @@ instructions.
   list items, or inline continuation.
 - A local refinement of this section's canonical draft uses `replace` with exact
   unique nonoverlapping output anchors; update source only when the user changes
-  the underlying brief or facts. When approved constraints change during append or
-  replacement, include the complete replacement brief.
+  the underlying brief or facts. Include the follow-on fixes the shared rules on
+  follow-up edits require as further replacements, or use `full`. When approved
+  constraints change during append or replacement, include the complete
+  replacement brief.
 - A broad redraft uses `full` with the complete draft as the deliverable and, when
   changed, the complete source and brief.
 - Questions, redirects, discussion, unresolved alternatives, and display-only

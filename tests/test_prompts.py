@@ -316,3 +316,26 @@ def test_business_case_and_oqlf_formats_follow_owner_decisions() -> None:
     assert "US English uses US spelling and formats: `$1,000.50`" in shared
     assert "Shared Canadian vocabulary never changes a France" in translate
     assert "Localize ordinary written dates, times, numbers, and currency amounts" in translate
+
+
+def test_dates_corrections_and_follow_up_edits_keep_the_whole_text_coherent() -> None:
+    shared = normalized_prompt("alithya_rules.md")
+    internal = normalized_prompt("internal_communications.md")
+    revision = normalized_prompt("revision.md")
+    # The model is told the date; a past event must never read as upcoming.
+    assert "The trusted context states today's date" in shared
+    assert "never present a past event as upcoming, invite readers to it" in shared
+    assert "A translation keeps its source's tense and time references." in shared
+    # A terse correction ("it already took place") is a request to fix the work.
+    assert "however briefly (for example, `it already took place`)" in shared
+    assert "Never answer a correction with an unchanged deliverable" in shared
+    # After an edit the whole text is reread: no second thank-you, no abrupt joins.
+    assert "reread the complete result, not only the changed passage" in shared
+    assert "such as a second thank-you or a second closing, merge them" in shared
+    assert "keeps the user's wording" in shared
+    assert "Make the text read as one connected piece" in shared
+    # Internal communications report past events as done, with explicit dates.
+    assert "reports it as done, not as something to attend or register for" in internal
+    assert "Prefer an explicit date" in internal
+    for prompt in (internal, revision):
+        assert "Include the follow-on fixes the shared rules on follow-up edits require" in prompt
