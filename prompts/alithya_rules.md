@@ -79,10 +79,10 @@ the source meaning; do not force a contextual term where it does not fit.
 
 - US English uses US spelling and conventions.
 - Canadian French uses established Canadian forms such as `infonuagique`,
-  `nuage`, `courriel`, `clavardage`, `logiciel`, and `site Web`. Avoid
-  `challenge` for `défi`, `opportunité` for `occasion`, `digital` for
-  `numérique`, `impacter` for `avoir un impact sur`, `solutionner` for
-  `résoudre`, and `feedback` for `rétroaction`.
+  `nuage`, `courriel`, `clavardage`, and `site Web`. Prefer `défi` to
+  `challenge`, `occasion` to `opportunité`, `numérique` to `digital`,
+  `avoir un impact sur` to `impacter`, `résoudre` to `solutionner`, and
+  `rétroaction` to `feedback`.
 - France French uses normal France vocabulary, spelling, grammar, and typography.
   Do not impose Canadian defaults such as `courriel`, `infonuagique`,
   `clavardage`, `fin de semaine`, or `stationnement` merely because these rules

@@ -9,6 +9,12 @@ def read_prompt(name: str) -> str:
     return (PROMPTS / name).read_text(encoding="utf-8")
 
 
+def normalized_prompt(name: str) -> str:
+    """The prompt with every whitespace run collapsed, for wrap-independent phrases."""
+
+    return " ".join(read_prompt(name).split())
+
+
 def test_prompt_directory_has_one_shared_rules_file_and_three_modes() -> None:
     assert {path.name for path in PROMPTS.glob("*.md")} == {
         "alithya_rules.md",
@@ -21,7 +27,7 @@ def test_prompt_directory_has_one_shared_rules_file_and_three_modes() -> None:
 
 
 def test_shared_terminology_exists_once_and_not_in_mode_prompts() -> None:
-    shared = read_prompt("alithya_rules.md")
+    shared = normalized_prompt("alithya_rules.md")
     assert "## Authorized terminology" in shared
     assert "Source term | Approved form | Direction / locale scope | Contextual note" in shared
     assert "partenaire d'affaires Capital humain (PACH)" in shared
@@ -29,13 +35,13 @@ def test_shared_terminology_exists_once_and_not_in_mode_prompts() -> None:
     assert "employés permanents" in shared
     assert "robot conversationnel" in shared
     for name in MODE_PROMPTS:
-        prompt = read_prompt(name)
+        prompt = normalized_prompt(name)
         assert "partenaire d'affaires Capital humain" not in prompt
         assert "HCBP | PACH" not in prompt
 
 
 def test_shared_rules_do_not_own_protocol_or_state_mechanics() -> None:
-    shared = read_prompt("alithya_rules.md")
+    shared = normalized_prompt("alithya_rules.md")
     for forbidden in (
         "response_start",
         "block_start",
@@ -49,7 +55,7 @@ def test_shared_rules_do_not_own_protocol_or_state_mechanics() -> None:
 
 
 def test_translate_intake_is_narrow_and_does_not_inherit_internal_voice() -> None:
-    prompt = read_prompt("translate.md")
+    prompt = normalized_prompt("translate.md")
     for direction in (
         "French→US English",
         "English→Canadian",
@@ -57,19 +63,18 @@ def test_translate_intake_is_narrow_and_does_not_inherit_internal_voice() -> Non
         "International French",
     ):
         assert direction in prompt
-    assert "Selecting this section already\nestablishes translation intent" in prompt
+    assert "Selecting this section already establishes translation intent" in prompt
     assert "bare English source" in prompt
-    assert "ask only which French\n  variety" in prompt
+    assert "ask only which French variety" in prompt
     assert "Clearly French source defaults to US English" in prompt
     assert "Preserve source tone and register by default" in prompt
     assert "Comm internes" not in prompt
 
 
 def test_revision_reviews_existing_translations_and_redirects_new_translation() -> None:
-    prompt = read_prompt("revision.md")
+    prompt = normalized_prompt("revision.md")
     for depth in ("proofread", "review/copyedit", "revision", "rewrite"):
         assert f"`{depth}`" in prompt
-    normalized = " ".join(prompt.split())
     for expected in (
         "supplies both a source-language original and its existing translation",
         "compare the entire pair and return the corrected target text",
@@ -78,17 +83,16 @@ def test_revision_reviews_existing_translations_and_redirects_new_translation() 
         "complete supplied comparison pair",
         "complete revised target text",
     ):
-        assert expected in normalized
-    assert "redirect to Translate" in normalized
-    assert "redirect to Internal communications" in normalized
+        assert expected in prompt
+    assert "redirect to Translate" in prompt
+    assert "redirect to Internal communications" in prompt
     assert "Do not create missing translated passages" in prompt
     assert "same-language locale adaptation" in prompt
     assert "Comm internes" not in prompt
 
 
 def test_revision_uses_relevant_references_as_active_style_authority() -> None:
-    prompt = read_prompt("revision.md")
-    normalized = " ".join(prompt.split())
+    prompt = normalized_prompt("revision.md")
     for expected in (
         "active authority for style and terminology",
         "sentence patterns",
@@ -98,13 +102,12 @@ def test_revision_uses_relevant_references_as_active_style_authority() -> None:
         "closest natural analogue",
         "never the canonical `source` or `output`",
     ):
-        assert expected in normalized
+        assert expected in prompt
     assert "Do not copy unrelated facts" in prompt
 
 
 def test_translate_reuses_grounded_precedent_without_inventing_history() -> None:
-    prompt = read_prompt("translate.md")
-    normalized = " ".join(prompt.split())
+    prompt = normalized_prompt("translate.md")
     for expected in (
         "active canonical translation",
         "prior conversation deliverables",
@@ -114,25 +117,24 @@ def test_translate_reuses_grounded_precedent_without_inventing_history() -> None
         "Never invent, guess, or imply access",
         "A `reference` attachment is precedent only",
     ):
-        assert expected in normalized
+        assert expected in prompt
 
 
 def test_docx_protocol_excludes_reference_blocks_from_working_document_state() -> None:
-    prompt = read_prompt("docx_protocol.md")
-    normalized = " ".join(prompt.split())
+    prompt = normalized_prompt("docx_protocol.md")
     assert "A `source` attachment" in prompt
-    assert "never use their block set as the returned replacement map" in normalized
-    assert "number their blocks the same way" in normalized
-    assert "make their text canonical source or output" in normalized
+    assert "never use their block set as the returned replacement map" in prompt
+    assert "number their blocks the same way" in prompt
+    assert "make their text canonical source or output" in prompt
     # The working text after the first version, and uploads before a question.
-    assert "build every later change from the canonical `docx_blocks`" in normalized
-    assert "most recent `source` attachment" in normalized
-    assert "the only valid mutation is `establish`" in normalized
-    assert "never contains a line break" in normalized
+    assert "build every later change from the canonical `docx_blocks`" in prompt
+    assert "most recent `source` attachment" in prompt
+    assert "the only valid mutation is `establish`" in prompt
+    assert "never contains a line break" in prompt
 
 
 def test_internal_communications_redirects_external_editing_but_refines_own_draft() -> None:
-    prompt = read_prompt("internal_communications.md")
+    prompt = normalized_prompt("internal_communications.md")
     assert "`Comm internes`" in prompt
     assert "not a person" in prompt
     assert "completed prose whose primary need is proofreading" in prompt
@@ -150,25 +152,24 @@ def test_all_modes_are_restrained_professional_copilots() -> None:
         "internal_communications.md": ("communications copilot", "missing owner or deadline"),
     }
     for name, examples in expected_examples.items():
-        prompt = read_prompt(name)
-        normalized = " ".join(prompt.split())
+        prompt = normalized_prompt(name)
         assert all(example in prompt for example in examples)
-        assert "Before starting," in normalized
-        assert "ask a focused question only when its answer is required" in normalized
-        assert "that is not a blocker must not delay the work" in normalized
-        assert "Do not delay clear," in normalized
-        assert "turn intake into a broad interview" in normalized
-        assert "one to three high-value points" in normalized
-        assert "nothing material to add" in normalized
-        assert "Never manufacture commentary" in normalized
-        assert "at most one concise `advice` block" in normalized
+        assert "Before starting," in prompt
+        assert "ask a focused question only when its answer is required" in prompt
+        assert "that is not a blocker must not delay the work" in prompt
+        assert "Do not delay clear," in prompt
+        assert "turn intake into a broad interview" in prompt
+        assert "one to three high-value points" in prompt
+        assert "nothing material to add" in prompt
+        assert "Never manufacture commentary" in prompt
+        assert "at most one concise `advice` block" in prompt
 
 
 def test_locale_ownership_and_isolation_are_explicit() -> None:
-    shared = read_prompt("alithya_rules.md")
-    translate = read_prompt("translate.md")
-    revision = read_prompt("revision.md")
-    internal = read_prompt("internal_communications.md")
+    shared = normalized_prompt("alithya_rules.md")
+    translate = normalized_prompt("translate.md")
+    revision = normalized_prompt("revision.md")
+    internal = normalized_prompt("internal_communications.md")
     assert "France French uses normal France vocabulary" in shared
     assert "Do not impose Canadian defaults" in shared
     assert "selected target locale" in translate
@@ -176,14 +177,14 @@ def test_locale_ownership_and_isolation_are_explicit() -> None:
     assert "selected draft locale" in internal
     for mode in (translate, revision, internal):
         assert "France" in mode and "Canadian" in mode
-    assert "never changes\na France or International French selection" in translate
+    assert "never changes a France or International French selection" in translate
     assert "adaptation between locales of the same language" in translate
     assert "merely because the rules are shared" in revision
     assert "merely because the rules are shared" in internal
 
 
 def test_protocol_has_closed_technical_grammar_without_mode_behavior() -> None:
-    protocol = read_prompt("protocol.md")
+    protocol = normalized_prompt("protocol.md")
     for event in (
         "response_start",
         "block_start",
@@ -197,13 +198,12 @@ def test_protocol_has_closed_technical_grammar_without_mode_behavior() -> None:
         assert f"`{block_type}`" in protocol
     for operation in ("none", "establish", "append", "replace", "full"):
         assert f'"operation":"{operation}"' in protocol
-    normalized = " ".join(protocol.split())
     # generation._DELTA_CHARS mirrors the upper end of this range.
-    assert "roughly 200\u2013600 characters per delta" in normalized
-    assert "at most 16 blocks" in normalized
-    assert "Headings, tables, horizontal rules, and code fences do not render" in normalized
-    assert "never from the transcript or from memory" in normalized
-    assert "copy `active_canonical_work.application_state.version` exactly" in normalized
+    assert "roughly 200\u2013600 characters per delta" in protocol
+    assert "at most 16 blocks" in protocol
+    assert "Headings, tables, horizontal rules, and code fences do not render" in protocol
+    assert "never from the transcript or from memory" in protocol
+    assert "copy `active_canonical_work.application_state.version` exactly" in protocol
     assert "mode prompt decides response meaning" in protocol
     for forbidden in (
         "French→US English",
@@ -224,8 +224,8 @@ def test_brand_logo_keeps_the_verified_oveo_semantics() -> None:
 
 
 def test_shared_rules_distinguish_link_destinations_and_ordinary_labels() -> None:
-    shared = read_prompt("alithya_rules.md")
-    assert "A visible linked label is\nordinary prose" in shared
+    shared = normalized_prompt("alithya_rules.md")
+    assert "A visible linked label is ordinary prose" in shared
     assert "leaving its destination exact" in shared
     for expected in (
         "| Trusted advisor | conseiller de confiance |",
@@ -247,13 +247,39 @@ def test_shared_rules_distinguish_link_destinations_and_ordinary_labels() -> Non
 
 
 def test_official_public_names_use_established_translations_without_invention() -> None:
-    shared = read_prompt("alithya_rules.md")
+    shared = normalized_prompt("alithya_rules.md")
     assert "For legislation, regulations, treaties, courts, government bodies" in shared
-    assert "first determine\n  whether an official target-language name is established" in shared
-    assert "use that\n  official form exactly, including its established acronym" in shared
-    assert "Never create an\n  official name or acronym by translating its components" in shared
-    assert (
-        "cannot be established confidently, retain the complete\n  source-language name" in shared
-    )
+    assert "first determine whether an official target-language name is established" in shared
+    assert "use that official form exactly, including its established acronym" in shared
+    assert "Never create an official name or acronym by translating its components" in shared
+    assert "cannot be established confidently, retain the complete source-language name" in (shared)
     assert "flag the need for verification" in shared
     assert "Act respecting labour standards" not in shared
+
+
+def test_precedent_continuations_and_conversation_language_are_unambiguous() -> None:
+    translate = normalized_prompt("translate.md")
+    revision = normalized_prompt("revision.md")
+    internal = normalized_prompt("internal_communications.md")
+    # Approved terminology is mandatory; earlier wording and references are precedent.
+    assert "Approved terminology and official names outrank precedent" in translate
+    assert "protected content still outrank the reference" in revision
+    # Pasting a new, unrelated text must not be appended to the working document.
+    assert "a new self-contained text is a separate translation" in translate
+    assert "a new self-contained text is a separate document" in revision
+    assert "Keep the source's paragraphs, headings, and lists" in translate
+    assert "Translate works only between French and English" in translate
+    assert "infer the depth from the request's wording" in revision
+    for prompt in (translate, revision, internal):
+        assert "An explicit user choice of conversation language overrides both" in prompt
+    for prompt in (revision, internal):
+        assert "Never reconstruct canonical work from transcript fragments" in prompt
+        assert "use the broader `full` operation" in prompt
+
+
+def test_canadian_usage_rules_read_in_one_direction() -> None:
+    shared = normalized_prompt("alithya_rules.md")
+    assert "Prefer `défi` to `challenge`, `occasion` to `opportunité`" in shared
+    canadian_forms = shared.split("Canadian French uses established Canadian forms", 1)[1]
+    # `logiciel` is approved for all French locales, not a Canadian-only form.
+    assert "`logiciel`" not in canadian_forms.split(".", 1)[0]
