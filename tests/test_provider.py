@@ -51,7 +51,7 @@ async def test_streaming_request_locks_model_privacy_and_parses_actual_cost(
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert body == {
-            "model": "openai/gpt-6-luna",
+            "model": "openai/gpt-5.6-luna",
             "messages": [
                 {"role": "system", "content": "system"},
                 {"role": "user", "content": "synthetic request"},
@@ -222,7 +222,7 @@ def test_model_is_pinned_in_code_even_if_the_environment_names_another(
     body = client.build_request_body(
         [ProviderMessage("user", "synthetic")], max_completion_tokens=10, reasoning_effort="low"
     )
-    assert body["model"] == OPENROUTER_MODEL == "openai/gpt-6-luna"
+    assert body["model"] == OPENROUTER_MODEL == "openai/gpt-5.6-luna"
     assert body["reasoning_effort"] == "low"
     assert body["provider"] == {
         "order": ["azure/eu"],

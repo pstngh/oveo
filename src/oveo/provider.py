@@ -18,7 +18,7 @@ from tiktoken import Encoding
 
 from .config import Settings
 
-OPENROUTER_MODEL = "openai/gpt-6-luna"
+OPENROUTER_MODEL = "openai/gpt-5.6-luna"
 _PROVIDER_ROUTING: dict[str, object] = {
     "order": ["azure/eu"],
     "allow_fallbacks": True,
@@ -26,7 +26,7 @@ _PROVIDER_ROUTING: dict[str, object] = {
     "zdr": True,
 }
 
-# Effort levels OpenRouter publishes for this model (GET /api/v1/models, 2026-09-23).
+# Supported reasoning levels for GPT-5.6 Luna; keep effort explicit per workload.
 ReasoningEffort = Literal["max", "xhigh", "high", "medium", "low", "none"]
 _REASONING_EFFORTS: frozenset[str] = frozenset({"max", "xhigh", "high", "medium", "low", "none"})
 
@@ -65,8 +65,8 @@ class ProviderCompletion:
 
 @lru_cache(maxsize=1)
 def _model_encoding() -> Encoding:
-    # tiktoken does not yet map GPT-6 Luna by model name. Use the established
-    # o200k_base encoding for local estimates until a mapping is published.
+    # GPT-5.6 Luna maps to o200k_base in the pinned tiktoken version.
+    # Provider serialization still adds framing to these local estimates.
     return tiktoken.get_encoding("o200k_base")
 
 
