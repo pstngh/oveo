@@ -563,6 +563,73 @@ _REPAIRABLE_STATE_CODES = frozenset(
         "state_output_addition_missing",
     }
 )
+_MISSING_STATE_GUIDANCE = (
+    "After the last block_end, emit exactly one state event and then response_end."
+)
+# What a strict protocol retry tells the model about the mistake it made.
+_PROTOCOL_RETRY_GUIDANCE: dict[str, str] = {
+    "state_deliverable_mismatch": (
+        "The visible deliverable differed from the canonical output. For "
+        "replace, make the deliverable exactly equal the complete output after "
+        "all replacements, character for character, including no-break spaces and "
+        "typographic quotes; when that is impractical, use full. For append, the "
+        "deliverable is the exact output addition, or the complete joined output "
+        "together with output_addition."
+    ),
+    "state_deliverable_count_mismatch": (
+        "A state mutation requires exactly one deliverable block. If you "
+        "present multiple alternatives, use operation none instead."
+    ),
+    "state_source_missing": (
+        "An establish for text work must include the complete source. Only an "
+        "uploaded source DOCX lets the application supply the source."
+    ),
+    "state_docx_source_mismatch": (
+        "For an uploaded source DOCX, omit source: the application uses the uploaded document."
+    ),
+    "state_docx_output_mismatch": (
+        "The deliverable must equal the returned docx_blocks' clean text: block "
+        "text joined in order with blank lines, keeping hyperlink display text "
+        "without its wrappers."
+    ),
+    "state_output_addition_missing": (
+        "The append deliverable showed the complete joined output, so the state "
+        "must name the exact output_addition."
+    ),
+    "invalid_event_fields": (
+        "An event had missing or extra keys. Use only the exact keys for "
+        "each event and the chosen state operation in the protocol. Never "
+        "repeat the deliverable as an output field. Omit unchanged optional "
+        "state fields rather than adding null values."
+    ),
+    "invalid_json": (
+        "A line was not one complete JSON object. Put each event on its own line, "
+        "escape line breaks and quotation marks inside strings, and emit no prose "
+        "or Markdown fence."
+    ),
+    "blank_line": "Emit one JSON object per line, with no blank lines between events.",
+    "invalid_block_order": (
+        "Use either exactly one conversation block, or one or more deliverable "
+        "blocks followed by at most one advice block."
+    ),
+    "invalid_state_for_conversation": (
+        "A conversation block cannot change canonical state: use operation none, or "
+        "put the finished work in a deliverable block."
+    ),
+    "invalid_block_count": (
+        "A response has at most 16 blocks; group alternatives in fewer deliverable blocks."
+    ),
+    "invalid_state_brief": "brief must be a non-empty JSON object, never a string or list.",
+    "invalid_base_version": (
+        "base_version must be the integer in active_canonical_work.application_state.version."
+    ),
+    "invalid_docx_blocks": (
+        'docx_blocks must list every working block exactly once and in order, as {"id", '
+        '"text"} objects numbered p000001, p000002, and so on.'
+    ),
+    "missing_state": _MISSING_STATE_GUIDANCE,
+    "incomplete_response": _MISSING_STATE_GUIDANCE,
+}
 
 
 def _parse_context_summary(raw: bytes) -> str:
@@ -3080,42 +3147,9 @@ class GenerationManager:
         messages = _snapshot_messages(snapshot, error_code="invalid_request_snapshot")
         if not messages or messages[0].role != "system":
             raise ProviderError("invalid_request_snapshot")
-        guidance = {
-            "state_deliverable_mismatch": (
-                "The visible deliverable differed from the canonical output. For "
-                "replace, make the deliverable exactly equal the complete output after "
-                "all replacements, character for character. For append, the deliverable "
-                "is the exact output addition, or the complete joined output together "
-                "with output_addition."
-            ),
-            "state_deliverable_count_mismatch": (
-                "A state mutation requires exactly one deliverable block. If you "
-                "present multiple alternatives, use operation none instead."
-            ),
-            "state_source_missing": (
-                "An establish for text work must include the complete source. Only an "
-                "uploaded source DOCX lets the application supply the source."
-            ),
-            "state_docx_source_mismatch": (
-                "For an uploaded source DOCX, omit source: the application uses the "
-                "uploaded document."
-            ),
-            "state_docx_output_mismatch": (
-                "The deliverable must equal the returned docx_blocks' clean text: block "
-                "text joined in order with blank lines, keeping hyperlink display text "
-                "without its wrappers."
-            ),
-            "state_output_addition_missing": (
-                "The append deliverable showed the complete joined output, so the state "
-                "must name the exact output_addition."
-            ),
-            "invalid_event_fields": (
-                "An event had missing or extra keys. Use only the exact keys for "
-                "each event and the chosen state operation in the protocol. Never "
-                "repeat the deliverable as an output field. Omit unchanged optional "
-                "state fields rather than adding null values."
-            ),
-        }.get(error_code, "Check every event against the exact protocol schema.")
+        guidance = _PROTOCOL_RETRY_GUIDANCE.get(
+            error_code, "Check every event against the exact protocol schema."
+        )
         reminder = (
             "\n\nPROTOCOL RETRY: The preceding attempt failed strict response-protocol "
             "validation and was discarded. Regenerate the response from the same "

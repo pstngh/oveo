@@ -824,19 +824,33 @@ async def test_state_application_failures_preserve_valid_visible_blocks(
 
 
 @pytest.mark.parametrize(
-    "invalid_response",
+    ("invalid_response", "guidance"),
     [
-        b"not-json\n",
+        (b"not-json\n", "A line was not one complete JSON object"),
         # Text work cannot establish without its complete source.
-        _response_stream(
-            "Visible draft that must be discarded",
-            {"operation": "establish", "brief": {"direction": "en-US-fr-CA"}},
+        (
+            _response_stream(
+                "Visible draft that must be discarded",
+                {"operation": "establish", "brief": {"direction": "en-US-fr-CA"}},
+            ),
+            "must include the complete source",
+        ),
+        # A question cannot also change the canonical work.
+        (
+            b'{"v":1,"event":"response_start"}\n'
+            b'{"v":1,"event":"block_start","id":"b1","type":"conversation"}\n'
+            b'{"v":1,"event":"block_delta","id":"b1","text":"Which variety?"}\n'
+            b'{"v":1,"event":"block_end","id":"b1"}\n'
+            b'{"v":1,"event":"state","operation":"establish","source":"Hi",'
+            b'"brief":{"direction":"en-US-fr-CA"}}\n',
+            "A conversation block cannot change canonical state",
         ),
     ],
 )
 async def test_protocol_failure_retries_once_and_discards_any_visible_draft(
     manager_database: tuple[Database, Settings, User],
     invalid_response: bytes,
+    guidance: str,
 ) -> None:
     database, settings, user = manager_database
     provider = ScriptedProvider([invalid_response, _SUCCESS])
@@ -859,6 +873,8 @@ async def test_protocol_failure_retries_once_and_discards_any_visible_draft(
     assert len(provider.requests) == 2
     assert "PROTOCOL RETRY" not in str(provider.requests[0].snapshot)
     assert "PROTOCOL RETRY" in str(provider.requests[1].snapshot)
+    retry_system = provider.requests[1].snapshot["provider_messages"][0]["content"]
+    assert guidance in retry_system
     async with database.sessions() as db:
         assert await db.scalar(select(func.count()).select_from(WorkVersion)) == 0
         assistant_messages = int(
@@ -1179,8 +1195,10 @@ async def test_automatic_compaction_preserves_recent_transcript_and_accounts_cos
     manager_database: tuple[Database, Settings, User],
 ) -> None:
     database, base_settings, user = manager_database
+    # Calibrated to the version-controlled prompts: above the prompts plus the latest
+    # turns, below the whole thread. Growing the prompts can require raising it.
     settings = base_settings.model_copy(
-        update={"context_compaction_tokens": 10_500, "context_recent_messages": 4}
+        update={"context_compaction_tokens": 11_500, "context_recent_messages": 4}
     )
     async with database.sessions() as db:
         thread = Thread(
@@ -1236,8 +1254,10 @@ async def test_malformed_summary_is_retried_once_without_killing_user_turn(
     manager_database: tuple[Database, Settings, User],
 ) -> None:
     database, base_settings, user = manager_database
+    # Calibrated to the version-controlled prompts: above the prompts plus the latest
+    # turns, below the whole thread. Growing the prompts can require raising it.
     settings = base_settings.model_copy(
-        update={"context_compaction_tokens": 10_500, "context_recent_messages": 4}
+        update={"context_compaction_tokens": 11_500, "context_recent_messages": 4}
     )
     async with database.sessions() as db:
         thread = Thread(owner_id=user.id, mode="translate", title="Existing thread")
