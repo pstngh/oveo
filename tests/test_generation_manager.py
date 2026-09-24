@@ -679,11 +679,18 @@ async def test_provider_stream_decoder_and_commit_cover_all_canonical_operations
 
 
 @pytest.mark.parametrize(
-    ("visible", "state"),
+    ("visible", "state", "error_code", "blocks"),
     [
+        # Only the state is wrong, so once the retries run out the valid alternatives
+        # stay visible with the failure.
         (
             ["Option une", "Option deux"],
             {"operation": "establish", "source": "Source", "brief": {"direction": "en-US-fr-CA"}},
+            "state_persistence_failed",
+            [
+                {"type": "deliverable", "text": "Option une"},
+                {"type": "deliverable", "text": "Option deux"},
+            ],
         ),
         # The previous grammar repeated the deliverable as `output`; it is now rejected.
         (
@@ -694,6 +701,8 @@ async def test_provider_stream_decoder_and_commit_cover_all_canonical_operations
                 "output": "Option une",
                 "brief": {"direction": "en-US-fr-CA"},
             },
+            "protocol_error",
+            [],
         ),
     ],
 )
@@ -701,6 +710,8 @@ async def test_mutation_rejects_multiple_deliverables_and_repeated_output(
     manager_database: tuple[Database, Settings, User],
     visible: str | list[str],
     state: dict[str, object],
+    error_code: str,
+    blocks: list[dict[str, str]],
 ) -> None:
     database, settings, user = manager_database
     invalid_response = _response_stream(visible, state)
@@ -720,8 +731,8 @@ async def test_mutation_rejects_multiple_deliverables_and_repeated_output(
         thread_id=thread_id,
     )
     failed = await _wait_status(manager, submitted.generation_id, {"failed"})
-    assert failed["error_code"] == "protocol_error"
-    assert failed["blocks"] == []
+    assert failed["error_code"] == error_code
+    assert failed["blocks"] == blocks
     async with database.sessions() as db:
         assert await db.scalar(select(func.count()).select_from(WorkVersion)) == 0
         assert await db.scalar(select(func.count()).select_from(Message)) == 1
@@ -730,8 +741,9 @@ async def test_mutation_rejects_multiple_deliverables_and_repeated_output(
 
 
 @pytest.mark.parametrize(
-    ("failed_state", "error_code"),
+    ("failed_state", "error_code", "requests"),
     [
+        # Stale work is never retried automatically.
         (
             {
                 "operation": "append",
@@ -742,7 +754,9 @@ async def test_mutation_rejects_multiple_deliverables_and_repeated_output(
                 "output_separator": "paragraph",
             },
             "stale_state",
+            2,
         ),
+        # Model mistakes in the state get two strict retries before failing.
         (
             {
                 "operation": "replace",
@@ -750,6 +764,7 @@ async def test_mutation_rejects_multiple_deliverables_and_repeated_output(
                 "replacements": [{"output_anchor": "missing", "output_replacement": "replacement"}],
             },
             "state_persistence_failed",
+            4,
         ),
         # A block map with no Word document anywhere in the conversation.
         (
@@ -759,6 +774,7 @@ async def test_mutation_rejects_multiple_deliverables_and_repeated_output(
                 "docx_blocks": [{"id": "p000001", "text": "Suite"}],
             },
             "state_persistence_failed",
+            4,
         ),
     ],
 )
@@ -766,6 +782,7 @@ async def test_state_application_failures_preserve_valid_visible_blocks(
     manager_database: tuple[Database, Settings, User],
     failed_state: dict[str, object],
     error_code: str,
+    requests: int,
 ) -> None:
     database, settings, user = manager_database
     provider = ScriptedProvider(
@@ -778,7 +795,7 @@ async def test_state_application_failures_preserve_valid_visible_blocks(
                     "brief": {"direction": "en-US-fr-CA"},
                 },
             ),
-            _response_stream("Suite", failed_state),
+            *[_response_stream("Suite", failed_state)] * 3,
         ]
     )
     manager = GenerationManager(database, settings, provider)
@@ -821,6 +838,68 @@ async def test_state_application_failures_preserve_valid_visible_blocks(
         )
     assert len(versions) == 1
     assert len(assistants) == 1
+    assert len(provider.requests) == requests
+    await manager.shutdown()
+
+
+async def test_an_anchor_mistake_is_repaired_by_a_strict_retry(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, settings, user = manager_database
+    provider = ScriptedProvider(
+        [
+            _response_stream(
+                "Bonjour tout le monde",
+                {
+                    "operation": "establish",
+                    "source": "Hello everyone",
+                    "brief": {"direction": "en-US-fr-CA"},
+                },
+            ),
+            # A normalized space in the anchor does not occur in the saved output.
+            _response_stream(
+                "Salut tout le monde",
+                {
+                    "operation": "replace",
+                    "base_version": 1,
+                    "replacements": [
+                        {"output_anchor": "Bonjour  tout", "output_replacement": "Salut tout"}
+                    ],
+                },
+            ),
+            _response_stream("Salut tout le monde", {"operation": "full", "base_version": 1}),
+        ]
+    )
+    manager = GenerationManager(database, settings, provider)
+    async with database.sessions() as db:
+        thread = Thread(owner_id=user.id, mode="translate", title="Existing conversation")
+        db.add(thread)
+        await db.commit()
+        thread_id = thread.id
+
+    first = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="anchor-base",
+        text="Translate Hello everyone.",
+        attachment=None,
+        thread_id=thread_id,
+    )
+    await _wait_status(manager, first.generation_id, {"completed"})
+    second = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="anchor-repair",
+        text="Use Salut instead.",
+        attachment=None,
+        thread_id=thread_id,
+    )
+    completed = await _wait_status(manager, second.generation_id, {"completed"})
+    assert completed["blocks"] == [{"type": "deliverable", "text": "Salut tout le monde"}]
+    retry_system = provider.requests[2].snapshot["provider_messages"][0]["content"]
+    assert "Copy each anchor character for character" in retry_system
+    async with database.sessions() as db:
+        latest = await db.scalar(select(WorkVersion).order_by(WorkVersion.version_no.desc()))
+    assert latest is not None and latest.version_no == 2
+    assert latest.output_text == "Salut tout le monde"
     await manager.shutdown()
 
 

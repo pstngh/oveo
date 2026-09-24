@@ -561,10 +561,37 @@ _REPAIRABLE_STATE_CODES = frozenset(
         "state_docx_source_mismatch",
         "state_docx_output_mismatch",
         "state_output_addition_missing",
+        "state_missing_output_anchor",
+        "state_missing_source_anchor",
+        "state_ambiguous_output_anchor",
+        "state_ambiguous_source_anchor",
+        "state_overlapping_output_anchors",
+        "state_overlapping_source_anchors",
+        "invalid_docx_blocks",
+        "invalid_docx_hyperlinks",
+        "state_docx_blocks_missing",
+        "state_docx_blocks_unexpected",
+        "state_docx_append_unsupported",
+        "state_docx_requires_establish",
+        "invalid_canonical_state",
     }
 )
 _MISSING_STATE_GUIDANCE = (
     "After the last block_end, emit exactly one state event and then response_end."
+)
+_MISSING_ANCHOR_GUIDANCE = (
+    "An anchor did not occur in its base text. Copy each anchor character for character "
+    "from active_canonical_work.document_data (output for output anchors, source for "
+    "source anchors), including no-break spaces and typographic quotes, or express the "
+    "change with full."
+)
+_AMBIGUOUS_ANCHOR_GUIDANCE = (
+    "An anchor occurred more than once in its base text. Extend it with neighboring words "
+    "until it occurs exactly once, or express the change with full."
+)
+_OVERLAPPING_ANCHOR_GUIDANCE = (
+    "Two replacements overlapped in the same base text. Merge them into one replacement, "
+    "or express the change with full."
 )
 # What a strict protocol retry tells the model about the mistake it made.
 _PROTOCOL_RETRY_GUIDANCE: dict[str, str] = {
@@ -625,7 +652,34 @@ _PROTOCOL_RETRY_GUIDANCE: dict[str, str] = {
     ),
     "invalid_docx_blocks": (
         'docx_blocks must list every working block exactly once and in order, as {"id", '
-        '"text"} objects numbered p000001, p000002, and so on.'
+        '"text"} objects numbered p000001, p000002, and so on, copied from the working '
+        "document: the canonical docx_blocks, or the source attachment's blocks for a new "
+        "work item."
+    ),
+    "invalid_docx_hyperlinks": (
+        "Every protected hyperlink wrapper must appear exactly once, in its original block "
+        "and order; only its display text may change."
+    ),
+    "state_missing_output_anchor": _MISSING_ANCHOR_GUIDANCE,
+    "state_missing_source_anchor": _MISSING_ANCHOR_GUIDANCE,
+    "state_ambiguous_output_anchor": _AMBIGUOUS_ANCHOR_GUIDANCE,
+    "state_ambiguous_source_anchor": _AMBIGUOUS_ANCHOR_GUIDANCE,
+    "state_overlapping_output_anchors": _OVERLAPPING_ANCHOR_GUIDANCE,
+    "state_overlapping_source_anchors": _OVERLAPPING_ANCHOR_GUIDANCE,
+    "state_docx_blocks_missing": (
+        "Word work needs the complete docx_blocks array on establish, replace, and full."
+    ),
+    "state_docx_blocks_unexpected": "This work is not a Word document: omit docx_blocks.",
+    "state_docx_append_unsupported": (
+        "Word work cannot use append: use full with the complete docx_blocks, or answer "
+        "with operation none."
+    ),
+    "state_docx_requires_establish": (
+        "The latest turn attaches a new source Word document, so the only valid mutation "
+        "is establish."
+    ),
+    "invalid_canonical_state": (
+        "The saved source, output, and brief must stay non-empty after the operation."
     ),
     "missing_state": _MISSING_STATE_GUIDANCE,
     "incomplete_response": _MISSING_STATE_GUIDANCE,
@@ -2151,7 +2205,8 @@ class GenerationManager:
                 template_blocks = extracted.blocks
             else:
                 if state_docx_blocks is not None:
-                    raise ProtocolError("state_docx_template_missing")
+                    # A block map with no Word document in the conversation.
+                    raise ProtocolError("state_docx_blocks_unexpected")
                 if state.source is None:
                     raise ProtocolError("state_source_missing")
                 source = state.source
@@ -2186,7 +2241,7 @@ class GenerationManager:
                 docx_template_attachment_id = template_attachment.id
                 template_blocks = extracted.blocks
             elif state_docx_blocks is not None:
-                raise ProtocolError("state_docx_template_missing")
+                raise ProtocolError("state_docx_blocks_unexpected")
 
             if isinstance(state, AppendState):
                 source = _append_text(source, state.source_addition, state.source_separator)
@@ -3248,6 +3303,7 @@ class GenerationManager:
                     )
                     decoder = ProtocolDecoder()
                     emit = protocol_emitter(decoder)
+                    decoded = False
 
                     try:
                         completion = await self._call_provider(
@@ -3260,6 +3316,7 @@ class GenerationManager:
                             record_ids=True,
                         )
                         document = decoder.finish()
+                        decoded = True
                         await self._commit_success(generation_id, document, completion)
                         break
                     except ProtocolError as error:
@@ -3272,6 +3329,9 @@ class GenerationManager:
                         if attempt == 2 or not await self._prepare_protocol_retry(
                             generation_id, attempt + 1
                         ):
+                            if decoded and error.code in _REPAIRABLE_STATE_CODES:
+                                # The visible response was valid; only its state failed.
+                                raise StatePersistenceError from error
                             raise
                         request_snapshot = self._protocol_retry_snapshot(
                             request_snapshot, error.code
