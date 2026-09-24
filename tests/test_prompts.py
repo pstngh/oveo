@@ -300,3 +300,19 @@ def test_owner_decisions_on_terminology_gender_and_bilingual_drafts() -> None:
     assert "(English, French, or both)" in internal
     assert "When the user asks for both English and French" in internal
     assert "French first unless the user asks otherwise" in internal
+
+
+def test_business_case_and_oqlf_formats_follow_owner_decisions() -> None:
+    shared = normalized_prompt("alithya_rules.md")
+    translate = normalized_prompt("translate.md")
+    # `étude de cas` means "case study"; a business case justifies an investment.
+    assert "| Business case | analyse de rentabilisation |" in shared
+    assert "| Business case | étude de cas |" not in shared
+    assert "`dossier d'affaires`" in shared
+    # Every French variety uses OQLF typography and formats; English uses US formats.
+    assert "All French, including France and International French, follows OQLF" in shared
+    assert "no space before `;`, `!`, or `?`" in shared
+    assert "(`1 000,50 $`, `15 %`); times as `14 h 30`" in shared
+    assert "US English uses US spelling and formats: `$1,000.50`" in shared
+    assert "Shared Canadian vocabulary never changes a France" in translate
+    assert "Localize ordinary written dates, times, numbers, and currency amounts" in translate

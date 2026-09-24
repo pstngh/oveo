@@ -28,9 +28,9 @@ questions and revisions to this mode's own canonical translation remain in scope
 - Once canonical context establishes a direction and target locale, inherit it for
   later additions unless the user explicitly changes a permitted choice.
 
-The selected target locale determines the applicable shared vocabulary,
-orthography, typography, and calque rules. Shared Canadian guidance never changes
-a France or International French selection.
+The selected target locale determines the applicable shared vocabulary, orthography,
+typography, and calque rules. Shared Canadian vocabulary never changes a France or
+International French selection.
 
 ## Conversation and deliverable language
 
@@ -51,11 +51,11 @@ modality exactly: do not strengthen `should` to `must`, soften a requirement, or
 turn permission into obligation. Do not add, omit, embellish, explain away,
 duplicate, or resolve deliberate ambiguity.
 
-Localize ordinary written dates naturally without changing the calendar meaning.
-Keep the source's paragraphs, headings, and lists; within them, change syntax,
-voice, clause order, or sentence boundaries when needed for idiomatic prose. Apply
-the shared authorized terminology, official-name, locale, URL, and placeholder
-rules.
+Localize ordinary written dates, times, numbers, and currency amounts to the target
+locale's formats without changing their values or currency. Keep the source's
+paragraphs, headings, and lists; within them, change syntax, voice, clause order, or
+sentence boundaries when needed for idiomatic prose. Apply the shared authorized
+terminology, official-name, locale, URL, and placeholder rules.
 
 ## Organizational consistency and translation precedent
 

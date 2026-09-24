@@ -36,7 +36,7 @@ before replacing it.
 | Legacy systems | systèmes hérités | English→French, all French | Technology context |
 | Business outcomes | résultats d'affaires | English→French, all French | Business context |
 | Driver | levier | English→French, all French | Business context only |
-| Business case | étude de cas | English→French, all French | Business context |
+| Business case | analyse de rentabilisation | English→French, all French | Project or investment justification; for a Québec public-sector project document, use `dossier d'affaires` |
 | Client stories | témoignages de clients | English→French, all French | Marketing/editorial context |
 | Subject matter experts | experts de contenu | English→French, all French | Organizational term |
 | NetZero | carboneutralité | English→French, all French | Sustainability context |
@@ -120,20 +120,27 @@ check silent and follow the active mode's normal response format.
 
 ## Locale conventions
 
-- US English uses US spelling and conventions.
+- US English uses US spelling and formats: `$1,000.50`, `15%`, `2:30 p.m.`, and
+  `September 24, 2026`.
 - Canadian French uses established Canadian forms such as `infonuagique`,
   `nuage`, `courriel`, `clavardage`, and `site Web`. Prefer `défi` to
   `challenge`, `occasion` to `opportunité`, `numérique` to `digital`,
   `avoir un impact sur` to `impacter`, `résoudre` to `solutionner`, and
   `rétroaction` to `feedback`.
-- France French uses normal France vocabulary, spelling, grammar, and typography.
-  Do not impose Canadian defaults such as `courriel`, `infonuagique`,
-  `clavardage`, `fin de semaine`, or `stationnement` merely because these rules
-  are shared.
+- France French uses normal France vocabulary, spelling, and grammar, with the
+  OQLF typography below like all French. Do not impose Canadian defaults such as
+  `courriel`, `infonuagique`, `clavardage`, `fin de semaine`, or `stationnement`
+  merely because these rules are shared.
 - International French uses broadly understood neutral French and avoids
   narrowly regional vocabulary unless the source or brief requires it.
-- French deliverables must not contain U+2014 EM DASH. Use punctuation natural
-  to the selected French locale.
+- All French, including France and International French, follows OQLF typography
+  and formats: no space before `;`, `!`, or `?`; a no-break space before `:` and
+  inside « »; a no-break space between thousands and a decimal comma
+  (`1 000,50`); the currency or percent sign after the number with a no-break
+  space (`1 000,50 $`, `15 %`); times as `14 h 30`; dates as
+  `le 24 septembre 2026`; and ordinals as `1er` and `2e`.
+- French deliverables must not contain U+2014 EM DASH; otherwise follow the OQLF
+  punctuation above.
 - Avoid French-to-English calques: `bruit ponctuel` may mean `intermittent
   noise`, business `levier` is `driver`, `dynamique globale` is `global
   momentum`, `mis à disposition` is often `available`, transitive `communiquer
