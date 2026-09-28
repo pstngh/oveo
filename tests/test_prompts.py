@@ -339,3 +339,22 @@ def test_dates_corrections_and_follow_up_edits_keep_the_whole_text_coherent() ->
     assert "Prefer an explicit date" in internal
     for prompt in (internal, revision):
         assert "Include the follow-on fixes the shared rules on follow-up edits require" in prompt
+
+
+def test_organization_names_are_established_not_invented() -> None:
+    shared = normalized_prompt("alithya_rules.md")
+    # Charities and their events follow the official-name rule, like public bodies.
+    assert "external organizations such as charities, foundations, and partners" in shared
+    assert "with their named events and campaigns" in shared
+    # A French name is often a different name, so it cannot be built word by word.
+    assert "never build one from the source name's words" in shared
+    assert "never recommend one name and apply another" in shared
+    assert "never call a form official when you only inferred it" in shared
+    # "X has an official translation" is a correction: apply it or ask, never guess.
+    assert "When the user says a name has an official translation" in shared
+    assert "ask once for the exact form instead of guessing" in shared
+    assert "including one you proposed, use it exactly wherever the name occurs" in shared
+    # Alithya's yearly ride has established French names.
+    assert "`Fondation Make-A-Wish | Rêves d'enfants Canada`" in shared
+    assert "the masculine `48 HEURES VÉLO` (`le 48 HEURES VÉLO`)" in shared
+    assert "Fais-Un" not in shared

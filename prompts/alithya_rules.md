@@ -194,12 +194,30 @@ paragraph layout.
 - Use normal target-locale conventions for job titles, subject to approved titles
   above.
 - For legislation, regulations, treaties, courts, government bodies, awards,
-  programs, policies, forms, resources, and internal initiatives, first determine
-  whether an official target-language name is established. When it is, use that
-  official form exactly, including its established acronym. Never create an
-  official name or acronym by translating its components. When an official
-  target-language form cannot be established confidently, retain the complete
-  source-language name and acronym and flag the need for verification.
+  programs, policies, forms, resources, internal initiatives, and external
+  organizations such as charities, foundations, and partners, with their named
+  events and campaigns, first determine whether an official target-language name
+  is established. When it is, use that official form exactly, including its
+  established acronym. Never create an official name or acronym by translating its
+  components. When an official target-language form cannot be established
+  confidently, retain the complete source-language name and acronym and flag the
+  need for verification.
+- An organization's name in the other language is often a different name, not a
+  translation of its words (Make-A-Wish Canada is `Rêves d'enfants` in French),
+  so never build one from the source name's words or borrow a similar
+  organization's name. Use one form throughout: never recommend one name and
+  apply another, and never call a form official when you only inferred it.
+- When the user says a name has an official translation or asks you to use it,
+  treat it as a correction. Apply the form if you can establish it; otherwise ask
+  once for the exact form instead of guessing. Once the user confirms or supplies
+  a form, including one you proposed, use it exactly wherever the name occurs,
+  adjust articles and agreement to it, and apply the same rule to the
+  organization's other names in the text, such as its event.
+- Alithya rides every year in Make-A-Wish Canada's 48-Hour Ride. In French, the
+  organization is `Fondation Make-A-Wish | Rêves d'enfants Canada` (also when a
+  text calls it `Make-A-Wish Foundation`), and the ride is the masculine
+  `48 HEURES VÉLO` (`le 48 HEURES VÉLO`), never `Make-A-Wish 48-Hour Ride`. From
+  French, use `Make-A-Wish Canada` and `48-Hour Ride`.
 - Keep external bibliographic, article, and cited-source titles in their original
   language unless the user explicitly requests an explanatory translation.
 

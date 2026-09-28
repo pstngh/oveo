@@ -37,6 +37,8 @@ from oveo.models import Message, Thread, User, WorkItem, WorkVersion
 from tests.docx_fixtures import R, W, make_docx
 
 NBSP = chr(0x00A0)
+NARROW_NBSP = chr(0x202F)
+APOSTROPHE = chr(0x2019)
 _FINISHED = frozenset({"completed", "failed", "stopped"})
 _FRENCH_WORDS = frozenset({"de", "des", "du", "la", "le", "les", "et", "pour", "une", "un"})
 
@@ -424,6 +426,33 @@ def _check_user_wording_is_merged(outcome: Outcome) -> None:
     expect(len(thanking) == 1, f"{len(thanking)} paragraphs thank people", outcome)
 
 
+def _saved_text(outcome: Outcome) -> str:
+    """The latest saved output with typographic apostrophes and no-break spaces made plain."""
+
+    latest = outcome.latest
+    expect(latest is not None, "no work was saved", outcome)
+    assert latest is not None
+    plain = latest.output_text.replace(APOSTROPHE, "'")
+    return plain.replace(NBSP, " ").replace(NARROW_NBSP, " ").casefold()
+
+
+def _check_make_a_wish_names_are_official(outcome: Outcome) -> None:
+    completed(outcome)
+    text = _saved_text(outcome)
+    expect("rêves d'enfants" in text, "the official French name is missing", outcome)
+    expect("48 heures vélo" in text, "the ride's official French name is missing", outcome)
+    for invented in ("fais-un", "foundation", "48-hour ride"):
+        expect(invented not in text, f"the translation still has {invented!r}", outcome)
+    expect("fais-un" not in outcome.notes().casefold(), "advice offers an invented name", outcome)
+
+
+def _check_named_organization_is_corrected(outcome: Outcome) -> None:
+    completed(outcome)
+    text = _saved_text(outcome)
+    expect("société canadienne du cancer" in text, "the official name was not applied", outcome)
+    expect("canadian cancer society" not in text, "the English name remains", outcome)
+
+
 def _check_side_text_keeps_word_work(outcome: Outcome) -> None:
     completed(outcome)
     latest = outcome.latest
@@ -484,6 +513,32 @@ _DRIVE_DAY = _TODAY - timedelta(days=3)
 _DRIVE = (
     f"The Montréal office blood drive with Héma-Québec takes place on {_spoken(_DRIVE_DAY)} "
     "in room 4B, from 9 a.m. to 3 p.m. Book your slot with Alex Martin."
+)
+
+_WISHES = (
+    "Alithya teams help make wishes come true\n\nFor many years, Alithya has supported the "
+    "Make-A-Wish Foundation through initiatives that help grant the wishes of children with "
+    "critical illnesses. This long-standing commitment once again brought our colleagues "
+    "together for the Make-A-Wish® 48-Hour Ride, marking Alithya's 11th consecutive year of "
+    "participation."
+)
+_WISHES_OFFICIAL = (
+    "Les équipes d'Alithya contribuent à réaliser des rêves\n\nDepuis de nombreuses années, "
+    "Alithya soutient la Fondation Make-A-Wish | Rêves d'enfants Canada grâce à des "
+    "initiatives qui contribuent à réaliser les rêves d'enfants atteints de maladies graves. "
+    "Cet engagement de longue date a une fois de plus rassemblé nos collègues à l'occasion du "
+    "48 HEURES VÉLO, qui marquait la 11e année consécutive de participation d'Alithya."
+)
+_WISHES_UNTRANSLATED = (
+    "Les équipes d'Alithya contribuent à réaliser des vœux\n\nDepuis de nombreuses années, "
+    "Alithya soutient la Make-A-Wish Foundation grâce à des initiatives qui contribuent à "
+    "réaliser les vœux d'enfants aux prises avec de graves problèmes de santé. Cet engagement "
+    "de longue date a une fois de plus rassemblé nos collègues à l'occasion de la "
+    "Make-A-Wish® 48-Hour Ride, marquant la 11e année consécutive de participation d'Alithya."
+)
+_CANCER = (
+    "Cette année encore, nos collègues de Montréal ont soutenu la Canadian Cancer Society en "
+    "participant à sa collecte de fonds annuelle."
 )
 
 _EN_TO_CA = "Translate into Canadian French: "
@@ -918,6 +973,64 @@ SCENARIOS: tuple[Scenario, ...] = (
                 ]
             ),
             _establish("À bientôt.", "See you soon."),
+        ),
+    ),
+    Scenario(
+        name="make-a-wish-uses-its-official-french-names",
+        mode="translate",
+        turns=(
+            Turn(_EN_TO_CA + _WISHES),
+            Turn("Make-A-Wish Foundation a une traduction en français."),
+        ),
+        check=_check_make_a_wish_names_are_official,
+        good=(
+            _establish(_WISHES_OFFICIAL, _WISHES),
+            _answer(
+                "Oui : la traduction utilise déjà le nom officiel, « Fondation Make-A-Wish | "
+                "Rêves d'enfants Canada », ainsi que « 48 HEURES VÉLO » pour l'évènement."
+            ),
+        ),
+        bad=(
+            _establish(_WISHES_UNTRANSLATED, _WISHES),
+            ndjson(
+                [
+                    (
+                        "deliverable",
+                        _WISHES_UNTRANSLATED.replace(
+                            "la Make-A-Wish Foundation", "la Fondation Fais-Un-Vœu"
+                        ),
+                    )
+                ],
+                {"operation": "full", "base_version": 1},
+            ),
+        ),
+    ),
+    Scenario(
+        name="official-name-remark-is-applied-not-recommended",
+        mode="revision",
+        turns=(
+            Turn("Proofread this Canadian French text: " + _CANCER),
+            Turn("La Canadian Cancer Society a un nom officiel en français."),
+        ),
+        check=_check_named_organization_is_corrected,
+        good=(
+            _establish(_CANCER, _CANCER),
+            ndjson(
+                [
+                    (
+                        "deliverable",
+                        _CANCER.replace("Canadian Cancer Society", "Société canadienne du cancer"),
+                    )
+                ],
+                {"operation": "full", "base_version": 1},
+            ),
+        ),
+        bad=(
+            _establish(_CANCER, _CANCER),
+            _answer(
+                "Oui. En français, l'organisme s'appelle « Société canadienne du cancer ». Je "
+                "recommande de remplacer la mention de la Canadian Cancer Society par ce nom."
+            ),
         ),
     ),
 )
