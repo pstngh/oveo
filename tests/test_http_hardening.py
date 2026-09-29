@@ -435,7 +435,7 @@ async def test_thread_list_is_one_query_regardless_of_size(
     listing = (await client.get("/api/threads")).json()
     assert len(listing) == 41
     assert len(statements) == small  # the audit counted 2N+2 statements
-    assert all(item["owner_username"] == "charles" for item in listing)
+    assert {item["title"] for item in listing} == {"One", *(f"T{i}" for i in range(40))}
 
 
 async def test_history_refresh_returns_only_newer_messages(client: httpx.AsyncClient) -> None:
