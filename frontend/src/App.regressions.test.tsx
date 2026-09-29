@@ -57,19 +57,19 @@ function deferred<T>() {
 }
 
 const summary = (id: string, title: string): ThreadSummary => ({
-  id, owner_id: "user-1", mode: "translate", title, updated_at: "2026-09-16T00:00:00Z", active_generation_id: null,
+  id, mode: "translate", title, updated_at: "2026-09-16T00:00:00Z", active_generation_id: null,
 });
 
 const message = (id: string, ordinal: number, text: string, role: Message["role"] = "user"): Message => ({
-  id, ordinal, role, actor_username: null, blocks: [{ type: "conversation", text }], attachment: null, created_at: "2026-09-16T00:00:00Z",
+  id, ordinal, role, blocks: [{ type: "conversation", text }], attachment: null, created_at: "2026-09-16T00:00:00Z",
 });
 
 const detailFor = (id: string, messages: Message[], extra: Partial<ThreadDetail> = {}): ThreadDetail => ({
-  ...summary(id, `Thread ${id}`), owner_username: "charles", docx_exportable: false, generation: null, messages, ...extra,
+  ...summary(id, `Thread ${id}`), docx_exportable: false, generation: null, handoff: null, messages, ...extra,
 });
 
 const snapshot = (id: string, threadId: string, status: GenerationSnapshot["status"], seq: number, extra: Partial<GenerationSnapshot> = {}): GenerationSnapshot => ({
-  id, thread_id: threadId, status, blocks: [], seq, ...extra,
+  id, thread_id: threadId, status, blocks: [], error_code: null, error_message: null, retryable: false, seq, ...extra,
 });
 
 const account = (username: "charles" | "yousra") => ({ id: `${username}-id`, username, display_name: username, csrf_token: `${username}-csrf` });
@@ -134,6 +134,55 @@ describe("M-2 / F-1: every sign-in starts from nothing", () => {
     expect(await screen.findByRole("form", { name: "Sign in to Oveo" })).toBeInTheDocument();
     expect(FakeEventSource.instances[0].readyState).toBe(FakeEventSource.CLOSED);
     expect(screen.queryByText("Req")).not.toBeInTheDocument();
+  });
+});
+
+describe("sign-in and startup", () => {
+  it("starts the session from the sign-in answer without asking the server again", async () => {
+    const user = userEvent.setup();
+    const me = vi.spyOn(api, "me").mockRejectedValue(new ApiError(401, "authentication_required", "Sign in to continue."));
+    vi.spyOn(api, "usage").mockResolvedValue({ formatted: "$0.00" });
+    vi.spyOn(api, "threads").mockResolvedValue([]);
+    vi.spyOn(api, "login").mockResolvedValue(account("charles"));
+
+    render(<App />);
+    await user.type(await screen.findByLabelText("Username"), "charles");
+    await user.type(screen.getByLabelText("Password"), "synthetic");
+    await user.click(screen.getByRole("button", { name: "Sign in" }));
+    expect(await screen.findByRole("heading", { name: "What would you like to do?" })).toBeInTheDocument();
+    expect(me).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers to try again, not to sign in again, when Oveo cannot be reached", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(null, "", "/new");
+    vi.spyOn(api, "me").mockRejectedValueOnce(new TypeError("Failed to fetch")).mockResolvedValue(account("charles"));
+    vi.spyOn(api, "usage").mockResolvedValue({ formatted: "$0.00" });
+    vi.spyOn(api, "threads").mockResolvedValue([]);
+
+    render(<App />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Oveo could not be reached");
+    expect(screen.queryByRole("form", { name: "Sign in to Oveo" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByRole("heading", { name: "What would you like to do?" })).toBeInTheDocument();
+  });
+
+  it("changes nothing, not even the address, when a load fails after sign-out", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(null, "", "/new");
+    signedIn([summary(A, "Thread A")]);
+    let fail: (reason: unknown) => void = () => undefined;
+    vi.spyOn(api, "thread").mockReturnValue(new Promise((_resolve, reject) => { fail = reject; }));
+    vi.spyOn(api, "logout").mockResolvedValue(undefined);
+
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: /^Thread A/ }));
+    await user.click(screen.getByRole("button", { name: "Sign out" }));
+    await screen.findByRole("form", { name: "Sign in to Oveo" });
+    await waitFor(() => expect(window.location.pathname).toBe("/"));
+    await act(async () => { fail(new TypeError("Failed to fetch")); });
+    expect(window.location.pathname).toBe("/");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 });
 
@@ -206,6 +255,70 @@ describe("L-1 / F-2, F-9: responses cannot land on the wrong conversation", () =
     await user.click(screen.getByRole("button", { name: /^Thread A/ }));
     await screen.findByText("Message in A");
     expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("");
+  });
+
+  it("keeps a send in progress when the user leaves and comes back, then follows its answer", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(null, "", `/conversations/${A}`);
+    signedIn([summary(A, "Thread A"), summary(B, "Thread B")]);
+    let turnAccepted = false;
+    vi.spyOn(api, "thread").mockImplementation(async (id: string) =>
+      detailFor(id, [message(`m-${id}`, 1, id === A ? "Message in A" : "Message in B")], {
+        generation: id === A && turnAccepted ? snapshot("g", A, "running", 1) : null,
+      }),
+    );
+    const accepted = deferred<{ thread_id: string; generation_id: string }>();
+    const submit = vi.spyOn(api, "submit").mockReturnValue(accepted.promise);
+
+    render(<App />);
+    await screen.findByText("Message in A");
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "For A");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await user.click(screen.getByRole("button", { name: /^Thread B/ }));
+    await screen.findByText("Message in B");
+    await user.click(screen.getByRole("button", { name: /^Thread A/ }));
+    await screen.findByText("Message in A");
+    turnAccepted = true;
+
+    // Still being sent: frozen, and it cannot be sent a second time.
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("For A");
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveAttribute("readonly");
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+
+    await act(async () => { accepted.resolve({ thread_id: A, generation_id: "g" }); });
+    await waitFor(() => expect(FakeEventSource.instances.at(-1)?.url).toBe("/api/generations/g/events"));
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("");
+    expect(submit).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the turn already running when a send is refused because of it", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(null, "", `/conversations/${T}`);
+    signedIn([summary(T, "Thread T")]);
+    vi.spyOn(api, "thread")
+      .mockResolvedValueOnce(detailFor(T, [message("m1", 1, "Earlier")]))
+      .mockResolvedValue(detailFor(T, [message("m2", 2, "Sent from another tab")], { generation: snapshot("g9", T, "running", 3) }));
+    vi.spyOn(api, "submit").mockRejectedValue(new ApiError(409, "active_generation", "This conversation already has an active generation."));
+
+    render(<App />);
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "Hello");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("already has an active generation");
+    expect(await screen.findByText("Sent from another tab")).toBeInTheDocument();
+    await waitFor(() => expect(FakeEventSource.instances.at(-1)?.url).toBe("/api/generations/g9/events"));
+  });
+
+  it("says the outcome is unknown when a proxy answers a send instead of Oveo", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(null, "", `/conversations/${T}`);
+    signedIn([summary(T, "Thread T")]);
+    vi.spyOn(api, "thread").mockResolvedValue(detailFor(T, [message("m1", 1, "Earlier")]));
+    vi.spyOn(api, "submit").mockRejectedValue(new ApiError(502, "request_failed", "Request failed."));
+
+    render(<App />);
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "Hello");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("could not confirm that your message was sent");
   });
 
   it("reports an accepted message as sent when only the refresh afterwards fails", async () => {
@@ -348,22 +461,20 @@ describe("L-10 / F-3, F-5, F-6, F-7: failures are reported and recoverable", () 
     signedIn([summary(T, "Thread T")]);
     vi.spyOn(api, "thread").mockResolvedValue(detailFor(T, [message("m1", 1, "Some request")]));
     vi.spyOn(api, "handoff").mockResolvedValue({ generation_id: "h" });
-    const generation = vi.spyOn(api, "generation").mockResolvedValue(
-      snapshot("h", T, "running", 1, { blocks: [{ type: "deliverable", text: "Partial" }] }),
-    );
     const stop = vi.spyOn(api, "stop").mockResolvedValue(undefined);
 
     render(<App />);
     await user.click(await screen.findByRole("button", { name: "Create prompt handoff" }));
     const dialog = await screen.findByRole("dialog", { name: "Prompt handoff" });
+    await waitFor(() => expect(FakeEventSource.instances.at(-1)?.url).toBe("/api/generations/h/events"));
+    const stream = FakeEventSource.instances.at(-1)!;
+    act(() => { stream.emit("snapshot", snapshot("h", T, "running", 1, { blocks: [{ type: "deliverable", text: "Partial" }] })); });
     await within(dialog).findByText("Partial");
     expect(within(dialog).getByText("Closing this dialog cancels the handoff.")).toBeInTheDocument();
     await user.click(within(dialog).getByRole("button", { name: "Close dialog" }));
     expect(stop).toHaveBeenCalledWith("h");
-    const polls = generation.mock.calls.length;
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    expect(stream.readyState).toBe(FakeEventSource.CLOSED);
     expect(screen.queryByRole("dialog", { name: "Prompt handoff" })).not.toBeInTheDocument();
-    expect(generation.mock.calls.length).toBe(polls);
   });
 
   it("rides out a transient failure while following a prompt handoff", async () => {
@@ -372,34 +483,39 @@ describe("L-10 / F-3, F-5, F-6, F-7: failures are reported and recoverable", () 
     signedIn([summary(T, "Thread T")]);
     vi.spyOn(api, "thread").mockResolvedValue(detailFor(T, [message("m1", 1, "Some request")]));
     vi.spyOn(api, "handoff").mockResolvedValue({ generation_id: "h" });
-    vi.spyOn(api, "generation")
-      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
-      .mockResolvedValue(snapshot("h", T, "completed", 5, { blocks: [{ type: "deliverable", text: "Finished handoff" }] }));
     const stop = vi.spyOn(api, "stop").mockResolvedValue(undefined);
 
     render(<App />);
     await user.click(await screen.findByRole("button", { name: "Create prompt handoff" }));
     const dialog = await screen.findByRole("dialog", { name: "Prompt handoff" });
+    await waitFor(() => expect(FakeEventSource.instances.at(-1)?.url).toBe("/api/generations/h/events"));
+    const stream = FakeEventSource.instances.at(-1)!;
+    // A dropped connection the browser reconnects by itself, starting with a snapshot.
+    act(() => { stream.onerror?.(); });
+    act(() => { stream.emit("snapshot", snapshot("h", T, "completed", 5, { blocks: [{ type: "deliverable", text: "Finished handoff" }] })); });
 
-    expect(await within(dialog).findByText("Finished handoff", undefined, { timeout: 3000 })).toBeInTheDocument();
+    expect(await within(dialog).findByText("Finished handoff")).toBeInTheDocument();
+    expect(within(dialog).queryByText("Closing this dialog cancels the handoff.")).not.toBeInTheDocument();
     expect(stop).not.toHaveBeenCalled();
   });
 
-  it("cancels a prompt handoff it can no longer follow", async () => {
+  it("closes a prompt handoff whose conversation was deleted elsewhere", async () => {
     const user = userEvent.setup();
     window.history.replaceState(null, "", `/conversations/${T}`);
     signedIn([summary(T, "Thread T")]);
     vi.spyOn(api, "thread").mockResolvedValue(detailFor(T, [message("m1", 1, "Some request")]));
     vi.spyOn(api, "handoff").mockResolvedValue({ generation_id: "h" });
-    vi.spyOn(api, "generation").mockRejectedValue(new ApiError(403, "forbidden", "The request could not be verified."));
+    vi.spyOn(api, "generation").mockRejectedValue(new ApiError(404, "generation_not_found", "Generation not found."));
     const stop = vi.spyOn(api, "stop").mockResolvedValue(undefined);
 
     render(<App />);
     await user.click(await screen.findByRole("button", { name: "Create prompt handoff" }));
+    await waitFor(() => expect(FakeEventSource.instances.at(-1)?.url).toBe("/api/generations/h/events"));
+    act(() => { FakeEventSource.instances.at(-1)!.fail(); });
 
-    await waitFor(() => expect(stop).toHaveBeenCalledWith("h"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("The prompt handoff is no longer available.");
     expect(screen.queryByRole("dialog", { name: "Prompt handoff" })).not.toBeInTheDocument();
-    expect(await screen.findByRole("alert")).toHaveTextContent("The request could not be verified.");
+    expect(stop).not.toHaveBeenCalled();
   });
 
   it("keeps a finished answer in view until the refreshed conversation shows it", async () => {
@@ -439,16 +555,16 @@ describe("L-10 / F-3, F-5, F-6, F-7: failures are reported and recoverable", () 
       handoff: snapshot("h0", T, "running", 4),
     }));
     const create = vi.spyOn(api, "handoff");
-    vi.spyOn(api, "generation").mockResolvedValue(
-      snapshot("h0", T, "completed", 9, { blocks: [{ type: "deliverable", text: "Finished handoff" }] }),
-    );
 
     render(<App />);
     await user.click(await screen.findByRole("button", { name: "Create prompt handoff" }));
     const dialog = await screen.findByRole("dialog", { name: "Prompt handoff" });
+    await waitFor(() => expect(FakeEventSource.instances.at(-1)?.url).toBe("/api/generations/h0/events"));
+    act(() => {
+      FakeEventSource.instances.at(-1)!.emit("snapshot", snapshot("h0", T, "completed", 9, { blocks: [{ type: "deliverable", text: "Finished handoff" }] }));
+    });
     expect(await within(dialog).findByText("Finished handoff")).toBeInTheDocument();
     expect(create).not.toHaveBeenCalled();
-    expect(api.generation).toHaveBeenCalledWith("h0");
   });
 
   it("sends the CSRF token from the current cookie, not the first one seen", async () => {

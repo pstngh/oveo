@@ -3,7 +3,9 @@ import { api, ApiError } from "./api";
 import { applyDelta, followGeneration } from "./stream";
 import type { GenerationSnapshot } from "./types";
 
-const base: GenerationSnapshot = { id: "g1", thread_id: "t1", status: "running", blocks: [], seq: 4 };
+const base: GenerationSnapshot = {
+  id: "g1", thread_id: "t1", status: "running", blocks: [], error_code: null, error_message: null, retryable: false, seq: 4,
+};
 
 class FakeEventSource {
   static CLOSED = 2;
@@ -47,9 +49,12 @@ describe("applyDelta", () => {
 });
 
 describe("followGeneration", () => {
-  it("renders the snapshot, coalesces deltas, and resynchronizes after a gap", () => {
+  it("renders the snapshot, coalesces deltas, and polls after a delta that does not follow", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("EventSource", FakeEventSource);
+    const poll = vi.spyOn(api, "generation").mockResolvedValue({
+      ...base, status: "completed", seq: 12, blocks: [{ type: "deliverable", text: "ABCD" }],
+    });
     const updates: GenerationSnapshot[] = [];
     const stop = followGeneration("g/1", { onUpdate: (snapshot) => updates.push(snapshot) });
     const first = FakeEventSource.instances[0];
@@ -64,12 +69,9 @@ describe("followGeneration", () => {
 
     first.emit("delta", { from: 9, seq: 9, ops: [{ op: "append", text: "lost" }] });
     expect(first.readyState).toBe(FakeEventSource.CLOSED);
-    expect(FakeEventSource.instances).toHaveLength(1); // reconnects after a short pause
-    vi.advanceTimersByTime(250);
-    const second = FakeEventSource.instances[1];
-    second.emit("snapshot", { ...base, status: "completed", seq: 12, blocks: [{ type: "deliverable", text: "ABCD" }] });
-    expect(updates.at(-1)).toMatchObject({ status: "completed", blocks: [{ text: "ABCD" }] });
-    expect(second.readyState).toBe(FakeEventSource.CLOSED);
+    await vi.waitFor(() => expect(updates.at(-1)).toMatchObject({ status: "completed", blocks: [{ text: "ABCD" }] }));
+    expect(poll).toHaveBeenCalledOnce();
+    expect(FakeEventSource.instances).toHaveLength(1);
     stop();
   });
 
@@ -97,25 +99,6 @@ describe("followGeneration", () => {
     stream.readyState = FakeEventSource.CLOSED;
     stream.onerror?.();
     await vi.waitFor(() => expect(unavailable).toHaveBeenCalledOnce());
-    stop();
-  });
-
-  it("falls back to polling when every reconnect misses a delta again", async () => {
-    vi.useFakeTimers();
-    vi.stubGlobal("EventSource", FakeEventSource);
-    const poll = vi.spyOn(api, "generation").mockResolvedValue({ ...base, status: "completed" });
-    const stop = followGeneration("g1", { onUpdate: vi.fn() });
-
-    // Each reconnect starts with a snapshot; that alone must not reset the count.
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      const stream = FakeEventSource.instances.at(-1)!;
-      stream.emit("snapshot", base);
-      stream.emit("delta", { from: 9, seq: 9, ops: [] });
-      await vi.advanceTimersByTimeAsync(2_000);
-    }
-
-    expect(FakeEventSource.instances).toHaveLength(4);
-    expect(poll).toHaveBeenCalled();
     stop();
   });
 

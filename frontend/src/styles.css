@@ -29,12 +29,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .brand-mark::before { left: 0; }
 .brand-mark::after { right: 0; }
 .brand-wordmark { font-size: 2.15rem; font-weight: 790; letter-spacing: -.075em; }
-.brand-lockup-compact { gap: .5rem; }
-.brand-lockup-compact .brand-mark { width: 1.22rem; height: 1.08rem; }
-.brand-lockup-compact .brand-mark::before, .brand-lockup-compact .brand-mark::after { width: .73rem; height: .73rem; border-width: .11rem; }
-.brand-lockup-compact .brand-mark::before { left: 0; }
-.brand-lockup-compact .brand-mark::after { right: 0; }
-.brand-lockup-compact .brand-wordmark { font-size: 1.08rem; }
 
 .app-loading, .login-page { height: 100%; display: grid; place-items: center; background: radial-gradient(circle at 50% 35%, #242529 0, var(--bg) 42%); }
 .login-card { width: min(420px, calc(100vw - 32px)); padding: 38px; border: 1px solid var(--border); border-radius: 18px; background: rgba(35, 36, 39, .96); box-shadow: 0 30px 80px rgba(0,0,0,.3); }
@@ -85,7 +79,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .message.user .message-inner { width: min(720px, calc(100% - 48px)); margin-right: max(24px, calc((100% - 820px) / 2)); }
 .message.user .message-inner > * { width: max-content; max-width: 100%; margin-left: auto; }
 .user-text { margin-top: 0; margin-bottom: 4px; padding: 8px 12px; border: 1px solid #393a3e; border-radius: 14px 14px 4px 14px; background: #292a2e; white-space: pre-wrap; line-height: 1.48; }
-.message-author { margin: 0 12px 4px; color: var(--muted); font-size: .75rem; }
 .user-text:last-of-type { margin-bottom: 0; }
 .sent-attachment { display: flex; align-items: center; gap: 8px; margin-top: 6px; padding: 8px 10px; border: 1px solid #3e3f44; border-radius: 9px; color: #d5d4d0; background: #25262a; font-size: .83rem; }
 .sent-attachment svg { width: 17px; color: var(--accent); }
