@@ -409,3 +409,214 @@ def test_a_paragraph_with_only_layout_characters_is_not_a_block() -> None:
         )
     )
     assert [block.text for block in extract_docx(template).blocks] == ["Text"]
+
+
+def _rezip(package: bytes, *, replace: dict[str, bytes]) -> tuple[bytes, dict[str, int]]:
+    """Write ``package`` again with some members replaced; return local header offsets."""
+
+    output = io.BytesIO()
+    with (
+        zipfile.ZipFile(io.BytesIO(package)) as source,
+        zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as target,
+    ):
+        for info in source.infolist():
+            target.writestr(info.filename, replace.get(info.filename, source.read(info)))
+        offsets = {info.filename: info.header_offset for info in target.infolist()}
+    return output.getvalue(), offsets
+
+
+def _declare(package: bytearray, offset: int, name: str, *, crc: int, size: int) -> None:
+    """Overwrite a member's CRC and uncompressed size in both of its headers."""
+
+    package[offset + 14 : offset + 18] = crc.to_bytes(4, "little")
+    package[offset + 22 : offset + 26] = size.to_bytes(4, "little")
+    central = package.index(b"PK\x01\x02")  # The first central directory record.
+    while True:
+        name_length = int.from_bytes(package[central + 28 : central + 30], "little")
+        if package[central + 46 : central + 46 + name_length] == name.encode():
+            break
+        extra = int.from_bytes(package[central + 30 : central + 32], "little")
+        comment = int.from_bytes(package[central + 32 : central + 34], "little")
+        central += 46 + name_length + extra + comment
+    package[central + 16 : central + 20] = crc.to_bytes(4, "little")
+    package[central + 24 : central + 28] = size.to_bytes(4, "little")
+
+
+def test_a_member_that_understates_its_size_is_never_inflated_past_it() -> None:
+    import tracemalloc
+    import zlib
+
+    real = zipfile.ZipFile(io.BytesIO(make_docx())).read("word/document.xml")
+    # The stream holds the document and 48 MiB of spaces; the headers declare only the
+    # document, so every size and ratio check passes.
+    rebuilt, offsets = _rezip(make_docx(), replace={"word/document.xml": real + b" " * (48 << 20)})
+    package = bytearray(rebuilt)
+    _declare(
+        package,
+        offsets["word/document.xml"],
+        "word/document.xml",
+        crc=zlib.crc32(real),
+        size=len(real),
+    )
+
+    tracemalloc.start()
+    try:
+        extracted = extract_docx(bytes(package))
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert extracted.plain_text == "Hello site.\n\nCell text"
+    assert peak < 16 << 20
+
+
+def test_a_damaged_compressed_stream_is_an_invalid_docx() -> None:
+    rebuilt, offsets = _rezip(make_docx(), replace={})
+    package = bytearray(rebuilt)
+    offset = offsets["word/document.xml"]
+    name_length = int.from_bytes(package[offset + 26 : offset + 28], "little")
+    extra = int.from_bytes(package[offset + 28 : offset + 30], "little")
+    package[offset + 30 + name_length + extra] ^= 0xFF  # First byte of the deflate data.
+
+    with pytest.raises(DocxError) as caught:
+        extract_docx(bytes(package))
+    assert caught.value.code == "invalid_docx"
+
+
+@pytest.mark.parametrize("character", ["\x00", "\x0b", "\x1f", "￾"])
+def test_text_a_word_document_cannot_hold_is_refused_before_it_is_committed(
+    character: str,
+) -> None:
+    template = make_docx()
+    replacements = [
+        DocxReplacement(
+            id="p000001", text="Bonjour {{OVEO_LINK_l000001}}site{{/OVEO_LINK_l000001}}."
+        ),
+        DocxReplacement(id="p000002", text=f"Cellule{character}"),
+    ]
+    blocks = extract_docx(template).blocks
+
+    with pytest.raises(DocxError) as caught:
+        docx_module.plain_text_from_replacements(blocks, replacements)
+    assert caught.value.code == "invalid_docx_text"
+
+
+def test_a_hyperlink_cannot_lose_all_of_its_text() -> None:
+    blocks = extract_docx(make_docx()).blocks
+    replacements = [
+        DocxReplacement(id="p000001", text="Bonjour {{OVEO_LINK_l000001}}{{/OVEO_LINK_l000001}}."),
+        DocxReplacement(id="p000002", text="Cellule"),
+    ]
+
+    with pytest.raises(DocxError) as caught:
+        docx_module.plain_text_from_replacements(blocks, replacements)
+    assert caught.value.code == "invalid_docx_hyperlinks"
+
+
+def test_text_after_the_last_link_stays_before_a_trailing_page_break() -> None:
+    template = make_docx(
+        document_xml=_body(
+            '<w:p><w:r><w:t xml:space="preserve">Details at </w:t></w:r>'
+            '<w:hyperlink r:id="rId5"><w:r><w:t>site</w:t></w:r></w:hyperlink>'
+            '<w:r><w:br w:type="page"/></w:r></w:p>'
+        )
+    )
+    exported = render_docx(
+        template,
+        [
+            DocxReplacement(
+                id="p000001", text="Détails sur {{OVEO_LINK_l000001}}site{{/OVEO_LINK_l000001}}."
+            )
+        ],
+    )
+
+    (paragraph,) = _paragraph_xml(exported)
+    assert paragraph.index(b">.</w:t>") < paragraph.index(b'w:type="page"')
+
+
+@pytest.mark.parametrize(
+    ("declared", "codec"),
+    [
+        # `<` is not the byte 0x3C in UTF-7 or EBCDIC, which hides elements from the
+        # byte checks that bound the tree before it is built.
+        ("UTF-7", "utf-7"),
+        ("IBM037", "cp037"),
+        ("ISO-8859-1", "latin-1"),
+    ],
+)
+def test_only_utf8_and_utf16_parts_are_accepted(declared: str, codec: str) -> None:
+    source = zipfile.ZipFile(io.BytesIO(make_docx())).read("word/document.xml").decode()
+    document = source.replace('encoding="UTF-8"', f'encoding="{declared}"').encode(codec)
+    package, _ = _rezip(make_docx(), replace={"word/document.xml": document})
+
+    with pytest.raises(DocxError) as caught:
+        extract_docx(package)
+    assert caught.value.code == "invalid_docx"
+
+
+def test_a_utf16_document_is_still_accepted() -> None:
+    source = zipfile.ZipFile(io.BytesIO(make_docx())).read("word/document.xml").decode()
+    utf16 = source.replace('encoding="UTF-8"', 'encoding="UTF-16"').encode("utf-16")
+    package, _ = _rezip(make_docx(), replace={"word/document.xml": utf16})
+
+    assert extract_docx(package).plain_text == "Hello site.\n\nCell text"
+
+
+def test_a_utf16_doctype_is_refused() -> None:
+    document = (
+        '<?xml version="1.0" encoding="UTF-16"?><!DOCTYPE d [<!ENTITY x "y">]>'
+        f'<w:document xmlns:w="{W}"><w:body><w:p><w:r><w:t>Hi &x; there</w:t></w:r></w:p>'
+        "</w:body></w:document>"
+    ).encode("utf-16")
+    package, _ = _rezip(make_docx(), replace={"word/document.xml": document})
+
+    with pytest.raises(DocxError) as caught:
+        extract_docx(package)
+    assert caught.value.code == "invalid_docx"
+
+
+def test_comments_count_toward_the_element_cap() -> None:
+    # Varied, so the package stays under the compression-ratio limit.
+    comments = "".join(f"<!--{n:x}-->" for n in range(docx_module.MAX_DOCX_XML_ELEMENTS + 1))
+    package = make_docx(document_xml=_body(f"<w:p><w:r><w:t>Text</w:t></w:r></w:p>{comments}"))
+
+    with pytest.raises(DocxError) as caught:
+        extract_docx(package)
+    assert caught.value.code == "docx_too_complex"
+
+
+def test_nested_bodies_are_refused() -> None:
+    nested = _body("<w:body><w:p><w:r><w:t>Inner</w:t></w:r></w:p></w:body>")
+
+    with pytest.raises(DocxError) as caught:
+        extract_docx(make_docx(document_xml=nested))
+    assert caught.value.code == "invalid_docx"
+
+
+def test_many_field_instructions_are_checked_in_linear_time() -> None:
+    # An XPath union of two large node sets is merged quadratically (seconds here).
+    fields = '<w:r><w:instrText>PAGE</w:instrText></w:r><w:fldSimple w:instr="DATE"/>' * 40_000
+    package = make_docx(
+        document_xml=_body(f"<w:p><w:r><w:t>Text</w:t></w:r></w:p><w:p>{fields}</w:p>")
+    )
+
+    started = time.perf_counter()
+    assert extract_docx(package).plain_text == "Text"
+    assert time.perf_counter() - started < 2
+
+
+def test_legacy_encoded_non_ascii_part_names_are_refused() -> None:
+    output = io.BytesIO()
+    with (
+        zipfile.ZipFile(io.BytesIO(make_docx())) as source,
+        zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as target,
+    ):
+        for info in source.infolist():
+            target.writestr(info, source.read(info))
+        target.writestr("word/media/placeholder.png", b"png")
+    # The same length in bytes, now non-ASCII, without the UTF-8 name flag.
+    package = output.getvalue().replace(b"placeholder", b"caf\xc3\xa9holder")
+
+    with pytest.raises(DocxError) as caught:
+        extract_docx(package)
+    assert caught.value.code == "unsafe_docx_package"

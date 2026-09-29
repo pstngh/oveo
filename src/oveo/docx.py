@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import io
+import lzma
 import re
 import stat
 import zipfile
+import zlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -61,12 +63,13 @@ _CHARACTER_ELEMENTS = {
 }
 _INLINE_TAGS = (_T_TAG, *_INLINE_CHARACTERS)
 _HYPERLINK_TAG = f"{{{_W}}}hyperlink"
+_BODY_TAG = f"{{{_W}}}body"
+_TRACKED_CHANGE_TAGS = tuple(f"{{{_W}}}{name}" for name in ("ins", "del", "moveFrom", "moveTo"))
+_INSTR_TEXT_TAG = f"{{{_W}}}instrText"
+_FLD_SIMPLE_TAG = f"{{{_W}}}fldSimple"
 _PPR_TAG = f"{{{_W}}}pPr"
 _ALTERNATE_CONTENT_TAG = f"{{{_MC}}}AlternateContent"
-_FIELD_TAGS = frozenset({f"{{{_W}}}fldChar", f"{{{_W}}}instrText", f"{{{_W}}}fldSimple"})
-# Paragraphs directly in the body flow (including table cells and content controls),
-# never paragraphs nested in another paragraph's text boxes or shapes.
-_BODY_PARAGRAPHS = etree.XPath(".//w:body//w:p[not(ancestor::w:p)]", namespaces=_NS)
+_FIELD_TAGS = frozenset({f"{{{_W}}}fldChar", _INSTR_TEXT_TAG, _FLD_SIMPLE_TAG})
 _IN_TABLE_CELL = etree.XPath("ancestor::w:tc", namespaces=_NS)
 _BLOCK_ID = re.compile(r"p[0-9]{6}\Z")
 _LINK_ID = re.compile(r"l[0-9]{6}\Z")
@@ -76,6 +79,13 @@ _LINK_TOKEN = re.compile(
 )
 _RESERVED_LINK_PREFIX = "{{OVEO_LINK_"
 _RESERVED_LINK_CLOSE_PREFIX = "{{/OVEO_LINK_"
+# Characters XML 1.0 cannot hold. Text containing one could be committed but never
+# written back into the document.
+_XML_ILLEGAL_CHARACTER = re.compile("[^\t\n\r\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+# OOXML parts are UTF-8 or UTF-16 (ECMA-376 Part 2). UTF-16 (and a BOM-less UTF-32)
+# starts with one of these; anything else must be ASCII-compatible UTF-8.
+_WIDE_ENCODING_STARTS = (b"\xff\xfe", b"\xfe\xff", b"<\x00", b"\x00<", b"\x00\x00")
+_DECLARED_ENCODING = re.compile(rb"<\?xml[^>]*?\bencoding\s*=\s*[\"']([^\"']*)[\"']")
 
 
 class DocxError(ValueError):
@@ -166,6 +176,18 @@ class _ElementCounter:
     def end(self, _tag: str) -> None:
         return None
 
+    def comment(self, _text: str) -> None:
+        # Comments and processing instructions become tree nodes too.
+        self._count_node()
+
+    def pi(self, _target: str, _data: str | None = None) -> None:
+        self._count_node()
+
+    def _count_node(self) -> None:
+        self.elements += 1
+        if self.elements > MAX_DOCX_XML_ELEMENTS:
+            raise _TooComplex
+
     def data(self, _data: str) -> None:
         return None
 
@@ -188,14 +210,49 @@ def _require_bounded_tree(data: bytes, *, label: str) -> None:
         raise DocxError("invalid_docx", f"The DOCX {label} part is malformed.") from exc
 
 
+def _require_supported_encoding(data: bytes, *, label: str) -> None:
+    """Refuse encodings where `<` is not the byte 0x3C (UTF-7, EBCDIC, ...).
+
+    The element-count shortcut and the DOCTYPE check both rely on that byte.
+    """
+
+    if data.startswith(_WIDE_ENCODING_STARTS):
+        return
+    text = data.removeprefix(b"\xef\xbb\xbf")
+    declared = _DECLARED_ENCODING.match(text)
+    if (declared is not None and declared.group(1).lower() not in {b"utf-8", b"utf8"}) or (
+        text.lstrip()[:1] != b"<"
+    ):
+        raise DocxError("invalid_docx", f"The DOCX {label} part uses an unsupported encoding.")
+
+
 def _xml(data: bytes, *, label: str, max_bytes: int = MAX_DOCX_XML_PART_BYTES) -> etree._Element:
     if len(data) > max_bytes or b"<!DOCTYPE" in data.upper():
         raise DocxError("invalid_docx", f"The DOCX {label} part is not supported.")
+    _require_supported_encoding(data, label=label)
     _require_bounded_tree(data, label=label)
     try:
-        return etree.fromstring(data, parser=_xml_parser())
+        root = etree.fromstring(data, parser=_xml_parser())
     except (etree.XMLSyntaxError, ValueError) as exc:
         raise DocxError("invalid_docx", f"The DOCX {label} part is malformed.") from exc
+    if root.getroottree().docinfo.doctype:
+        # A wide-encoded DOCTYPE escapes the byte check above; entity references it
+        # declares would drop text on extraction and break the exported part.
+        raise DocxError("invalid_docx", f"The DOCX {label} part is not supported.")
+    return root
+
+
+def _read_member(archive: zipfile.ZipFile, member: zipfile.ZipInfo | str) -> bytes:
+    """Read one member, inflating no more than the size its directory entry declares.
+
+    `ZipFile.read` inflates the whole stream before cutting it to the declared size, so
+    a member whose declared size understates its data could expand to gigabytes past
+    every size check. A positive read size bounds each inflate step.
+    """
+
+    info = member if isinstance(member, zipfile.ZipInfo) else archive.getinfo(member)
+    with archive.open(info) as handle:
+        return handle.read(info.file_size) if info.file_size else b""
 
 
 def _validated_infos(
@@ -214,6 +271,10 @@ def _validated_infos(
         if not name or name in seen or path.is_absolute() or ".." in path.parts or "\\" in name:
             raise DocxError("unsafe_docx_package", "The DOCX package contains unsafe paths.")
         seen.add(name)
+        if not name.isascii() and not info.flag_bits & 0x800:
+            # A legacy-encoded name would be rewritten as different UTF-8 bytes on export,
+            # breaking every relationship to that part. OPC part names are ASCII.
+            raise DocxError("unsafe_docx_package", "The DOCX package contains unsupported names.")
         if info.flag_bits & 0x1:
             raise DocxError("encrypted_docx", "Encrypted DOCX files are not supported.")
         file_mode = (info.external_attr >> 16) & 0xFFFF
@@ -249,7 +310,16 @@ def _open_package(
     except DocxError:
         archive.close()
         raise
-    except (zipfile.BadZipFile, OSError, RuntimeError, ValueError) as exc:
+    except (
+        zipfile.BadZipFile,
+        zlib.error,
+        lzma.LZMAError,
+        EOFError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as exc:
+        # A damaged compressed stream raises from inflate itself, not as BadZipFile.
         raise DocxError("invalid_docx", "The file is not a valid DOCX package.") from exc
     if bad is not None:
         archive.close()
@@ -260,7 +330,7 @@ def _open_package(
 def _validate_content_types(archive: zipfile.ZipFile, names: set[str]) -> None:
     if _CONTENT_TYPES not in names or _DOCUMENT_PART not in names:
         raise DocxError("invalid_docx", "The DOCX package is missing required document parts.")
-    root = _xml(archive.read(_CONTENT_TYPES), label="content-types")
+    root = _xml(_read_member(archive, _CONTENT_TYPES), label="content-types")
     content_types = {
         str(node.get("ContentType", ""))
         for node in root.xpath("//*[local-name()='Default' or local-name()='Override']")
@@ -281,7 +351,7 @@ def _validate_content_types(archive: zipfile.ZipFile, names: set[str]) -> None:
 def _hyperlink_relationships(archive: zipfile.ZipFile, names: set[str]) -> set[str]:
     if _DOCUMENT_RELS not in names:
         return set()
-    root = _xml(archive.read(_DOCUMENT_RELS), label="relationships")
+    root = _xml(_read_member(archive, _DOCUMENT_RELS), label="relationships")
     ids: set[str] = set()
     for relationship in root.xpath("/pr:Relationships/pr:Relationship", namespaces=_NS):
         rel_id = relationship.get("Id")
@@ -298,20 +368,49 @@ def _hyperlink_relationships(archive: zipfile.ZipFile, names: set[str]) -> set[s
 
 
 def _reject_unsupported_markup(root: etree._Element) -> None:
-    if root.xpath(".//w:ins | .//w:del | .//w:moveFrom | .//w:moveTo", namespaces=_NS):
+    # Single tree walks: XPath unions of large node sets are merged quadratically.
+    if next(root.iter(*_TRACKED_CHANGE_TAGS), None) is not None:
         raise DocxError(
             "tracked_changes_not_supported",
             "Accept or reject tracked changes before uploading the DOCX.",
         )
-    instructions = [
-        str(value)
-        for value in root.xpath(".//w:instrText/text() | .//w:fldSimple/@w:instr", namespaces=_NS)
-    ]
-    if any(re.search(r"\bHYPERLINK\b", value, flags=re.IGNORECASE) for value in instructions):
-        raise DocxError(
-            "complex_hyperlink_not_supported",
-            "The DOCX contains a field-code hyperlink that cannot be edited safely.",
-        )
+    for field in root.iter(_INSTR_TEXT_TAG, _FLD_SIMPLE_TAG):
+        if field.tag == _FLD_SIMPLE_TAG:
+            instructions = [field.get(f"{{{_W}}}instr")]
+        else:
+            instructions = [field.text, *(child.tail for child in field)]
+        if any(
+            value and re.search(r"\bHYPERLINK\b", value, flags=re.IGNORECASE)
+            for value in instructions
+        ):
+            raise DocxError(
+                "complex_hyperlink_not_supported",
+                "The DOCX contains a field-code hyperlink that cannot be edited safely.",
+            )
+
+
+def _body_paragraphs(root: etree._Element) -> list[etree._Element]:
+    """Paragraphs of the body flow (including table cells and content controls).
+
+    Paragraphs nested in another paragraph's text boxes or shapes are never included.
+    One linear walk that stops at each paragraph, rather than an ancestor test per
+    paragraph, which nested bodies could make quadratic.
+    """
+
+    bodies = list(root.iter(_BODY_TAG))
+    if not bodies:
+        return []
+    if len(bodies) != 1:
+        raise DocxError("invalid_docx", "The DOCX document body is not supported.")
+    paragraphs: list[etree._Element] = []
+    pending = list(reversed(bodies[0]))
+    while pending:
+        element = pending.pop()
+        if element.tag == _P_TAG:
+            paragraphs.append(element)
+        else:
+            pending.extend(reversed(element))
+    return paragraphs
 
 
 def _belongs_to(node: etree._Element, paragraph: etree._Element) -> bool:
@@ -466,7 +565,7 @@ def _parse_package(content: bytes, *, max_uncompressed_bytes: int) -> _ParsedPac
         _validate_content_types(archive, names)
         hyperlink_relationships = _hyperlink_relationships(archive, names)
         root = _xml(
-            archive.read(_DOCUMENT_PART),
+            _read_member(archive, _DOCUMENT_PART),
             label="document",
             max_bytes=_xml_part_limit(max_uncompressed_bytes),
         )
@@ -474,7 +573,7 @@ def _parse_package(content: bytes, *, max_uncompressed_bytes: int) -> _ParsedPac
         blocks: list[DocxBlock] = []
         editable: list[etree._Element] = []
         link_number = 0
-        for paragraph in _BODY_PARAGRAPHS(root):
+        for paragraph in _body_paragraphs(root):
             block, link_number = _paragraph_block(
                 paragraph,
                 block_number=len(blocks) + 1,
@@ -566,6 +665,11 @@ def validate_replacements(
                 "invalid_docx_blocks",
                 "DOCX block identifiers are missing or reordered.",
             )
+        if _XML_ILLEGAL_CHARACTER.search(replacement.text) is not None:
+            raise DocxError(
+                "invalid_docx_text",
+                "DOCX block text contains a character a Word document cannot hold.",
+            )
         _, expected_links = _link_parts(expected.text)
         _, actual_links = _link_parts(replacement.text)
         expected_ids = [link_id for link_id, _ in expected_links]
@@ -574,6 +678,8 @@ def validate_replacements(
             any(_LINK_ID.fullmatch(link_id) is None for link_id in actual_ids)
             or actual_ids != expected_ids
             or len(set(actual_ids)) != len(actual_ids)
+            # An empty display would leave an invisible link that no later upload shows.
+            or any(not display for _, display in actual_links)
         ):
             raise DocxError(
                 "invalid_docx_hyperlinks",
@@ -684,20 +790,14 @@ def _rewrite_items(items: Sequence[etree._Element], value: str) -> None:
         run.insert(position + offset, element)
 
 
-def _insert_plain_run(
-    paragraph: etree._Element,
-    value: str,
-    *,
-    before: etree._Element | None,
-) -> None:
+def _insert_plain_run(value: str, *, anchor: etree._Element, before: bool) -> None:
     if not value:
         return
     run = etree.Element(_R_TAG)
     run.extend(_inline_elements(value))
-    if before is None:
-        paragraph.append(run)
-    else:
-        paragraph.insert(paragraph.index(before), run)
+    paragraph = anchor.getparent()
+    position = paragraph.index(anchor)
+    paragraph.insert(position if before else position + 1, run)
 
 
 def _patch_paragraph(paragraph: etree._Element, replacement: DocxReplacement) -> None:
@@ -719,9 +819,15 @@ def _patch_paragraph(paragraph: etree._Element, replacement: DocxReplacement) ->
     for index, (items, value) in enumerate(zip(segments, plain_parts, strict=True)):
         if items:
             _rewrite_items(items, value)
-        else:
-            before = hyperlinks[index] if index < len(hyperlinks) else None
-            _insert_plain_run(paragraph, value, before=before)
+        elif index < len(hyperlinks):
+            _insert_plain_run(value, anchor=hyperlinks[index], before=True)
+        elif hyperlinks:
+            # Directly after the last link: a trailing page break stays after the text.
+            _insert_plain_run(value, anchor=hyperlinks[-1], before=False)
+        elif value:
+            raise DocxError(
+                "invalid_docx_blocks", "The DOCX template no longer matches its blocks."
+            )
     for hyperlink, (_, display) in zip(hyperlinks, replacement_links, strict=True):
         items = _own_inline_items(hyperlink, paragraph)
         if not items:
@@ -777,7 +883,7 @@ def render_docx(
                 data = (
                     patched_document
                     if info.filename == _DOCUMENT_PART
-                    else parsed.archive.read(info)
+                    else _read_member(parsed.archive, info)
                 )
                 destination.writestr(info, data)
         return output.getvalue()
