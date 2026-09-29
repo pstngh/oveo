@@ -400,6 +400,8 @@ _TERMINAL = frozenset({"completed", "failed", "stopped"})
 _WORK_KINDS = {"translate": "translation", "revision": "revision", "internal_comms": "draft"}
 _ACTIVE = frozenset(ACTIVE_GENERATION_STATUSES)
 _TRUNCATED_RESPONSE_CODES = frozenset({"response_too_long", "provider_content_filtered"})
+# Failures a retry repeats exactly: its message tells the user what to do instead.
+_NOT_RETRYABLE_CODES = frozenset({"attachment_unavailable"})
 # Failures of a valid visible response whose state could not be saved; the response
 # stays shown with the error.
 _STATE_FAILURE_CODES: dict[type[Exception], str] = {
@@ -864,11 +866,13 @@ class GenerationManager:
         self.provider = provider
         # One thread each: a DOCX parse can use tens of MiB, so request-path parses are
         # admitted one running plus one waiting. Token counting is lighter but still
-        # CPU-bound and kept off the event loop.
+        # CPU-bound and kept off the event loop. Stored attachments are hashed on their
+        # own thread, so checking them never turns an upload or an export away.
         # Prompts come from the configured directory, never the working directory.
         self._prompts = PromptLoader(settings.prompts_dir)
         self.docx_worker = BoundedWorker("oveo-docx", max_pending=2)
         self.token_worker = BoundedWorker("oveo-tokens", max_pending=4)
+        self.file_worker = BoundedWorker("oveo-files", max_pending=1)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._cancel: dict[str, asyncio.Event] = {}
         self._provider_calls: dict[str, asyncio.Future[ProviderCompletion]] = {}
@@ -1183,6 +1187,7 @@ class GenerationManager:
             await close()
         self.docx_worker.close()
         self.token_worker.close()
+        self.file_worker.close()
 
     async def _snapshot_fits(self, snapshot: Mapping[str, Any], budget: int) -> bool:
         """Whether a request snapshot's estimated input tokens are within ``budget``.
@@ -1227,6 +1232,11 @@ class GenerationManager:
     def _set_live_status(self, generation_id: str, status: str) -> None:
         live = self._live.get(generation_id)
         if live is None:
+            return
+        if live.status in _TERMINAL:
+            # A finished draft never becomes active again (for example after a late
+            # second Stop); readers re-read the stored row instead.
+            self._notify(generation_id)
             return
         live.status = status
         if status in _TERMINAL:
@@ -1330,14 +1340,14 @@ class GenerationManager:
     async def _verify_attachment_file(self, attachment: Attachment) -> None:
         """Fail unless the stored file is the uploaded one (hashed once per file).
 
-        Hashing up to 25 MB runs on the DOCX worker rather than the event loop.
+        Hashing up to 25 MB runs on the file worker rather than the event loop.
         """
 
         identity = _file_identity(self.settings.attachments_dir / attachment.storage_name)
         if self._verified_files.get(attachment.storage_name) == (attachment.sha256, identity):
             self._verified_files.move_to_end(attachment.storage_name)
             return
-        await self.docx_worker.run(
+        await self.file_worker.run(
             partial(
                 read_stored_attachment,
                 self.settings.attachments_dir,
@@ -1867,6 +1877,7 @@ class GenerationManager:
         if (
             generation.purpose != "chat"
             or generation.status not in {"failed", "stopped"}
+            or generation.error_code in _NOT_RETRYABLE_CODES
             or generation.result_message_id is not None
             or generation.thread_id is None
             or generation.source_message_id is None
@@ -2654,7 +2665,7 @@ class GenerationManager:
 
         try:
             await self._generate_title(usage, thread_id)
-        except (ProviderError, UnicodeDecodeError, ValueError):
+        except (ProviderError, UnicodeDecodeError):
             return  # Provider usage was already recorded.
         except Exception as error:
             log_unexpected(_LOGGER, error, area="title")

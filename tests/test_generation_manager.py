@@ -23,12 +23,14 @@ from oveo.db import Database
 from oveo.docx import DocxBlock, docx_uncompressed_limit, extract_docx
 from oveo.generation import (
     ActiveGenerationError,
+    GenerationError,
     GenerationManager,
     OpenRouterProvider,
     ProviderCompletion,
     ProviderError,
     ProviderRequest,
     _apply_base_replacements,
+    _LiveGeneration,
     _snapshot_messages,
 )
 from oveo.models import Generation, Message, Thread, UsageEvent, User, WorkItem, WorkVersion
@@ -313,6 +315,20 @@ async def _wait_status(
             return snapshot
         await asyncio.sleep(0.01)
     raise AssertionError(f"generation did not reach {expected}")
+
+
+async def test_a_late_stop_never_reopens_a_finished_draft(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, settings, _user = manager_database
+    manager = GenerationManager(database, settings, ScriptedProvider([]))
+    manager._live["g1"] = _LiveGeneration(thread_id="t1", status="completed", seq=7)
+
+    manager._set_live_status("g1", "stopping")
+
+    assert manager._live["g1"].status == "completed"
+    assert manager._live["g1"].seq == 7
+    await manager.shutdown()
 
 
 async def test_same_thread_guard_stop_and_snapshot_reconnect(
@@ -1882,14 +1898,25 @@ async def test_attachment_files_are_hashed_once_and_still_fail_closed_when_chang
     )
     failed = await _wait_status(manager, changed.generation_id, {"failed"})
     assert failed["error_code"] == "attachment_unavailable"
+    # A retry would fail the same way; the message says what to do instead.
+    assert failed["retryable"] is False
+    with pytest.raises(GenerationError) as refused:
+        await manager.retry(
+            generation_id=changed.generation_id,
+            requester_id=user.id,
+            client_request_id="hash-once-retry",
+        )
+    assert refused.value.code == "generation_not_retryable"
 
     stored.unlink()
-    missing = await manager.retry(
-        generation_id=changed.generation_id,
+    missing = await manager.submit_turn(
         requester_id=user.id,
         client_request_id="hash-once-4",
+        text="Again.",
+        attachment=None,
+        thread_id=first.thread_id,
     )
-    failed = await _wait_status(manager, missing, {"failed"})
+    failed = await _wait_status(manager, missing.generation_id, {"failed"})
     assert failed["error_code"] == "attachment_unavailable"
     await manager.shutdown()
 
