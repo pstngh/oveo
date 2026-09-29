@@ -54,6 +54,10 @@ def _validated_docx(name: str, content: bytes, max_bytes: int) -> ValidatedAttac
     )
 
 
+def upload_limit_message(max_bytes: int) -> str:
+    return f"The Word file is larger than the {max_bytes / 1_000_000:g} MB limit."
+
+
 async def validate_attachment_upload(
     upload: UploadFile, *, max_bytes: int, worker: BoundedWorker
 ) -> ValidatedAttachment:
@@ -70,7 +74,7 @@ async def validate_attachment_upload(
     if len(content) > max_bytes:
         raise AttachmentError(
             "attachment_too_large",
-            f"The source file is larger than the {max_bytes:,}-byte limit.",
+            upload_limit_message(max_bytes),
             status_code=413,
         )
     try:

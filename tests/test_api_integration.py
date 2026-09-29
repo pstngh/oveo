@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import re
 import time
 import zipfile
@@ -540,6 +541,35 @@ def test_charles_cannot_discover_or_access_yousra_conversations(
     )
     # Cost is shared operational metadata; conversation content remains private.
     assert api_client.get("/api/usage/lifetime").json() == {"formatted": "$0.000246"}
+
+
+def test_word_file_with_large_picture_is_accepted_and_exported(api_client: TestClient) -> None:
+    api_client.app.state.generation_manager.provider = DocxProvider()
+    _, csrf = _login(api_client, "charles", "charles password")
+    headers = {"X-CSRF-Token": csrf, "Origin": "http://testserver"}
+    # Pictures do not compress, so this file is as large as the picture it carries.
+    picture = os.urandom(15_000_000)
+    document = make_docx(extra_parts={"word/media/image1.png": picture})
+    assert len(document) > 15_000_000
+
+    submitted = api_client.post(
+        "/api/threads",
+        data={
+            "mode": "translate",
+            "text": "Translate the attached Word document.",
+            "client_request_id": "docx-with-picture",
+        },
+        files={"attachment": ("policy.docx", document, DOCX_MEDIA_TYPE)},
+        headers=headers,
+    )
+    assert submitted.status_code == 200, submitted.json()
+    ids = submitted.json()
+    assert _wait_generation(api_client, ids["generation_id"])["status"] == "completed"
+
+    exported = api_client.get(f"/api/threads/{ids['thread_id']}/document.docx")
+    assert exported.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+        assert archive.read("word/media/image1.png") == picture
 
 
 def test_docx_upload_latest_canonical_export_and_ownership(

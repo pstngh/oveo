@@ -182,10 +182,12 @@ The command works in small batches beside the running application and is never r
 
 The application rejects oversized requests before reading them: 16 KiB for JSON
 routes and the upload limit plus 256 KiB for the two message routes that accept a
-DOCX file (declared `Content-Length` or counted while streaming). As optional
-defense in depth, an operator may add `request_body { max_size 3MB }` to the Oveo
-site block of the shared Caddyfile during a maintenance window; this repository does
-not edit that file.
+DOCX file (declared `Content-Length` or counted while streaming). The upload limit is
+25 MB by default (`OVEO_MAX_UPLOAD_BYTES`, at most 25,000,000): Word files often carry
+pictures, which Oveo never opens, and only the document text is parsed. An oversized
+upload is refused with a message naming that limit. The Oveo site block of the shared
+Caddyfile caps request bodies at 27MB, which leaves room for the form fields; keep it
+above the upload limit plus 256 KiB. This repository does not edit that file.
 
 Sign-in attempts are serialized per account, password checks run on one dedicated
 thread with a short admission queue, and failed attempts are rate limited per client

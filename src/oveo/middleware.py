@@ -12,6 +12,7 @@ from starlette.responses import Response
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from oveo.attachments import upload_limit_message
 from oveo.diagnostics import log_unexpected
 
 _LOGGER = logging.getLogger("oveo.http")
@@ -41,18 +42,24 @@ class RequestBodyLimit:
 
     def __init__(self, app: ASGIApp, *, max_upload_bytes: int) -> None:
         self.app = app
+        self.max_upload_bytes = max_upload_bytes
         self.upload_limit = max_upload_bytes + UPLOAD_OVERHEAD
 
-    def _limit(self, scope: Scope) -> int:
-        if scope["method"] == "POST" and _UPLOAD_ROUTES.fullmatch(scope["path"]):
-            return self.upload_limit
-        return SMALL_BODY_LIMIT
+    @staticmethod
+    def _is_upload(scope: Scope) -> bool:
+        return scope["method"] == "POST" and _UPLOAD_ROUTES.fullmatch(scope["path"]) is not None
+
+    def _too_large(self, scope: Scope) -> JSONResponse:
+        # A refused upload names the file limit instead of a generic request error.
+        if self._is_upload(scope):
+            return _error(413, "attachment_too_large", upload_limit_message(self.max_upload_bytes))
+        return _error(413, "request_too_large", "The request is too large.")
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        limit = self._limit(scope)
+        limit = self.upload_limit if self._is_upload(scope) else SMALL_BODY_LIMIT
         declared = [value for name, value in scope["headers"] if name == b"content-length"]
         if declared:
             try:
@@ -65,7 +72,7 @@ class RequestBodyLimit:
                 )
                 return
             if lengths.pop() > limit:
-                await _too_large(scope, receive, send)
+                await self._too_large(scope)(scope, receive, send)
                 return
 
         received = 0
@@ -81,10 +88,6 @@ class RequestBodyLimit:
             return message
 
         await self.app(scope, limited_receive, send)
-
-
-async def _too_large(scope: Scope, receive: Receive, send: Send) -> None:
-    await _error(413, "request_too_large", "The request is too large.")(scope, receive, send)
 
 
 class MaintenanceGate:

@@ -154,6 +154,23 @@ async def test_upload_routes_allow_the_configured_file_size_and_no_more(
         },
     )
     assert too_large.status_code == 413
+    # The refusal names the file limit rather than a generic request error.
+    assert too_large.json() == {
+        "code": "attachment_too_large",
+        "message": f"The Word file is larger than the {settings.max_upload_bytes / 1_000_000:g} "
+        "MB limit.",
+    }
+    # A Word file with pictures fits: the default is 25 MB.
+    assert settings.max_upload_bytes == 25_000_000
+    fits = await client.post(
+        "/api/threads",
+        content=b"x" * 16,
+        headers={
+            "Content-Type": "multipart/form-data; boundary=abc",
+            "Content-Length": str(upload_limit),
+        },
+    )
+    assert fits.status_code != 413
     # Other routes keep the small JSON limit.
     rename = await client.patch(
         "/api/threads/any",
@@ -161,6 +178,7 @@ async def test_upload_routes_allow_the_configured_file_size_and_no_more(
         headers={"Content-Type": "application/json", "Content-Length": str(SMALL_BODY_LIMIT + 1)},
     )
     assert rename.status_code == 413
+    assert rename.json()["code"] == "request_too_large"
     headers = await _login(client)
     malformed = await client.post(
         "/api/threads",

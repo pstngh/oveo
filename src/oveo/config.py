@@ -39,7 +39,8 @@ class Settings(BaseSettings):
     # further attempts are refused without hashing.
     login_client_failure_limit: int = Field(default=20, ge=5, le=1_000)
     login_global_failure_limit: int = Field(default=60, ge=10, le=10_000)
-    max_upload_bytes: int = Field(default=2_000_000, ge=1024, le=10_000_000)
+    # Word files often carry pictures that Oveo never opens; only the text is parsed.
+    max_upload_bytes: int = Field(default=25_000_000, ge=1024, le=25_000_000)
     max_source_words: int = Field(default=25_000, ge=1000, le=100_000)
     # The latest reference is re-sent with every turn and cannot be compacted away.
     max_reference_words: int = Field(default=25_000, ge=1000, le=100_000)

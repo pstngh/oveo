@@ -129,7 +129,7 @@ def docx_uncompressed_limit(max_upload_bytes: int) -> int:
 
 
 def _xml_part_limit(max_uncompressed_bytes: int) -> int:
-    # 10 MB for the default 2 MB upload limit; smaller uploads get a smaller ceiling.
+    # 12 MB for the default 25 MB upload limit; smaller uploads get a smaller ceiling.
     return min(MAX_DOCX_XML_PART_BYTES, max_uncompressed_bytes // 4)
 
 
