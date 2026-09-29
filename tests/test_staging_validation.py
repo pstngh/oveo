@@ -67,3 +67,26 @@ def test_staging_validator_rejects_examples(
 
     with pytest.raises(validator.StagingError):
         validator.validate_runtime(runtime)
+
+
+@pytest.mark.parametrize("quoting", ('"{}"', "{}"))
+def test_staging_validator_requires_single_quotes_around_dollar_signs(
+    tmp_path: Path, quoting: str
+) -> None:
+    # Compose would expand `$argon2id`, `$v` and the rest, mangling the hash.
+    password_hash = PasswordHasher().hash("synthetic password")
+    runtime = tmp_path / "runtime.env"
+    runtime.write_text(
+        "\n".join(
+            (
+                f"OVEO_OPENROUTER_API_KEY=sk-or-v1-{'a' * 64}",
+                "OVEO_CHARLES_PASSWORD_HASH=" + quoting.format(password_hash),
+                f"OVEO_YOUSRA_PASSWORD_HASH='{password_hash}'",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(validator.StagingError, match="must be single-quoted"):
+        validator.validate_runtime(runtime)

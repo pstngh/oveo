@@ -209,7 +209,10 @@ def create_archive(
             source = _open_readonly_database(database_path)
             target = sqlite3.connect(snapshot)
             try:
-                source.backup(target, pages=256, sleep=0.05)
+                # One step: no writer can change the database while the lock is held,
+                # so pacing the copy would only keep the application's writes waiting
+                # (they give up after five seconds).
+                source.backup(target)
             finally:
                 target.close()
                 source.close()

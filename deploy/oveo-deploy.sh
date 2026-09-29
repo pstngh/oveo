@@ -104,7 +104,10 @@ start_image() {
 rollback() {
   [ -n "$previous" ] || return 1
   echo "Candidate failed; restoring the preceding immutable Oveo image." >&2
-  docker pull "$previous" >/dev/null || return 1
+  # The preceding image normally is still local; pull only if it is not, so a rollback
+  # does not depend on the registry being reachable.
+  docker image inspect "$previous" >/dev/null 2>&1 || docker pull "$previous" >/dev/null \
+    || return 1
   start_image "$previous" || return 1
   ready
 }
@@ -164,9 +167,9 @@ else
   if [ "$migrating" = true ]; then
     echo "Candidate failed; putting back the data directory from before its migration." >&2
     compose stop app || true
-    mv "$data_dir" "$failed_dir" \
+    mv -T -- "$data_dir" "$failed_dir" \
       || die "could not set the candidate's data aside; Oveo is stopped (see OPERATIONS.md)"
-    mv "$snapshot_dir" "$data_dir" \
+    mv -T -- "$snapshot_dir" "$data_dir" \
       || die "could not put back $snapshot_dir; Oveo is stopped (see OPERATIONS.md)"
     if rollback; then
       die "candidate failed; the preceding image runs on the pre-deployment data; the candidate's data is kept at $failed_dir"

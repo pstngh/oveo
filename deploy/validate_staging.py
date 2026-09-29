@@ -35,10 +35,15 @@ def _read_env(path: Path) -> dict[str, str]:
         if key in values:
             raise StagingError(f"duplicate environment key: {key}")
         value = raw_value.strip()
-        if value[:1] in {"'", '"'}:
-            if len(value) < 2 or value[-1] != value[0]:
+        quote = value[:1] if value[:1] in {"'", '"'} else ""
+        if quote:
+            if len(value) < 2 or value[-1] != quote:
                 raise StagingError(f"unbalanced quotes for environment key: {key}")
             value = value[1:-1]
+        if "$" in value and quote != "'":
+            # Compose interpolates `$` in unquoted and double-quoted env_file values, so
+            # an Argon2 hash would reach the application mangled and fail at startup.
+            raise StagingError(f"{key} contains $ and must be single-quoted")
         values[key] = value
     return values
 

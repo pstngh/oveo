@@ -120,10 +120,12 @@ find "$candidate" -type f -exec chmod 0600 {} +
 # Downtime starts here: everything written after the backup was taken stays only in
 # the pre-restore directory.
 compose stop app
-mv "$live_dir" "$previous"
-mv "$candidate" "$live_dir"
+mv -T -- "$live_dir" "$previous"
+mv -T -- "$candidate" "$live_dir"
+# While the container starts (migrations, then startup), Docker's port proxy accepts
+# connections and resets them; --retry-connrefused alone gives up on the first reset.
 if compose up --detach app \
-  && curl --retry 30 --retry-delay 2 --retry-connrefused --fail --silent --show-error \
+  && curl --retry 30 --retry-delay 2 --retry-all-errors --fail --silent --show-error \
     --max-time 5 http://127.0.0.1:8000/health/ready >/dev/null; then
   rm -f -- "$live_dir/maintenance-mode"
   echo "Live restore succeeded. Pre-restore data retained at: $previous"
@@ -132,7 +134,7 @@ fi
 
 echo "Restored data failed readiness; reverting to the pre-restore data." >&2
 compose stop app || true
-mv "$live_dir" "$failed"
-mv "$previous" "$live_dir"
+mv -T -- "$live_dir" "$failed"
+mv -T -- "$previous" "$live_dir"
 compose up --detach app
 die "live restore failed; rejected data retained at $failed"
