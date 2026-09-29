@@ -45,8 +45,11 @@ def do_run_migrations(connection: Connection) -> None:
         compare_type=True,
     )
     with context.begin_transaction():
+        migration = context.get_context()
+        before = migration.get_current_revision()
         context.run_migrations()
-        if connection.dialect.name == "sqlite":
+        # Every container start runs this; only one that migrated has anything to check.
+        if connection.dialect.name == "sqlite" and migration.get_current_revision() != before:
             # Foreign keys are off while migrating (see run_async_migrations), so the
             # result is checked instead: a migration must not leave a dangling reference.
             violations = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
