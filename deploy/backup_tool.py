@@ -135,31 +135,47 @@ def _intact(path: Path, byte_count: int, expected_sha256: str) -> bool:
     )
 
 
-def _copy_referenced(
+def _stage_referenced(
     references: list[tuple[str, int, str]], source: Path, destination: Path
-) -> tuple[str, ...]:
-    """Copy each referenced attachment that can be verified; return the ones that cannot."""
+) -> set[str]:
+    """Link or copy each referenced attachment; return the names that are not there.
+
+    Attachments are written once and never modified, so what is staged here while the
+    database is locked stays consistent with the database copy after the lock is gone.
+    """
 
     destination.mkdir(mode=0o700)
     if source.exists() and (source.is_symlink() or not source.is_dir()):
         raise BackupError("attachment source must be a real directory")
-    missing: list[str] = []
-    for storage_name, byte_count, expected_sha256 in references:
+    absent: set[str] = set()
+    for storage_name, _byte_count, _sha256 in references:
         original = source / storage_name
-        target = destination / storage_name
         try:
             if not stat.S_ISREG(original.lstat().st_mode):
-                missing.append(storage_name)
+                absent.add(storage_name)
                 continue
-            shutil.copyfile(original, target, follow_symlinks=False)
+            _link_or_copy(original, destination / storage_name)
         except FileNotFoundError:
-            missing.append(storage_name)
+            absent.add(storage_name)
+    return absent
+
+
+def _verify_staged(
+    references: list[tuple[str, int, str]], directory: Path, absent: set[str]
+) -> tuple[str, ...]:
+    """Drop staged attachments that are not the referenced bytes; return what is missing.
+
+    Checked on the staged files, so the archive holds exactly the bytes that were verified.
+    """
+
+    missing = set(absent)
+    for storage_name, byte_count, expected_sha256 in references:
+        if storage_name in absent:
             continue
-        target.chmod(0o600)
-        # Checked on the copy, so the archive holds exactly the bytes that were verified.
-        if not _intact(target, byte_count, expected_sha256):
-            target.unlink()
-            missing.append(storage_name)
+        staged = directory / storage_name
+        if not _intact(staged, byte_count, expected_sha256):
+            staged.unlink()
+            missing.add(storage_name)
     return tuple(sorted(missing))
 
 
@@ -194,14 +210,16 @@ def create_archive(
         raise BackupError("refusing to overwrite an existing plaintext archive")
     archive_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-    with tempfile.TemporaryDirectory(prefix="oveo-backup-") as temporary:
+    # Staged beside the archive, on disk: /tmp may be a small memory-backed filesystem.
+    with tempfile.TemporaryDirectory(prefix="oveo-backup-", dir=archive_path.parent) as temporary:
         payload = Path(temporary) / "payload"
         payload.mkdir(mode=0o700)
         snapshot = payload / "oveo.sqlite3"
         copied_attachments = payload / "attachments"
 
-        # Holding the write lock keeps the database and the attachment directory
-        # consistent with each other while both are copied.
+        # The write lock keeps the database and the attachments consistent with each
+        # other while both are copied. The application's writes wait for it and give up
+        # after five seconds, so checking and hashing happen only after it is released.
         locker = sqlite3.connect(database_path, timeout=30, isolation_level=None)
         locker.execute("PRAGMA busy_timeout=30000")
         try:
@@ -210,25 +228,23 @@ def create_archive(
             target = sqlite3.connect(snapshot)
             try:
                 # One step: no writer can change the database while the lock is held,
-                # so pacing the copy would only keep the application's writes waiting
-                # (they give up after five seconds).
+                # so pacing the copy would only keep the application's writes waiting.
                 source.backup(target)
+                references = _referenced_attachments(target)
             finally:
                 target.close()
                 source.close()
-            snapshot.chmod(0o600)
-            checked = _check_database(snapshot)
-            try:
-                references = _referenced_attachments(checked)
-            finally:
-                checked.close()
-            missing = _copy_referenced(references, attachments_path, copied_attachments)
-            referenced_names = {storage_name for storage_name, _, _ in references}
-            unreferenced = len(_regular_files(attachments_path) - referenced_names)
+            absent = _stage_referenced(references, attachments_path, copied_attachments)
         finally:
             if locker.in_transaction:
                 locker.rollback()
             locker.close()
+
+        snapshot.chmod(0o600)
+        _check_database(snapshot).close()
+        missing = _verify_staged(references, copied_attachments, absent)
+        referenced_names = {storage_name for storage_name, _, _ in references}
+        unreferenced = len(_regular_files(attachments_path) - referenced_names)
 
         if missing and not allow_incomplete:
             raise BackupError(f"{len(missing)} referenced attachment(s) are missing or damaged")
@@ -260,7 +276,9 @@ def create_archive(
         )
         manifest_path.chmod(0o600)
 
-        with tarfile.open(archive_path, mode="w:gz", compresslevel=6) as archive:
+        # Word files are already compressed; a light level keeps the database small
+        # without spending minutes on them.
+        with tarfile.open(archive_path, mode="w:gz", compresslevel=1) as archive:
             archive.add(manifest_path, arcname="manifest.json", filter=_normalized_tar_info)
             archive.add(snapshot, arcname="oveo.sqlite3", filter=_normalized_tar_info)
             archive.add(

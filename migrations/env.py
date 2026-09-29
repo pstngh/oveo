@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import os
 from logging.config import fileConfig
+from typing import Any
 
 from alembic import context
-from sqlalchemy import pool
+from sqlalchemy import event, pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
@@ -45,6 +46,12 @@ def do_run_migrations(connection: Connection) -> None:
     )
     with context.begin_transaction():
         context.run_migrations()
+        if connection.dialect.name == "sqlite":
+            # Foreign keys are off while migrating (see run_async_migrations), so the
+            # result is checked instead: a migration must not leave a dangling reference.
+            violations = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError(f"migrations left {len(violations)} foreign key violation(s)")
 
 
 async def run_async_migrations() -> None:
@@ -53,6 +60,15 @@ async def run_async_migrations() -> None:
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
+    if connectable.dialect.name == "sqlite":
+        # Batch migrations rebuild a table by dropping it; with foreign keys on, that drop
+        # would cascade and delete every child row.
+        @event.listens_for(connectable.sync_engine, "connect")
+        def foreign_keys_off(dbapi_connection: Any, _record: Any) -> None:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=OFF")
+            cursor.close()
+
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
     await connectable.dispose()

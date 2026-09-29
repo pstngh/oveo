@@ -1,10 +1,11 @@
 """Run the host scripts against temporary stand-ins for every host path.
 
-In production the scripts run as root on the Debian host. Here each one runs as the
-root of an unprivileged user namespace (`unshare --map-auto --map-root-user`) with GNU
-coreutils, every absolute host path rewritten into a temporary directory, and docker,
-curl, age, logger and sleep replaced by stubs. Nothing outside the temporary directory
-is read or changed. The tests are skipped where such namespaces are unavailable.
+In production the scripts run as root on the Debian host. Here each one runs as root,
+or as the root of an unprivileged user namespace (`unshare --map-auto --map-root-user`),
+with GNU coreutils, every absolute host path rewritten into a temporary directory, and
+docker, curl, age, logger and sleep replaced by stubs. Nothing outside the temporary
+directory is read or changed. Without root or such namespaces the tests are skipped,
+unless OVEO_REQUIRE_HOST_TESTS is set (CI runs them as root and requires them).
 """
 
 from __future__ import annotations
@@ -39,6 +40,8 @@ HOST_PATHS = (
 )
 _HOST_PATH = re.compile("|".join(re.escape(path) for path in HOST_PATHS))
 UNSHARE = shutil.which("unshare")
+# Already root (CI runs these tests with sudo): run the scripts directly.
+_AS_ROOT = os.geteuid() == 0
 _UNREWRITTEN = re.compile(r"(?<![\w.-])/(?:etc|var|opt|run|usr/local)/")
 # The Debian host runs GNU coreutils; some development systems ship other
 # implementations and keep GNU's under a "gnu" prefix.
@@ -308,12 +311,10 @@ for path in "{self.root}"/var/lib/*; do stat -c '%u:%g %n' "$path"; done >"$STUB
 chown -R 0:0 "{self.root}"
 find "{self.root}" -type d -exec chmod u+rwx {{}} +
 """
-        assert UNSHARE is not None
+        namespace = [] if _AS_ROOT else [str(UNSHARE), "--map-auto", "--map-root-user"]
         subprocess.run(  # noqa: S603 - our own scripts, run inside the stand-in tree
             [
-                UNSHARE,
-                "--map-auto",
-                "--map-root-user",
+                *namespace,
                 "sh",
                 "-c",
                 observe,
@@ -357,8 +358,11 @@ find "{self.root}" -type d -exec chmod u+rwx {{}} +
 
 @pytest.fixture
 def host(tmp_path: Path) -> Host:
-    if not _namespaces_work(tmp_path / "probe"):
-        pytest.skip("unprivileged user namespaces with subordinate IDs are unavailable")
+    if not (_AS_ROOT or _namespaces_work(tmp_path / "probe")):
+        reason = "neither root nor unprivileged user namespaces with subordinate IDs"
+        if os.environ.get("OVEO_REQUIRE_HOST_TESTS"):
+            pytest.fail(f"host-script tests cannot run: {reason}")
+        pytest.skip(reason)
     return Host(tmp_path)
 
 
@@ -503,6 +507,33 @@ def test_deploy_stops_for_a_person_after_an_interrupted_deployment(host: Host) -
     assert "an earlier deployment did not finish" in outcome.stderr
     assert outcome.docker == []
     assert (host.data / "maintenance-mode").exists()
+
+
+def test_deploy_never_starts_on_an_empty_database_after_an_interrupted_swap(host: Host) -> None:
+    host.deployment_files()
+    host.data_directory(revision="rev1", attachments={"a.docx": b"synthetic"})
+    # A live restore interrupted between its two renames leaves the data elsewhere, and
+    # installing the host bundle recreates an empty data directory.
+    host.data.rename(host.root / "var/lib/oveo.pre-restore.20260929T000000Z")
+    (host.data / "attachments").mkdir(parents=True)
+
+    outcome = host.run("oveo-deploy", CANDIDATE)
+
+    assert outcome.status == 1
+    assert "oveo.sqlite3 is missing although a release was deployed" in outcome.stderr
+    assert not any(line.startswith("up ") for line in outcome.docker)
+    assert _deployed(host) == f"OVEO_IMAGE={PREVIOUS}"
+
+
+def test_a_candidate_that_fails_its_checks_is_never_recorded(host: Host) -> None:
+    host.deployment_files(previous=None)
+    host.configure(revisions={CANDIDATE: ["rev1"]}, broken=(CANDIDATE,))
+
+    outcome = host.run("oveo-deploy", CANDIDATE)
+
+    assert outcome.status == 1
+    # A restart, a restore or the next deployment must not start it.
+    assert not (host.root / "etc/oveo/deploy.env").exists()
 
 
 # --- L-19: backups, alerts and restores ------------------------------------------------

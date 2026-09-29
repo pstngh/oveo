@@ -71,6 +71,35 @@ def test_backup_round_trip_uses_consistent_sqlite_snapshot(tmp_path: Path) -> No
     connection.close()
 
 
+def test_backup_hashes_attachments_only_after_releasing_the_write_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attachments = tmp_path / "attachments"
+    attachments.mkdir()
+    attachment = attachments / "synthetic.docx"
+    attachment.write_text("Synthetic attachment only.\n", encoding="utf-8")
+    database = tmp_path / "oveo.sqlite3"
+    _database(database, attachment)
+    hash_file = backup_tool.sha256_file
+
+    def hash_while_the_application_writes(path: Path) -> str:
+        # The application's writes give up after five seconds; hashing must not block them.
+        writer = sqlite3.connect(database, timeout=0.1, isolation_level=None)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("ROLLBACK")
+        finally:
+            writer.close()
+        return str(hash_file(path))
+
+    monkeypatch.setattr(backup_tool, "sha256_file", hash_while_the_application_writes)
+    archive = tmp_path / "backup.tar.gz"
+    result = backup_tool.create_archive(database, attachments, archive)
+
+    assert result.complete
+    backup_tool.restore_archive(archive, tmp_path / "restored")
+
+
 def test_backup_rejects_attachment_digest_mismatch(tmp_path: Path) -> None:
     attachments = tmp_path / "attachments"
     attachments.mkdir()

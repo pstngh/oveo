@@ -4,7 +4,9 @@ umask 077
 
 repo=ghcr.io/pstngh/oveo
 compose_file=/opt/oveo/compose.yml
+# Names the last release that passed its checks; a candidate starts from its own file.
 deploy_env=/etc/oveo/deploy.env
+candidate_env=/etc/oveo/deploy.env.candidate
 runtime_env=/etc/oveo/runtime.env
 staging_validator=/usr/local/lib/oveo/validate_staging.py
 backup_tool=/usr/local/lib/oveo/backup_tool.py
@@ -36,7 +38,6 @@ printf '%s\n' "$image" | grep -Eq '^ghcr\.io/pstngh/oveo@sha256:[0-9a-f]{64}$' \
 python3 "$staging_validator" --runtime "$runtime_env" \
   || die "staged credentials did not pass content-free validation"
 
-install -d -m 0700 -o 10001 -g 10001 "$data_dir" "$data_dir/attachments"
 install -d -m 0700 /etc/oveo
 [ -d "$lock_dir" ] || die "$lock_dir is missing"
 exec 9>"$lock_dir/oveo-maintenance.lock"
@@ -54,7 +55,13 @@ fi
 if [ -n "$previous" ]; then
   printf '%s\n' "$previous" | grep -Eq '^ghcr\.io/pstngh/oveo@sha256:[0-9a-f]{64}$' \
     || die "recorded previous image is not a valid immutable Oveo image"
+  # A release ran here, so its database must be too. It is missing only when an
+  # interrupted restore or rollback left the data directory under another name, and a
+  # candidate started on a new, empty database would look as if everything was lost.
+  [ -f "$data_dir/oveo.sqlite3" ] \
+    || die "$data_dir/oveo.sqlite3 is missing although a release was deployed; an interrupted restore or deployment left the data under another /var/lib/oveo.* name (see OPERATIONS.md)"
 fi
+install -d -m 0700 -o 10001 -g 10001 "$data_dir" "$data_dir/attachments"
 
 docker manifest inspect "$image" >/dev/null \
   || die "immutable candidate is not readable from GHCR"
@@ -63,22 +70,27 @@ docker image inspect "$image" --format '{{range .RepoDigests}}{{println .}}{{end
   | grep -Fx "$image" >/dev/null \
   || die "pulled image does not expose the requested repository digest"
 
-OVEO_IMAGE=$image docker compose --project-name oveo --env-file "$deploy_env" \
-  -f "$compose_file" config --quiet 2>/dev/null \
-  || OVEO_IMAGE=$image docker compose --project-name oveo -f "$compose_file" config --quiet
+compose_with() {
+  env_file=$1
+  shift
+  docker compose --project-name oveo --env-file "$env_file" -f "$compose_file" "$@"
+}
 
 compose() {
-  docker compose --project-name oveo --env-file "$deploy_env" -f "$compose_file" "$@"
+  compose_with "$deploy_env" "$@"
 }
 
-write_image_env() {
-  selected=$1
-  temporary=${deploy_env}.next
-  printf 'OVEO_IMAGE=%s\n' "$selected" >"$temporary"
-  chmod 0600 "$temporary"
-  chown root:root "$temporary"
-  mv -f "$temporary" "$deploy_env"
+# Select an image for the next start without recording it: deploy.env only ever names a
+# release that passed its checks, so a restart, a restore or the next deployment can
+# never start one that failed.
+select_image() {
+  printf 'OVEO_IMAGE=%s\n' "$1" >"$candidate_env"
+  chmod 0600 "$candidate_env"
+  chown root:root "$candidate_env"
 }
+
+select_image "$image"
+compose_with "$candidate_env" config --quiet
 
 wait_ready() {
   attempt=0
@@ -94,11 +106,14 @@ wait_ready() {
 }
 
 ready() {
-  wait_ready && curl --fail --silent --show-error --max-time 15 "$public_ready" >/dev/null
+  # The public check goes through DNS and the proxy, so it rides out a brief failure
+  # rather than rolling back a release that works.
+  wait_ready && curl --fail --silent --show-error --max-time 15 \
+    --retry 5 --retry-delay 3 --retry-all-errors "$public_ready" >/dev/null
 }
 
 start_image() {
-  write_image_env "$1" && compose up --detach --remove-orphans app
+  select_image "$1" && compose_with "$candidate_env" up --detach --remove-orphans app
 }
 
 rollback() {
@@ -108,8 +123,8 @@ rollback() {
   # does not depend on the registry being reachable.
   docker image inspect "$previous" >/dev/null 2>&1 || docker pull "$previous" >/dev/null \
     || return 1
-  start_image "$previous" || return 1
-  ready
+  start_image "$previous" && ready || return 1
+  rm -f -- "$candidate_env"
 }
 
 # Does the candidate migrate the database? The image lists its migrations without
@@ -162,6 +177,7 @@ fi
 # With the marker in place the candidate serves reads and health checks but accepts no
 # writes until every check passed, so undoing it can lose no user data.
 if start_image "$image" && ready; then
+  mv -f -- "$candidate_env" "$deploy_env"
   rm -f -- "$maintenance_marker"
 else
   if [ "$migrating" = true ]; then
