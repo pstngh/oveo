@@ -110,6 +110,16 @@ npm run build
 Migration verification additionally performs a fresh upgrade, validates all three
 current modes and work kinds, and runs an Alembic schema drift check.
 
+`tests/test_host_scripts.py` runs the deploy, backup and restore scripts against a
+temporary stand-in for the host. It needs root or unprivileged user namespaces and is
+skipped otherwise; CI runs it again as root with `OVEO_REQUIRE_HOST_TESTS=1`, which
+turns a skip into a failure:
+
+```bash
+sudo env OVEO_REQUIRE_HOST_TESTS=1 \
+  .venv/bin/python -m pytest -p no:cacheprovider -rs tests/test_host_scripts.py
+```
+
 `tests/live_evals.py` holds prompt evaluation scenarios (Word uploads, local edits,
 terminology, OQLF formats, bilingual drafts, summaries, and more) that run through
 the real generation path. The normal test suite checks each scenario offline against
@@ -152,8 +162,8 @@ stream alive.
 
 Production uses one slim image and one Uvicorn worker behind host Caddy. SQLite
 runs in WAL mode with foreign keys and a bounded busy timeout. Background calls
-have durable generation rows and replayable snapshots, so navigation and browser
-disconnects do not cancel them. See [ARCHITECTURE.md](ARCHITECTURE.md) and
+have durable generation rows, and every event stream starts from an authoritative
+snapshot, so navigation and browser disconnects do not cancel them. See [ARCHITECTURE.md](ARCHITECTURE.md) and
 [OPERATIONS.md](OPERATIONS.md).
 
 The production application origin is `https://oveo.duckdns.org`. The direct VPS
