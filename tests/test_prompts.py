@@ -358,3 +358,16 @@ def test_organization_names_are_established_not_invented() -> None:
     assert "`Fondation Make-A-Wish | Rêves d'enfants Canada`" in shared
     assert "the masculine `48 HEURES VÉLO` (`le 48 HEURES VÉLO`)" in shared
     assert "Fais-Un" not in shared
+
+
+def test_alithya_legal_name_and_chez_are_always_used_in_french() -> None:
+    shared = normalized_prompt("alithya_rules.md")
+    # The legal name has a fixed French form that is never left in English.
+    assert "always `Groupe Alithya inc.` in French" in shared
+    assert "`Alithya Group` alone is `Groupe Alithya`" in shared
+    assert "Never leave the English legal name in French" in shared
+    # A company takes `chez`, never `à`, when `at` means within it.
+    assert "`At Alithya, we ...` is always `Chez Alithya, nous ...`" in shared
+    assert "never `À Alithya, nous ...`" in shared
+    assert "Keep `à`, `au`, or `dans` for a place, an event, or a public body" in shared
+    assert "correct `à` used this way in French text you revise" in shared

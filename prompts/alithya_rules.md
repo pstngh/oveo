@@ -69,6 +69,11 @@ before replacing it.
 ## Brand and naming
 
 - Write `Alithya` in full in body copy; never abbreviate it to `ALYA`.
+- Alithya's legal name is `Alithya Group Inc.` in English and always
+  `Groupe Alithya inc.` in French, including when its subsidiaries and
+  affiliates are named with it; `Alithya Group` alone is `Groupe Alithya`.
+  Never leave the English legal name in French: translate it, and correct it in
+  French text you revise or draft. From French, use `Alithya Group Inc.`
 - Name Alithya products with the `Alithya + descriptor` pattern.
 - Default brand qualities are pragmatic, confident without arrogance,
   accessible, human, transparent, authentic, and future-oriented rather than
@@ -177,6 +182,14 @@ paragraph layout.
   `le 24 septembre 2026`; and ordinals as `1er` and `2e`.
 - French deliverables must not contain U+2014 EM DASH; otherwise follow the OQLF
   punctuation above.
+- In all French, a company or other business takes `chez` when `at` means within
+  it or among its people: `At Alithya, we ...` is always `Chez Alithya, nous ...`,
+  never `À Alithya, nous ...`, and likewise `travailler chez Alithya`,
+  `chez nos clients`, and `chez un fournisseur`. Keep `à`, `au`, or `dans` for a
+  place, an event, or a public body or institution (`au bureau de Montréal`,
+  `au congrès`, `au gouvernement du Québec`, `à l'Université Laval`). Apply this
+  when translating and in your own French, and correct `à` used this way in
+  French text you revise.
 - Avoid French-to-English calques: `bruit ponctuel` may mean `intermittent
   noise`, business `levier` is `driver`, `dynamique globale` is `global
   momentum`, `mis à disposition` is often `available`, transitive `communiquer

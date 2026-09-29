@@ -453,6 +453,26 @@ def _check_named_organization_is_corrected(outcome: Outcome) -> None:
     expect("canadian cancer society" not in text, "the English name remains", outcome)
 
 
+def _check_at_alithya_is_chez_alithya(outcome: Outcome) -> None:
+    completed(outcome)
+    text = _saved_text(outcome)
+    expect(text.startswith("chez alithya"), "“At Alithya” is not “Chez Alithya”", outcome)
+    expect("à alithya" not in text, "the translation still has “À Alithya”", outcome)
+
+
+def _check_legal_name_is_groupe_alithya(outcome: Outcome) -> None:
+    completed(outcome)
+    text = _saved_text(outcome)
+    assert outcome.latest is not None
+    expect("Groupe Alithya inc." in outcome.latest.output_text, "no “Groupe Alithya inc.”", outcome)
+    expect("alithya group" not in text, "the English legal name remains", outcome)
+
+
+def _check_revised_french_uses_chez_and_legal_name(outcome: Outcome) -> None:
+    _check_at_alithya_is_chez_alithya(outcome)
+    _check_legal_name_is_groupe_alithya(outcome)
+
+
 def _check_side_text_keeps_word_work(outcome: Outcome) -> None:
     completed(outcome)
     latest = outcome.latest
@@ -539,6 +559,34 @@ _WISHES_UNTRANSLATED = (
 _CANCER = (
     "Cette année encore, nos collègues de Montréal ont soutenu la Canadian Cancer Society en "
     "participant à sa collecte de fonds annuelle."
+)
+
+_RECONCILIATION = (
+    "At Alithya, we recognize September 30 as an opportunity to reflect, learn, and contribute "
+    "to meaningful reconciliation with Indigenous Peoples."
+)
+_RECONCILIATION_CHEZ = (
+    "Chez Alithya, nous considérons le 30 septembre comme une occasion de réfléchir, "
+    "d'apprendre et de contribuer à une réconciliation porteuse de sens avec les peuples "
+    "autochtones."
+)
+_POLICY = (
+    "Alithya Group Inc. and its subsidiaries and affiliates worldwide (hereinafter collectively "
+    "referred to as “Alithya”) are committed to promoting and maintaining a workplace free of "
+    "psychological harassment, bullying, violence, and discrimination."
+)
+_POLICY_GROUPE = (
+    "Groupe Alithya inc. et ses filiales et sociétés affiliées partout dans le monde (ci-après "
+    f"collectivement désignées par «{NBSP}Alithya{NBSP}») s'engagent à promouvoir et à "
+    "maintenir un milieu de travail exempt de harcèlement psychologique, d'intimidation, de "
+    "violence et de discrimination."
+)
+_RESPECT = (
+    "À Alithya, nous croyons qu'un milieu de travail respectueux est l'affaire de tous. "
+    "Alithya Group Inc. et ses filiales s'engagent à maintenir un milieu exempt de harcèlement."
+)
+_RESPECT_FIXED = _RESPECT.replace("À Alithya", "Chez Alithya").replace(
+    "Alithya Group Inc.", "Groupe Alithya inc."
 )
 
 _EN_TO_CA = "Translate into Canadian French: "
@@ -1032,6 +1080,36 @@ SCENARIOS: tuple[Scenario, ...] = (
                 "recommande de remplacer la mention de la Canadian Cancer Society par ce nom."
             ),
         ),
+    ),
+    Scenario(
+        name="at-alithya-is-chez-alithya",
+        mode="translate",
+        turns=(Turn(_EN_TO_CA + _RECONCILIATION),),
+        check=_check_at_alithya_is_chez_alithya,
+        good=(_establish(_RECONCILIATION_CHEZ, _RECONCILIATION),),
+        bad=(
+            _establish(_RECONCILIATION_CHEZ.replace("Chez Alithya", "À Alithya"), _RECONCILIATION),
+        ),
+    ),
+    Scenario(
+        name="alithya-group-inc-is-groupe-alithya-inc",
+        mode="translate",
+        turns=(Turn(_EN_TO_CA + _POLICY),),
+        check=_check_legal_name_is_groupe_alithya,
+        good=(_establish(_POLICY_GROUPE, _POLICY),),
+        bad=(
+            _establish(
+                _POLICY_GROUPE.replace("Groupe Alithya inc.", "Alithya Group Inc."), _POLICY
+            ),
+        ),
+    ),
+    Scenario(
+        name="proofreading-corrects-a-alithya-and-the-legal-name",
+        mode="revision",
+        turns=(Turn("Proofread this Canadian French text: " + _RESPECT),),
+        check=_check_revised_french_uses_chez_and_legal_name,
+        good=(_establish(_RESPECT_FIXED, _RESPECT),),
+        bad=(_establish(_RESPECT, _RESPECT),),
     ),
 )
 
