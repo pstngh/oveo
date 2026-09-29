@@ -100,6 +100,32 @@ def test_backup_hashes_attachments_only_after_releasing_the_write_lock(
     backup_tool.restore_archive(archive, tmp_path / "restored")
 
 
+def test_backup_survives_a_file_deleted_once_the_lock_is_released(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attachments = tmp_path / "attachments"
+    attachments.mkdir()
+    attachment = attachments / "synthetic.docx"
+    attachment.write_text("Synthetic attachment only.\n", encoding="utf-8")
+    # An upload whose transaction never committed: unreferenced, and removed by the
+    # application at any moment it holds no lock.
+    leftover = attachments / "uncommitted.docx"
+    leftover.write_text("never committed", encoding="utf-8")
+    database = tmp_path / "oveo.sqlite3"
+    _database(database, attachment)
+    hash_file = backup_tool.sha256_file
+
+    def hash_after_the_application_cleans_up(path: Path) -> str:
+        leftover.unlink(missing_ok=True)
+        return str(hash_file(path))
+
+    monkeypatch.setattr(backup_tool, "sha256_file", hash_after_the_application_cleans_up)
+    result = backup_tool.create_archive(database, attachments, tmp_path / "backup.tar.gz")
+
+    assert result.complete
+    assert result.unreferenced == 1
+
+
 def test_backup_rejects_attachment_digest_mismatch(tmp_path: Path) -> None:
     attachments = tmp_path / "attachments"
     attachments.mkdir()

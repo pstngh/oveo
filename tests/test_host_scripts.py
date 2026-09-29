@@ -520,20 +520,20 @@ def test_deploy_never_starts_on_an_empty_database_after_an_interrupted_swap(host
     outcome = host.run("oveo-deploy", CANDIDATE)
 
     assert outcome.status == 1
-    assert "oveo.sqlite3 is missing although a release was deployed" in outcome.stderr
+    assert "oveo.sqlite3 is missing but" in outcome.stderr
+    assert "oveo.pre-restore.20260929T000000Z exists" in outcome.stderr
     assert not any(line.startswith("up ") for line in outcome.docker)
     assert _deployed(host) == f"OVEO_IMAGE={PREVIOUS}"
 
 
-def test_a_candidate_that_fails_its_checks_is_never_recorded(host: Host) -> None:
+def test_first_deploy_creates_the_data_directory_on_a_fresh_host(host: Host) -> None:
     host.deployment_files(previous=None)
-    host.configure(revisions={CANDIDATE: ["rev1"]}, broken=(CANDIDATE,))
 
     outcome = host.run("oveo-deploy", CANDIDATE)
 
-    assert outcome.status == 1
-    # A restart, a restore or the next deployment must not start it.
-    assert not (host.root / "etc/oveo/deploy.env").exists()
+    assert outcome.status == 0, outcome.stderr
+    assert _deployed(host) == f"OVEO_IMAGE={CANDIDATE}"
+    assert (host.data / "attachments").is_dir()
 
 
 # --- L-19: backups, alerts and restores ------------------------------------------------

@@ -235,6 +235,10 @@ def create_archive(
                 target.close()
                 source.close()
             absent = _stage_referenced(references, attachments_path, copied_attachments)
+            # Counted under the lock too: afterwards the application may delete files
+            # (a deleted conversation, an abandoned upload) while the tree is walked.
+            referenced_names = {storage_name for storage_name, _, _ in references}
+            unreferenced = len(_regular_files(attachments_path) - referenced_names)
         finally:
             if locker.in_transaction:
                 locker.rollback()
@@ -243,8 +247,6 @@ def create_archive(
         snapshot.chmod(0o600)
         _check_database(snapshot).close()
         missing = _verify_staged(references, copied_attachments, absent)
-        referenced_names = {storage_name for storage_name, _, _ in references}
-        unreferenced = len(_regular_files(attachments_path) - referenced_names)
 
         if missing and not allow_incomplete:
             raise BackupError(f"{len(missing)} referenced attachment(s) are missing or damaged")
