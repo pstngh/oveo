@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 from collections import Counter, OrderedDict
@@ -18,10 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from oveo.attachments import (
+    AttachmentIntegrityError,
     ValidatedAttachment,
     count_words,
     is_managed_attachment_name,
     persist_attachment,
+    read_stored_attachment,
 )
 from oveo.config import Settings
 from oveo.context import (
@@ -47,6 +48,8 @@ from oveo.docx import (
     require_matching_blocks,
 )
 from oveo.models import (
+    ACTIVE_GENERATION_STATUSES,
+    DEFAULT_THREAD_TITLE,
     Attachment,
     Generation,
     Message,
@@ -55,6 +58,7 @@ from oveo.models import (
     User,
     WorkItem,
     WorkVersion,
+    latest_work_version,
     new_id,
     utc_now,
 )
@@ -70,6 +74,7 @@ from oveo.protocol import (
     ProtocolEvent,
     ReplaceState,
     SourceOutputReplacement,
+    StateOperation,
 )
 from oveo.provider import (
     IdsCallback,
@@ -139,7 +144,6 @@ class _TemplateRef:
 
     id: str
     storage_name: str
-    media_type: str
     byte_count: int
     sha256: str
     stored_blocks: object
@@ -176,8 +180,61 @@ async def _latest_source_docx(db: AsyncSession, thread_id: str) -> Attachment | 
     return attachment
 
 
+async def _own_source_docx(db: AsyncSession, generation: Generation) -> Attachment | None:
+    """The source Word document uploaded with the generation's own user turn, if any."""
+
+    if generation.source_message_id is None:
+        return None
+    attachment: Attachment | None = await db.scalar(
+        select(Attachment).where(Attachment.message_id == generation.source_message_id)
+    )
+    return attachment if attachment is not None and attachment.role == "source" else None
+
+
+async def _template_attachment(
+    db: AsyncSession, generation: Generation, state: StateOperation
+) -> Attachment | None:
+    """The Word document a state mutation is checked against, if any.
+
+    An establish uses the turn's own source upload or, when it returns a block map, the
+    conversation's latest one; later operations keep the template of the version they
+    change.
+    """
+
+    if isinstance(state, NoState) or generation.thread_id is None:
+        return None
+    if isinstance(state, EstablishState):
+        attachment = await _own_source_docx(db, generation)
+        if attachment is None and state.docx_blocks is not None:
+            attachment = await _latest_source_docx(db, generation.thread_id)
+        return attachment
+    current = await db.scalar(latest_work_version(generation.thread_id))
+    if current is None or current.docx_template_attachment_id is None:
+        return None
+    template: Attachment | None = await db.get(Attachment, current.docx_template_attachment_id)
+    if template is None:
+        raise ProtocolError("state_docx_template_missing")
+    return template
+
+
 class SummaryFormatError(ValueError):
     """A maintenance summary did not satisfy its closed response schema."""
+
+
+def _snapshot(mode: str, messages: Sequence[ProviderMessage]) -> dict[str, Any]:
+    """The request a provider call sends: the conversation mode and its messages."""
+
+    return {
+        "schema_version": 1,
+        "mode": mode,
+        "provider_messages": [
+            {"role": message.role, "content": message.content} for message in messages
+        ],
+    }
+
+
+def _snapshot_mode(snapshot: Mapping[str, Any]) -> str:
+    return str(snapshot.get("mode", "translate"))
 
 
 def _snapshot_messages(
@@ -339,8 +396,17 @@ class Submission:
 
 
 _TERMINAL = frozenset({"completed", "failed", "stopped"})
-_ACTIVE = frozenset({"queued", "running", "stopping"})
+# The work item each conversation mode creates.
+_WORK_KINDS = {"translate": "translation", "revision": "revision", "internal_comms": "draft"}
+_ACTIVE = frozenset(ACTIVE_GENERATION_STATUSES)
 _TRUNCATED_RESPONSE_CODES = frozenset({"response_too_long", "provider_content_filtered"})
+# Failures of a valid visible response whose state could not be saved; the response
+# stays shown with the error.
+_STATE_FAILURE_CODES: dict[type[Exception], str] = {
+    StaleStateError: "stale_state",
+    DocxTemplateOutdatedError: "docx_template_outdated",
+    StatePersistenceError: "state_persistence_failed",
+}
 _MIN_RECENT_MESSAGES = 4
 _RECONCILE_BATCH_SIZE = 8
 _RECONCILE_CANDIDATES = 64
@@ -476,6 +542,10 @@ _ERROR_MESSAGES = {
         "This Word document was imported by an earlier Oveo version that could not edit "
         "its layout safely. Upload the document again to continue editing it."
     ),
+    "attachment_unavailable": (
+        "A Word document saved in this conversation could not be read. Start a new "
+        "conversation and upload the document again."
+    ),
     "context_compaction_failed": "Oveo could not safely fit this conversation in context.",
     "handoff_turn_too_large": (
         "One user turn is too large to create a safe prompt handoff. "
@@ -534,6 +604,35 @@ def _append_text(base: str, addition: str, separator: str) -> str:
     except KeyError as exc:  # Defensive: the decoder owns the closed enum.
         raise ProtocolError("invalid_append_separator") from exc
     return f"{base}{joiner}{addition}"
+
+
+async def _append_reconcilable(
+    db: AsyncSession,
+    usage: _UsageContext,
+    *,
+    purpose: str,
+    request_id: str | None,
+    provider_generation_id: str,
+) -> None:
+    """Record a provider call whose charge reconciliation settles from its metadata."""
+
+    await append_usage_event(
+        db,
+        dedupe_key=f"{provider_generation_id}:{purpose}:reconcile-pending",
+        event_type="pending",
+        purpose=purpose,
+        amount_microusd=None,
+        generation_id=usage.generation_id,
+        thread_id=usage.thread_id,
+        requester_id=usage.requester_id,
+        provider_request_id=request_id,
+        provider_generation_id=provider_generation_id,
+    )
+
+
+def _file_identity(path: Path) -> tuple[int, int, int]:
+    stat = path.stat()
+    return (stat.st_size, stat.st_mtime_ns, stat.st_ino)
 
 
 def _usage_of(generation: Generation) -> _UsageContext:
@@ -809,6 +908,7 @@ class GenerationManager:
 
         now = utc_now()
         finished: dict[str, Any] = {
+            # Earlier releases stored each request's context in its row.
             "request_snapshot": {},
             "stream_revision": Generation.stream_revision + 1,
         }
@@ -870,12 +970,10 @@ class GenerationManager:
 
         SQLite reads outside the write lock, so read-modify-write on a status can
         overwrite a concurrent terminal state. Every transition is conditional instead.
-        Terminal states drop the derived request snapshot in the same statement.
         """
 
         if status in _TERMINAL:
             values.setdefault("finished_at", utc_now())
-            values.setdefault("request_snapshot", {})
         result = await db.execute(
             update(Generation)
             .where(Generation.id == generation_id, Generation.status.in_(allowed))
@@ -1192,7 +1290,7 @@ class GenerationManager:
         attachment_rows = list((await db.execute(attachment_query)).scalars())
         attachments: dict[str, AttachmentDocument] = {}
         for attachment in attachment_rows:
-            attachments[attachment.message_id] = self._attachment_document(attachment)
+            attachments[attachment.message_id] = await self._attachment_document(attachment)
         active_reference_document = None
         if purpose == "chat":
             active_reference = await db.scalar(
@@ -1206,14 +1304,8 @@ class GenerationManager:
                 .limit(1)
             )
             if active_reference is not None:
-                active_reference_document = self._attachment_document(active_reference)
-        canonical = await db.scalar(
-            select(WorkVersion)
-            .join(WorkItem, WorkVersion.work_item_id == WorkItem.id)
-            .where(WorkItem.thread_id == thread.id, WorkItem.active.is_(True))
-            .order_by(WorkVersion.version_no.desc())
-            .limit(1)
-        )
+                active_reference_document = await self._attachment_document(active_reference)
+        canonical = await db.scalar(latest_work_version(thread.id))
         provider_messages = build_provider_messages(
             thread,
             purpose=cast(Any, purpose),
@@ -1225,49 +1317,42 @@ class GenerationManager:
             prompt_loader=self._prompts,
             timezone=self.settings.timezone,
         )
-        return {
-            "schema_version": 1,
-            "mode": thread.mode,
-            "provider_messages": [
-                {"role": message.role, "content": message.content} for message in provider_messages
-            ],
-        }
+        return _snapshot(thread.mode, provider_messages)
 
-    def _remember_verified_file(self, path: Path, storage_name: str, sha256: str) -> None:
-        stat = path.stat()
-        self._verified_files[storage_name] = (
-            sha256,
-            (stat.st_size, stat.st_mtime_ns, stat.st_ino),
-        )
+    def _remember_verified_file(
+        self, storage_name: str, sha256: str, identity: tuple[int, int, int]
+    ) -> None:
+        self._verified_files[storage_name] = (sha256, identity)
         self._verified_files.move_to_end(storage_name)
         while len(self._verified_files) > _VERIFIED_FILE_CACHE_SIZE:
             self._verified_files.popitem(last=False)
 
-    def _verify_attachment_file(self, path: Path, attachment: Attachment) -> None:
-        """Fail unless the stored file is the uploaded one (hashed once per file)."""
+    async def _verify_attachment_file(self, attachment: Attachment) -> None:
+        """Fail unless the stored file is the uploaded one (hashed once per file).
 
-        stat = path.stat()
-        identity = (stat.st_size, stat.st_mtime_ns, stat.st_ino)
+        Hashing up to 25 MB runs on the DOCX worker rather than the event loop.
+        """
+
+        identity = _file_identity(self.settings.attachments_dir / attachment.storage_name)
         if self._verified_files.get(attachment.storage_name) == (attachment.sha256, identity):
             self._verified_files.move_to_end(attachment.storage_name)
             return
-        content = path.read_bytes()
-        if (
-            len(content) != attachment.byte_count
-            or hashlib.sha256(content).hexdigest() != attachment.sha256
-        ):
-            raise OSError("attachment integrity mismatch")
-        self._remember_verified_file(path, attachment.storage_name, attachment.sha256)
+        await self.docx_worker.run(
+            partial(
+                read_stored_attachment,
+                self.settings.attachments_dir,
+                attachment.storage_name,
+                byte_count=attachment.byte_count,
+                sha256=attachment.sha256,
+            ),
+            wait=True,
+        )
+        self._remember_verified_file(attachment.storage_name, attachment.sha256, identity)
 
-    def _attachment_document(self, attachment: Attachment) -> AttachmentDocument:
-        path = self.settings.attachments_dir / attachment.storage_name
+    async def _attachment_document(self, attachment: Attachment) -> AttachmentDocument:
         try:
-            self._verify_attachment_file(path, attachment)
-            if attachment.media_type != DOCX_MEDIA_TYPE:
-                raise OSError("unsupported attachment media type")
+            await self._verify_attachment_file(attachment)
             document_blocks = docx_blocks_from_storage(attachment.document_blocks)
-            if attachment.role not in {"source", "reference"}:
-                raise OSError("unsupported attachment role")
         except (OSError, DocxError) as exc:
             raise GenerationError(
                 "attachment_unavailable",
@@ -1403,7 +1488,7 @@ class GenerationManager:
                     id=new_id(),
                     owner_id=owner_id,
                     mode=mode,
-                    title="New conversation",
+                    title=DEFAULT_THREAD_TITLE,
                 )
                 db.add(thread)
                 await db.flush()
@@ -1432,11 +1517,7 @@ class GenerationManager:
                 measured_words = attachment.word_count
             else:
                 latest_words = await db.scalar(
-                    select(WorkVersion.source_word_count)
-                    .join(WorkItem, WorkVersion.work_item_id == WorkItem.id)
-                    .where(WorkItem.thread_id == thread.id, WorkItem.active.is_(True))
-                    .order_by(WorkVersion.version_no.desc())
-                    .limit(1)
+                    latest_work_version(thread.id).with_only_columns(WorkVersion.source_word_count)
                 )
                 measured_words = int(latest_words or 0) + count_words(clean_text)
             if measured_words > self.settings.max_source_words:
@@ -1462,7 +1543,9 @@ class GenerationManager:
                 )
                 staged_files.append(stored_file)
                 # These bytes were hashed at upload; do not read them back to check.
-                self._remember_verified_file(stored_file, storage_name, attachment.sha256)
+                self._remember_verified_file(
+                    storage_name, attachment.sha256, _file_identity(stored_file)
+                )
                 db.add(
                     Attachment(
                         id=attachment_id,
@@ -1478,7 +1561,6 @@ class GenerationManager:
                     )
                 )
                 await db.flush()
-            request_snapshot = await self._request_snapshot(db, thread, purpose="chat")
             db.add(
                 Generation(
                     id=generation_id,
@@ -1488,7 +1570,6 @@ class GenerationManager:
                     client_request_id=client_request_id,
                     purpose="chat",
                     status="queued",
-                    request_snapshot=request_snapshot,
                 )
             )
             thread.updated_at = utc_now()
@@ -1684,6 +1765,71 @@ class GenerationManager:
         requester_id: str,
         client_request_id: str,
     ) -> str:
+        async def prepare(db: AsyncSession, generation_id: str) -> Generation:
+            thread = await db.get(Thread, thread_id)
+            if thread is None or thread.owner_id != requester_id:
+                raise GenerationError(
+                    "thread_not_found", "Conversation not found.", status_code=404
+                )
+            return Generation(
+                id=generation_id,
+                thread_id=thread.id,
+                requester_id=requester_id,
+                client_request_id=client_request_id,
+                purpose="prompt_handoff",
+                status="queued",
+            )
+
+        return await self._start_generation(requester_id, client_request_id, prepare)
+
+    async def retry(
+        self,
+        *,
+        generation_id: str,
+        requester_id: str,
+        client_request_id: str,
+    ) -> str:
+        async def prepare(db: AsyncSession, retry_id: str) -> Generation:
+            not_retryable = GenerationError(
+                "generation_not_retryable",
+                "This generation cannot be retried.",
+                status_code=409,
+            )
+            original = await db.get(Generation, generation_id)
+            if original is None or original.thread_id is None:
+                raise not_retryable
+            thread = await db.get(Thread, original.thread_id)
+            if thread is None:
+                raise GenerationError(
+                    "thread_not_found", "Conversation not found.", status_code=404
+                )
+            if thread.owner_id != requester_id or not await self._is_retryable(db, original):
+                raise not_retryable
+            return Generation(
+                id=retry_id,
+                thread_id=original.thread_id,
+                requester_id=requester_id,
+                source_message_id=original.source_message_id,
+                retry_of_generation_id=original.id,
+                client_request_id=client_request_id,
+                purpose=original.purpose,
+                status="queued",
+            )
+
+        return await self._start_generation(requester_id, client_request_id, prepare)
+
+    async def _start_generation(
+        self,
+        requester_id: str,
+        client_request_id: str,
+        prepare: Callable[[AsyncSession, str], Awaitable[Generation]],
+    ) -> str:
+        """Commit and schedule the generation ``prepare`` validates, idempotently.
+
+        A repeated request returns the generation it already created; one that loses to
+        another active generation in the same thread gets 409.
+        """
+
         generation_id = new_id()
         self._starting.add(generation_id)
         finalized: list[str] = []
@@ -1693,113 +1839,23 @@ class GenerationManager:
                     existing = await self._existing_request(db, requester_id, client_request_id)
                     if existing is not None:
                         return existing.id
-                    thread = await db.get(Thread, thread_id)
-                    if thread is None or thread.owner_id != requester_id:
-                        raise GenerationError(
-                            "thread_not_found", "Conversation not found.", status_code=404
-                        )
-                    finalized = await self._finalize_orphans(db, thread.id)
-                    request_snapshot = await self._request_snapshot(
-                        db, thread, purpose="prompt_handoff"
-                    )
-                    db.add(
-                        Generation(
-                            id=generation_id,
-                            thread_id=thread.id,
-                            requester_id=requester_id,
-                            client_request_id=client_request_id,
-                            purpose="prompt_handoff",
-                            status="queued",
-                            request_snapshot=request_snapshot,
-                        )
-                    )
+                    generation = await prepare(db, generation_id)
+                    assert generation.thread_id is not None
+                    finalized = await self._finalize_orphans(db, generation.thread_id)
+                    db.add(generation)
                     await db.commit()
-                    self._schedule(generation_id, thread.id)
+                    self._schedule(generation_id, generation.thread_id)
             except IntegrityError as exc:
                 async with self.database.sessions() as db:
                     existing = await self._existing_request(db, requester_id, client_request_id)
-                    if existing is not None:
-                        return existing.id
+                if existing is not None:
+                    return existing.id
                 raise ActiveGenerationError from exc
         finally:
             self._starting.discard(generation_id)
         for orphan_id in finalized:
             self._notify(orphan_id)
         return generation_id
-
-    async def retry(
-        self,
-        *,
-        generation_id: str,
-        requester_id: str,
-        client_request_id: str,
-    ) -> str:
-        not_retryable = GenerationError(
-            "generation_not_retryable",
-            "This generation cannot be retried.",
-            status_code=409,
-        )
-        retry_id = new_id()
-        self._starting.add(retry_id)
-        finalized: list[str] = []
-        try:
-            try:
-                async with self.database.sessions() as db:
-                    existing = await db.scalar(
-                        select(Generation).where(
-                            Generation.requester_id == requester_id,
-                            Generation.client_request_id == client_request_id,
-                        )
-                    )
-                    if existing is not None:
-                        existing_owner = await db.scalar(
-                            select(Thread.owner_id).where(Thread.id == existing.thread_id)
-                        )
-                        if existing_owner != requester_id:
-                            raise not_retryable
-                        return existing.id
-                    original = await db.get(Generation, generation_id)
-                    if original is None or original.thread_id is None:
-                        raise not_retryable
-                    thread = await db.get(Thread, original.thread_id)
-                    if thread is None:
-                        raise GenerationError(
-                            "thread_not_found", "Conversation not found.", status_code=404
-                        )
-                    if thread.owner_id != requester_id or not await self._is_retryable(
-                        db, original
-                    ):
-                        raise not_retryable
-                    finalized = await self._finalize_orphans(db, thread.id)
-                    request_snapshot = await self._request_snapshot(
-                        db, thread, purpose=original.purpose
-                    )
-                    db.add(
-                        Generation(
-                            id=retry_id,
-                            thread_id=original.thread_id,
-                            requester_id=requester_id,
-                            source_message_id=original.source_message_id,
-                            retry_of_generation_id=original.id,
-                            client_request_id=client_request_id,
-                            purpose=original.purpose,
-                            status="queued",
-                            request_snapshot=request_snapshot,
-                        )
-                    )
-                    await db.commit()
-                    self._schedule(retry_id, original.thread_id)
-            except IntegrityError as exc:
-                async with self.database.sessions() as db:
-                    existing = await self._existing_request(db, requester_id, client_request_id)
-                    if existing is not None:
-                        return existing.id
-                raise ActiveGenerationError from exc
-        finally:
-            self._starting.discard(retry_id)
-        for orphan_id in finalized:
-            self._notify(orphan_id)
-        return retry_id
 
     async def _is_retryable(self, db: AsyncSession, generation: Generation) -> bool:
         """Only the latest chat turn without an answer can be retried.
@@ -2046,17 +2102,6 @@ class GenerationManager:
             generation = await db.get(Generation, generation_id)
             if generation is None:  # pragma: no cover - the update just matched this row
                 return None
-            await append_usage_event(
-                db,
-                dedupe_key=f"{generation.id}:pending",
-                event_type="pending",
-                purpose=generation.purpose,
-                amount_microusd=None,
-                generation_id=generation.id,
-                thread_id=generation.thread_id,
-                requester_id=generation.requester_id,
-                provider_request_id=None,
-            )
             await db.commit()
         self._set_live_status(generation_id, "running")
         return generation
@@ -2231,18 +2276,7 @@ class GenerationManager:
                 .limit(1)
             )
 
-        source_attachment = None
-        if generation.source_message_id is not None:
-            source_attachment = await db.scalar(
-                select(Attachment).where(Attachment.message_id == generation.source_message_id)
-            )
-        source_docx = (
-            source_attachment
-            if source_attachment is not None
-            and source_attachment.role == "source"
-            and source_attachment.media_type == DOCX_MEDIA_TYPE
-            else None
-        )
+        source_docx = await _own_source_docx(db, generation)
         docx_template_attachment_id: str | None = None
         docx_blocks: list[dict[str, str]] | None = None
         template_blocks = None
@@ -2251,15 +2285,7 @@ class GenerationManager:
         if isinstance(state, EstablishState):
             if item is not None:
                 item.active = False
-            item = WorkItem(
-                thread_id=thread.id,
-                kind={
-                    "translate": "translation",
-                    "revision": "revision",
-                    "internal_comms": "draft",
-                }[thread.mode],
-                active=True,
-            )
+            item = WorkItem(thread_id=thread.id, kind=_WORK_KINDS[thread.mode], active=True)
             db.add(item)
             await db.flush()
             output = visible
@@ -2311,12 +2337,9 @@ class GenerationManager:
                     raise ProtocolError("state_docx_append_unsupported")
                 if state_docx_blocks is None:
                     raise ProtocolError("state_docx_blocks_missing")
-                template_attachment = await db.get(Attachment, current.docx_template_attachment_id)
-                if template_attachment is None:
-                    raise ProtocolError("state_docx_template_missing")
-                extracted = _prepared_template(templates, template_attachment.id)
-                docx_template_attachment_id = template_attachment.id
-                template_blocks = extracted.blocks
+                docx_template_attachment_id = current.docx_template_attachment_id
+                assert docx_template_attachment_id is not None
+                template_blocks = _prepared_template(templates, docx_template_attachment_id).blocks
             elif state_docx_blocks is not None:
                 raise ProtocolError("state_docx_blocks_unexpected")
 
@@ -2406,38 +2429,12 @@ class GenerationManager:
             generation = await db.get(Generation, generation_id)
             if generation is None or generation.purpose != "chat" or generation.thread_id is None:
                 return {}
-            attachment: Attachment | None
-            if isinstance(document.state, EstablishState):
-                attachment = None
-                if generation.source_message_id is not None:
-                    attachment = await db.scalar(
-                        select(Attachment).where(
-                            Attachment.message_id == generation.source_message_id
-                        )
-                    )
-                    if attachment is not None and attachment.role != "source":
-                        attachment = None
-                if attachment is None and document.state.docx_blocks is not None:
-                    attachment = await _latest_source_docx(db, generation.thread_id)
-                if attachment is None:
-                    return {}
-            else:
-                current = await db.scalar(
-                    select(WorkVersion)
-                    .join(WorkItem, WorkVersion.work_item_id == WorkItem.id)
-                    .where(WorkItem.thread_id == generation.thread_id, WorkItem.active.is_(True))
-                    .order_by(WorkVersion.version_no.desc())
-                    .limit(1)
-                )
-                if current is None or current.docx_template_attachment_id is None:
-                    return {}
-                attachment = await db.get(Attachment, current.docx_template_attachment_id)
-                if attachment is None:
-                    raise ProtocolError("state_docx_template_missing")
+            attachment = await _template_attachment(db, generation, document.state)
+            if attachment is None:
+                return {}
             template = _TemplateRef(
                 id=attachment.id,
                 storage_name=attachment.storage_name,
-                media_type=attachment.media_type,
                 byte_count=attachment.byte_count,
                 sha256=attachment.sha256,
                 stored_blocks=attachment.document_blocks,
@@ -2450,20 +2447,17 @@ class GenerationManager:
     def _load_docx_template(self, template: _TemplateRef) -> ExtractedDocx:
         """Read, verify and parse one template (runs on the DOCX worker thread)."""
 
-        if template.media_type != DOCX_MEDIA_TYPE:
-            raise ProtocolError("state_docx_template_invalid")
-        root = self.settings.attachments_dir.resolve()
-        path = (root / template.storage_name).resolve()
-        if path.parent != root:
-            raise ProtocolError("state_docx_template_invalid")
         try:
-            content = path.read_bytes()
+            content = read_stored_attachment(
+                self.settings.attachments_dir,
+                template.storage_name,
+                byte_count=template.byte_count,
+                sha256=template.sha256,
+            )
+        except AttachmentIntegrityError as exc:
+            raise ProtocolError("state_docx_template_invalid") from exc
         except OSError as exc:
             raise ProtocolError("state_docx_template_missing") from exc
-        if len(content) != template.byte_count or hashlib.sha256(content).hexdigest() != (
-            template.sha256
-        ):
-            raise ProtocolError("state_docx_template_invalid")
         try:
             extracted = extract_docx(
                 content,
@@ -2530,7 +2524,7 @@ class GenerationManager:
             try:
                 completion = await call
             except ProviderError as error:
-                await self._record_provider_error(
+                await self._record_usage(
                     usage, error, purpose=ledger_purpose, scope=dedupe_scope, observed=observed
                 )
                 raise
@@ -2539,7 +2533,7 @@ class GenerationManager:
                     del self._provider_calls[usage.generation_id]
         finally:
             self._provider_slots.release()
-        await self._record_provider_completion(
+        await self._record_usage(
             usage, completion, purpose=ledger_purpose, scope=dedupe_scope, observed=observed
         )
         return completion
@@ -2581,16 +2575,11 @@ class GenerationManager:
         record_ids: bool,
     ) -> None:
         async with self.database.sessions() as db:
-            await append_usage_event(
+            await _append_reconcilable(
                 db,
-                dedupe_key=f"{provider_generation_id}:{purpose}:reconcile-pending",
-                event_type="pending",
+                usage,
                 purpose=purpose,
-                amount_microusd=None,
-                generation_id=usage.generation_id,
-                thread_id=usage.thread_id,
-                requester_id=usage.requester_id,
-                provider_request_id=request_id,
+                request_id=request_id,
                 provider_generation_id=provider_generation_id,
             )
             if record_ids:
@@ -2605,67 +2594,39 @@ class GenerationManager:
                 )
             await db.commit()
 
-    async def _record_provider_completion(
+    async def _record_usage(
         self,
         usage: _UsageContext,
-        completion: ProviderCompletion,
+        outcome: ProviderCompletion | ProviderError,
         *,
         purpose: str,
         scope: str,
         observed: Mapping[str, str | None],
     ) -> None:
-        await self._record_usage(
-            usage,
-            purpose=purpose,
-            scope=scope,
-            suffix="charge",
-            cost_microusd=completion.cost_microusd,
-            request_id=completion.provider_request_id or observed.get("request_id"),
-            provider_generation_id=(
-                completion.provider_generation_id or observed.get("generation_id")
-            ),
-        )
+        """Charge a finished or failed call, or leave it pending for reconciliation."""
 
-    async def _record_provider_error(
-        self,
-        usage: _UsageContext,
-        error: ProviderError,
-        *,
-        purpose: str,
-        scope: str,
-        observed: Mapping[str, str | None] | None = None,
-    ) -> None:
-        seen = observed or {}
-        await self._record_usage(
-            usage,
-            purpose=purpose,
-            scope=scope,
-            suffix="failed-charge",
-            cost_microusd=error.cost_microusd,
-            request_id=error.provider_request_id or seen.get("request_id"),
-            provider_generation_id=error.provider_generation_id or seen.get("generation_id"),
-        )
-
-    async def _record_usage(
-        self,
-        usage: _UsageContext,
-        *,
-        purpose: str,
-        scope: str,
-        suffix: str,
-        cost_microusd: int | None,
-        request_id: str | None,
-        provider_generation_id: str | None,
-    ) -> None:
+        request_id = outcome.provider_request_id or observed.get("request_id")
+        provider_generation_id = outcome.provider_generation_id or observed.get("generation_id")
+        cost_microusd = outcome.cost_microusd
         if cost_microusd is None and provider_generation_id is None:
             return
         async with self.database.sessions() as db:
-            if cost_microusd is not None:
+            if cost_microusd is None:
+                assert provider_generation_id is not None
+                await _append_reconcilable(
+                    db,
+                    usage,
+                    purpose=purpose,
+                    request_id=request_id,
+                    provider_generation_id=provider_generation_id,
+                )
+            else:
                 # Keyed by the provider call, so a call is charged exactly once. With a
                 # provider generation id this is the key every reconciler checks, this
                 # release's and the one it replaces: the id recorded early as `pending`
                 # then counts as settled, even after a rollback, and a reconciliation that
                 # raced the stream cannot add a second charge.
+                suffix = "failed-charge" if isinstance(outcome, ProviderError) else "charge"
                 dedupe_key = (
                     f"{provider_generation_id}:{purpose}:reconciled-charge"
                     if provider_generation_id is not None
@@ -2683,24 +2644,22 @@ class GenerationManager:
                     provider_request_id=request_id,
                     provider_generation_id=provider_generation_id,
                 )
-            else:
-                await append_usage_event(
-                    db,
-                    dedupe_key=f"{provider_generation_id}:{purpose}:reconcile-pending",
-                    event_type="pending",
-                    purpose=purpose,
-                    amount_microusd=None,
-                    generation_id=usage.generation_id,
-                    thread_id=usage.thread_id,
-                    requester_id=usage.requester_id,
-                    provider_request_id=request_id,
-                    provider_generation_id=provider_generation_id,
-                )
             await db.commit()
 
     async def _maybe_generate_title(self, usage: _UsageContext, thread_id: str) -> None:
-        """Generate the first title as a non-transcript, separately accounted model call."""
+        """Generate the first title as a non-transcript, separately accounted model call.
 
+        A title is optional: no failure here may touch the answer already committed.
+        """
+
+        try:
+            await self._generate_title(usage, thread_id)
+        except (ProviderError, UnicodeDecodeError, ValueError):
+            return  # Provider usage was already recorded.
+        except Exception as error:
+            log_unexpected(_LOGGER, error, area="title")
+
+    async def _generate_title(self, usage: _UsageContext, thread_id: str) -> None:
         generation_id = usage.generation_id
         async with self.database.sessions() as db:
             thread = await db.get(Thread, thread_id)
@@ -2708,7 +2667,7 @@ class GenerationManager:
             if (
                 thread is None
                 or generation is None
-                or thread.title != "New conversation"
+                or thread.title != DEFAULT_THREAD_TITLE
                 or generation.status != "completed"
             ):
                 return
@@ -2723,51 +2682,33 @@ class GenerationManager:
             snapshot = await self._title_snapshot(db, thread)
             if snapshot is None:
                 return
-            await append_usage_event(
-                db,
-                dedupe_key=f"{generation.id}:title:pending",
-                event_type="pending",
-                purpose="title",
-                amount_microusd=None,
-                generation_id=generation.id,
-                thread_id=thread.id,
-                requester_id=generation.requester_id,
-                provider_request_id=None,
-            )
-            await db.commit()
 
         parts = _BoundedChunks(1_024, "title_too_large")
-
         request = ProviderRequest(
             generation_id=f"{generation_id}:title",
             purpose="title",
-            mode=str(snapshot.get("mode", "translate")),
+            mode=_snapshot_mode(snapshot),
             snapshot=snapshot,
         )
-        try:
-            await self._call_provider(
-                usage,
-                request,
-                parts.collect,
-                asyncio.Event(),
-                ledger_purpose="title",
-                dedupe_scope=request.generation_id,
-            )
-            title = parts.joined().decode("utf-8").strip()
-            if not title or len(title) > 60 or "\n" in title or not 2 <= len(title.split()) <= 6:
-                return
-            async with self.database.sessions() as db:
-                thread = await db.get(Thread, thread_id)
-                if thread is None:
-                    return
-                if thread.title == "New conversation":
-                    thread.title = title
-                    thread.updated_at = utc_now()
-                await db.commit()
-        except ProviderError:
-            return  # A title is optional; its usage was already recorded.
-        except (UnicodeDecodeError, ValueError):
+        await self._call_provider(
+            usage,
+            request,
+            parts.collect,
+            asyncio.Event(),
+            ledger_purpose="title",
+            dedupe_scope=request.generation_id,
+        )
+        title = parts.joined().decode("utf-8").strip()
+        if not title or len(title) > 60 or "\n" in title or not 2 <= len(title.split()) <= 6:
             return
+        async with self.database.sessions() as db:
+            thread = await db.get(Thread, thread_id)
+            if thread is None:
+                return
+            if thread.title == DEFAULT_THREAD_TITLE:
+                thread.title = title
+                thread.updated_at = utc_now()
+            await db.commit()
 
     async def _title_snapshot(self, db: AsyncSession, thread: Thread) -> dict[str, Any] | None:
         """Build a title request from the first user request only, bounded in size.
@@ -2831,13 +2772,7 @@ class GenerationManager:
             actor_labels={first.actor_user_id: actor or "User"},
             attachments=attachments,
         )
-        return {
-            "schema_version": 1,
-            "mode": thread.mode,
-            "provider_messages": [
-                {"role": message.role, "content": message.content} for message in provider_messages
-            ],
-        }
+        return _snapshot(thread.mode, provider_messages)
 
     async def _finish_stopped(self, generation_id: str) -> None:
         async def write() -> None:
@@ -2855,20 +2790,20 @@ class GenerationManager:
         await self._with_write_retries(write)
         self._mark_finished(generation_id, "stopped")
 
-    async def _maybe_compact_context(self, generation: Generation) -> Mapping[str, Any]:
-        snapshot = generation.request_snapshot
-        if generation.purpose not in {"chat", "prompt_handoff"}:
-            return snapshot
+    async def _maybe_compact_context(
+        self, generation: Generation, snapshot: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
         if await self._snapshot_fits(snapshot, self.settings.context_compaction_tokens):
             return snapshot
         if generation.thread_id is None:
             raise ProviderError("context_compaction_failed")
         if generation.purpose == "prompt_handoff":
-            return await self._compact_handoff_context(generation)
-        return await self._compact_chat_context(generation)
+            return await self._compact_handoff_context(generation, _snapshot_mode(snapshot))
+        return await self._compact_chat_context(generation, snapshot)
 
-    async def _compact_chat_context(self, generation: Generation) -> Mapping[str, Any]:
-        snapshot: Mapping[str, Any] = generation.request_snapshot
+    async def _compact_chat_context(
+        self, generation: Generation, snapshot: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
         budget = self.settings.context_compaction_tokens
         await self._require_compactable_floor(generation, budget)
         while not await self._snapshot_fits(snapshot, budget):
@@ -2898,22 +2833,9 @@ class GenerationManager:
                 )
                 candidates = unsummarized[:-retain]
                 bounded = await self._largest_bounded_summary_snapshot(db, thread, candidates)
-                if bounded is None:
-                    raise ProviderError("context_compaction_failed")
-                cutoff, summary_snapshot = bounded
-                await append_usage_event(
-                    db,
-                    dedupe_key=f"{generation.id}:summary:{cutoff}:pending",
-                    event_type="pending",
-                    purpose="summary",
-                    amount_microusd=None,
-                    generation_id=generation.id,
-                    thread_id=thread.id,
-                    requester_id=generation.requester_id,
-                    provider_request_id=None,
-                )
-                await db.commit()
-
+            if bounded is None:
+                raise ProviderError("context_compaction_failed")
+            cutoff, summary_snapshot = bounded
             compacted = await self._generate_context_summary(
                 generation,
                 cutoff=cutoff,
@@ -2927,10 +2849,8 @@ class GenerationManager:
                     raise asyncio.CancelledError
                 thread.context_summary = compacted
                 thread.summary_through_ordinal = cutoff
-                fresh_snapshot = await self._request_snapshot(db, thread, purpose="chat")
-                current.request_snapshot = fresh_snapshot
+                snapshot = await self._request_snapshot(db, thread, purpose="chat")
                 await db.commit()
-                snapshot = fresh_snapshot
         return snapshot
 
     async def _require_compactable_floor(self, generation: Generation, budget: int) -> None:
@@ -2998,27 +2918,11 @@ class GenerationManager:
         summary_snapshot: Mapping[str, Any],
     ) -> str:
         for attempt in range(1, 3):
-            if attempt == 2:
-                async with self.database.sessions() as db:
-                    await append_usage_event(
-                        db,
-                        dedupe_key=f"{generation.id}:summary:{cutoff}:retry:pending",
-                        event_type="pending",
-                        purpose="summary",
-                        amount_microusd=None,
-                        generation_id=generation.id,
-                        thread_id=generation.thread_id,
-                        requester_id=generation.requester_id,
-                        provider_request_id=None,
-                    )
-                    await db.commit()
-
             parts = _BoundedChunks(131_072, "context_compaction_failed")
-
             request = ProviderRequest(
                 generation_id=f"{generation.id}:summary:{cutoff}:attempt:{attempt}",
                 purpose="summary",
-                mode=str(summary_snapshot.get("mode", "translate")),
+                mode=_snapshot_mode(summary_snapshot),
                 snapshot=summary_snapshot,
             )
             try:
@@ -3044,7 +2948,9 @@ class GenerationManager:
                 raise ProviderError("context_compaction_failed") from exc
         raise AssertionError("summary attempt loop did not return or raise")
 
-    async def _compact_handoff_context(self, generation: Generation) -> Mapping[str, Any]:
+    async def _compact_handoff_context(
+        self, generation: Generation, mode: str
+    ) -> Mapping[str, Any]:
         budget = self.settings.context_compaction_tokens
         chunks: list[Mapping[str, Any]] = []
         async with self.database.sessions() as db:
@@ -3099,48 +3005,27 @@ class GenerationManager:
             for index, chunk in enumerate(chunks, start=1)
         ]
         while True:
-            final_snapshot = self._snapshot_with_messages(
-                generation.request_snapshot,
-                build_handoff_merge_messages(extracts),
-            )
+            final_snapshot = _snapshot(mode, build_handoff_merge_messages(extracts))
             if await self._snapshot_fits(final_snapshot, budget):
-                break
-            groups = await self._bounded_handoff_groups(generation.request_snapshot, extracts)
+                return final_snapshot
+            groups = await self._bounded_handoff_groups(mode, extracts)
             if len(groups) >= len(extracts):
                 raise ProviderError("context_compaction_failed")
             extracts = [
                 await self._generate_handoff_extract(
                     generation,
-                    snapshot=self._snapshot_with_messages(
-                        generation.request_snapshot,
-                        build_handoff_merge_messages(group),
-                    ),
+                    snapshot=_snapshot(mode, build_handoff_merge_messages(group)),
                     request_suffix=f"merge:{index}",
                 )
                 for index, group in enumerate(groups, start=1)
             ]
 
-        async with self.database.sessions() as db:
-            current = await db.get(Generation, generation.id)
-            if current is None or current.status != "running":
-                raise asyncio.CancelledError
-            current.request_snapshot = dict(final_snapshot)
-            await db.commit()
-        return final_snapshot
-
-    async def _bounded_handoff_groups(
-        self,
-        base_snapshot: Mapping[str, Any],
-        extracts: Sequence[str],
-    ) -> list[list[str]]:
+    async def _bounded_handoff_groups(self, mode: str, extracts: Sequence[str]) -> list[list[str]]:
         groups: list[list[str]] = []
         current: list[str] = []
         for extract in extracts:
             candidate = [*current, extract]
-            candidate_snapshot = self._snapshot_with_messages(
-                base_snapshot,
-                build_handoff_merge_messages(candidate),
-            )
+            candidate_snapshot = _snapshot(mode, build_handoff_merge_messages(candidate))
             if await self._snapshot_fits(
                 candidate_snapshot, self.settings.context_compaction_tokens
             ):
@@ -3154,19 +3039,6 @@ class GenerationManager:
             groups.append(current)
         return groups
 
-    @staticmethod
-    def _snapshot_with_messages(
-        base_snapshot: Mapping[str, Any],
-        messages: Sequence[ProviderMessage],
-    ) -> dict[str, Any]:
-        return {
-            "schema_version": 1,
-            "mode": str(base_snapshot.get("mode", "translate")),
-            "provider_messages": [
-                {"role": message.role, "content": message.content} for message in messages
-            ],
-        }
-
     async def _generate_handoff_extract(
         self,
         generation: Generation,
@@ -3174,20 +3046,6 @@ class GenerationManager:
         snapshot: Mapping[str, Any],
         request_suffix: str,
     ) -> str:
-        async with self.database.sessions() as db:
-            await append_usage_event(
-                db,
-                dedupe_key=f"{generation.id}:prompt_handoff_compaction:{request_suffix}:pending",
-                event_type="pending",
-                purpose="prompt_handoff_compaction",
-                amount_microusd=None,
-                generation_id=generation.id,
-                thread_id=generation.thread_id,
-                requester_id=generation.requester_id,
-                provider_request_id=None,
-            )
-            await db.commit()
-
         decoder = ProtocolDecoder()
 
         async def collect(chunk: bytes) -> None:
@@ -3196,7 +3054,7 @@ class GenerationManager:
         request = ProviderRequest(
             generation_id=f"{generation.id}:prompt_handoff_compaction:{request_suffix}",
             purpose="prompt_handoff",
-            mode=str(snapshot.get("mode", "translate")),
+            mode=_snapshot_mode(snapshot),
             snapshot=snapshot,
         )
         try:
@@ -3224,42 +3082,19 @@ class GenerationManager:
                 raise ProviderError("context_compaction_failed") from exc
             raise
 
-    async def _prepare_protocol_retry(self, generation_id: str, retry_number: int) -> bool:
-        """Discard one uncommitted attempt so the model can regenerate it strictly."""
+    def _reset_draft_for_retry(self, generation_id: str) -> bool:
+        """Discard one uncommitted attempt so the model can regenerate it strictly.
 
-        async with self.database.sessions() as db:
-            generation = await db.get(Generation, generation_id)
-            if generation is None:
-                return False
-            # Partial blocks are explicitly draft streaming state. A response that fails
-            # protocol validation was never committed as an assistant message, so reset
-            # that draft before each bounded retry even when text had started to
-            # stream. This avoids turning a repairable late state/terminal-event mistake
-            # into a user-visible hard failure.
-            reset = await db.execute(
-                update(Generation)
-                .where(Generation.id == generation_id, Generation.status == "running")
-                .values(partial_blocks=[], stream_revision=Generation.stream_revision + 1)
-                .execution_options(synchronize_session=False)
-            )
-            if int(reset.rowcount or 0) != 1:  # type: ignore[attr-defined]
-                return False
-            await append_usage_event(
-                db,
-                dedupe_key=f"{generation.id}:protocol_retry:{retry_number}:pending",
-                event_type="pending",
-                purpose=generation.purpose,
-                amount_microusd=None,
-                generation_id=generation.id,
-                thread_id=generation.thread_id,
-                requester_id=generation.requester_id,
-                provider_request_id=None,
-            )
-            await db.commit()
+        The draft exists only in memory. A response that failed protocol validation was
+        never committed, so it is cleared (and readers resynchronize) even when text had
+        started to stream. False once a Stop or shutdown owns the generation.
+        """
+
         live = self._live.get(generation_id)
-        if live is not None:
-            live.blocks.clear()
-            live.seq += 1
+        if live is None or live.status != "running":
+            return False
+        live.blocks.clear()
+        live.seq += 1
         self._notify(generation_id)
         return True
 
@@ -3281,13 +3116,7 @@ class GenerationManager:
             ProviderMessage(role="system", content=messages[0].content + reminder),
             *messages[1:],
         ]
-        return {
-            "schema_version": 1,
-            "mode": str(snapshot.get("mode", "translate")),
-            "provider_messages": [
-                {"role": message.role, "content": message.content} for message in repaired
-            ],
-        }
+        return _snapshot(_snapshot_mode(snapshot), repaired)
 
     async def _fail(
         self,
@@ -3300,42 +3129,45 @@ class GenerationManager:
 
         recorded_code = code if code in _ERROR_MESSAGES else "provider_error"
 
-        async def write() -> bool:
+        async def write() -> str | None:
             async with self.database.sessions() as db:
-                values: dict[str, Any] = {
-                    "error_code": recorded_code,
-                    "partial_blocks": blocks or [],
-                }
-                failed = await self._transition(
+                finished: str | None = None
+                if await self._transition(
                     db,
                     generation_id,
                     allowed=("queued", "running"),
                     status="failed",
-                    **values,
-                )
-                if not failed:
+                    error_code=recorded_code,
+                    partial_blocks=blocks or [],
+                ):
+                    finished = "failed"
+                elif await self._transition(
                     # A pending Stop wins over a late failure.
-                    await self._transition(
-                        db,
-                        generation_id,
-                        allowed=("stopping",),
-                        status="stopped",
-                        error_code=None,
-                        partial_blocks=[],
-                    )
+                    db,
+                    generation_id,
+                    allowed=("stopping",),
+                    status="stopped",
+                    error_code=None,
+                    partial_blocks=[],
+                ):
+                    finished = "stopped"
                 await db.commit()
-                return failed
+                return finished
 
         # If even the retried write fails, the row stays active without a task and is
         # finished by the next Stop, submission, retry or restart (see _is_live).
-        failed = await self._with_write_retries(write)
-        if failed:
+        finished = await self._with_write_retries(write)
+        if finished == "failed":
             _LOGGER.error(
                 "generation_failed generation_id=%s error_code=%s",
                 generation_id,
                 recorded_code,
             )
-        self._mark_finished(generation_id, "failed" if failed else "stopped")
+        if finished is None:
+            # Already final (or deleted): readers re-read what is stored.
+            self._notify(generation_id)
+        else:
+            self._mark_finished(generation_id, finished)
 
     async def _run(self, generation_id: str, cancel_event: asyncio.Event) -> None:
         try:
@@ -3344,88 +3176,9 @@ class GenerationManager:
                 # Stopped before it started; finish that stop (no-op if already final).
                 await self._finish_stopped(generation_id)
                 return
-            usage = _usage_of(generation)
-            request_snapshot = await self._maybe_compact_context(generation)
-
-            def protocol_emitter(attempt_decoder: ProtocolDecoder) -> EmitChunk:
-                async def emit(chunk: bytes) -> None:
-                    if cancel_event.is_set():
-                        raise asyncio.CancelledError
-                    self._apply_live_events(generation_id, attempt_decoder.feed(chunk))
-
-                return emit
-
-            try:
-                for attempt in range(3):
-                    request = ProviderRequest(
-                        generation_id=(
-                            generation.id
-                            if attempt == 0
-                            else f"{generation.id}:protocol-retry:{attempt}"
-                        ),
-                        purpose=generation.purpose,
-                        mode=str(request_snapshot.get("mode", "translate")),
-                        snapshot=request_snapshot,
-                    )
-                    decoder = ProtocolDecoder()
-                    emit = protocol_emitter(decoder)
-                    decoded = False
-
-                    try:
-                        completion = await self._call_provider(
-                            usage,
-                            request,
-                            emit,
-                            cancel_event,
-                            ledger_purpose=generation.purpose,
-                            dedupe_scope=request.generation_id,
-                            record_ids=True,
-                        )
-                        document = decoder.finish()
-                        decoded = True
-                        await self._commit_success(generation_id, document, completion)
-                        break
-                    except ProtocolError as error:
-                        _LOGGER.error(
-                            "protocol_attempt_failed generation_id=%s attempt=%s protocol_code=%s",
-                            generation_id,
-                            attempt + 1,
-                            error.code,
-                        )
-                        if attempt == 2 or not await self._prepare_protocol_retry(
-                            generation_id, attempt + 1
-                        ):
-                            if decoded and error.code in _REPAIRABLE_STATE_CODES:
-                                # The visible response was valid; only its state failed.
-                                raise StatePersistenceError from error
-                            raise
-                        request_snapshot = self._protocol_retry_snapshot(
-                            request_snapshot, error.code
-                        )
-                if generation.purpose == "chat" and generation.thread_id is not None:
-                    await self._maybe_generate_title(usage, generation.thread_id)
-            except ProviderError as error:
-                # Its usage was already recorded by _call_provider.
-                await self._fail(generation_id, error.code)
-            except ProtocolError:
-                await self._fail(generation_id, "protocol_error")
-            # The response itself was valid; keep it visible with the failure.
-            except StaleStateError:
-                await self._fail(
-                    generation_id, "stale_state", blocks=self._live_blocks(generation_id)
-                )
-            except DocxTemplateOutdatedError:
-                await self._fail(
-                    generation_id,
-                    "docx_template_outdated",
-                    blocks=self._live_blocks(generation_id),
-                )
-            except StatePersistenceError:
-                await self._fail(
-                    generation_id,
-                    "state_persistence_failed",
-                    blocks=self._live_blocks(generation_id),
-                )
+            await self._respond(generation, cancel_event)
+            if generation.purpose == "chat" and generation.thread_id is not None:
+                await self._maybe_generate_title(_usage_of(generation), generation.thread_id)
         except asyncio.CancelledError:
             if self._shutting_down:
                 # A restart ended this run, not the user: say so (a Stop they already
@@ -3433,10 +3186,88 @@ class GenerationManager:
                 await asyncio.shield(self._fail(generation_id, "restart_interrupted"))
             else:
                 await asyncio.shield(self._finish_stopped(generation_id))
-        except ProviderError as error:
+        # Provider usage was already recorded by _call_provider.
+        except (ProviderError, GenerationError) as error:
             await self._fail(generation_id, error.code)
+        except ProtocolError:
+            await self._fail(generation_id, "protocol_error")
+        except (StaleStateError, DocxTemplateOutdatedError, StatePersistenceError) as error:
+            # The response itself was valid; keep it visible with the failure.
+            await self._fail(
+                generation_id,
+                _STATE_FAILURE_CODES[type(error)],
+                blocks=self._live_blocks(generation_id),
+            )
         except Exception as error:
             log_unexpected(_LOGGER, error, area="generation")
             await self._fail(generation_id, "provider_error")
         finally:
             self.reconcile_later()
+
+    async def _respond(self, generation: Generation, cancel_event: asyncio.Event) -> None:
+        """Compose the request, stream the answer, and commit it.
+
+        The context is composed here rather than when the turn is submitted, so the
+        submission's write transaction never waits on it. Nothing else can change the
+        conversation meanwhile: a thread has at most one active generation.
+        """
+
+        usage = _usage_of(generation)
+        snapshot = await self._maybe_compact_context(generation, await self._compose(generation))
+        for attempt in range(3):
+            request = ProviderRequest(
+                generation_id=(
+                    generation.id if attempt == 0 else f"{generation.id}:protocol-retry:{attempt}"
+                ),
+                purpose=generation.purpose,
+                mode=_snapshot_mode(snapshot),
+                snapshot=snapshot,
+            )
+            decoder = ProtocolDecoder()
+            decoded = False
+            try:
+                completion = await self._call_provider(
+                    usage,
+                    request,
+                    self._live_emitter(generation.id, decoder, cancel_event),
+                    cancel_event,
+                    ledger_purpose=generation.purpose,
+                    dedupe_scope=request.generation_id,
+                    record_ids=True,
+                )
+                document = decoder.finish()
+                decoded = True
+                await self._commit_success(generation.id, document, completion)
+                return
+            except ProtocolError as error:
+                _LOGGER.error(
+                    "protocol_attempt_failed generation_id=%s attempt=%s protocol_code=%s",
+                    generation.id,
+                    attempt + 1,
+                    error.code,
+                )
+                if attempt == 2 or not self._reset_draft_for_retry(generation.id):
+                    if decoded and error.code in _REPAIRABLE_STATE_CODES:
+                        # The visible response was valid; only its state failed.
+                        raise StatePersistenceError from error
+                    raise
+                snapshot = self._protocol_retry_snapshot(snapshot, error.code)
+
+    async def _compose(self, generation: Generation) -> dict[str, Any]:
+        async with self.database.sessions() as db:
+            thread = await db.get(Thread, generation.thread_id) if generation.thread_id else None
+            if thread is None:
+                raise GenerationError(
+                    "thread_not_found", "Conversation not found.", status_code=404
+                )
+            return await self._request_snapshot(db, thread, purpose=generation.purpose)
+
+    def _live_emitter(
+        self, generation_id: str, decoder: ProtocolDecoder, cancel_event: asyncio.Event
+    ) -> EmitChunk:
+        async def emit(chunk: bytes) -> None:
+            if cancel_event.is_set():
+                raise asyncio.CancelledError
+            self._apply_live_events(generation_id, decoder.feed(chunk))
+
+        return emit

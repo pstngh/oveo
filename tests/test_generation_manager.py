@@ -23,7 +23,6 @@ from oveo.db import Database
 from oveo.docx import DocxBlock, docx_uncompressed_limit, extract_docx
 from oveo.generation import (
     ActiveGenerationError,
-    GenerationError,
     GenerationManager,
     OpenRouterProvider,
     ProviderCompletion,
@@ -1872,27 +1871,26 @@ async def test_attachment_files_are_hashed_once_and_still_fail_closed_when_chang
     )
     await _wait_status(manager, second.generation_id, {"completed"})
 
+    # The turn is kept; its response fails before any provider call.
     stored.write_bytes(package + b"tampered")
-    with pytest.raises(GenerationError) as changed:
-        await manager.submit_turn(
-            requester_id=user.id,
-            client_request_id="hash-once-3",
-            text="Again.",
-            attachment=None,
-            thread_id=first.thread_id,
-        )
-    assert changed.value.code == "attachment_unavailable"
+    changed = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="hash-once-3",
+        text="Again.",
+        attachment=None,
+        thread_id=first.thread_id,
+    )
+    failed = await _wait_status(manager, changed.generation_id, {"failed"})
+    assert failed["error_code"] == "attachment_unavailable"
 
     stored.unlink()
-    with pytest.raises(GenerationError) as missing:
-        await manager.submit_turn(
-            requester_id=user.id,
-            client_request_id="hash-once-4",
-            text="Again.",
-            attachment=None,
-            thread_id=first.thread_id,
-        )
-    assert missing.value.code == "attachment_unavailable"
+    missing = await manager.retry(
+        generation_id=changed.generation_id,
+        requester_id=user.id,
+        client_request_id="hash-once-4",
+    )
+    failed = await _wait_status(manager, missing, {"failed"})
+    assert failed["error_code"] == "attachment_unavailable"
     await manager.shutdown()
 
 

@@ -92,6 +92,29 @@ async def validate_attachment_upload(
         raise AttachmentError(exc.code, exc.message) from exc
 
 
+class AttachmentIntegrityError(OSError):
+    """A stored attachment is not the file that was uploaded."""
+
+
+def read_stored_attachment(
+    directory: Path, storage_name: str, *, byte_count: int, sha256: str
+) -> bytes:
+    """Read a stored attachment, failing unless it is exactly the uploaded file.
+
+    Raises `AttachmentIntegrityError` for a changed file or an unsafe name, and another
+    `OSError` when the file cannot be read.
+    """
+
+    root = directory.resolve()
+    path = (root / storage_name).resolve()
+    if path.parent != root:
+        raise AttachmentIntegrityError("unsafe attachment storage name")
+    content = path.read_bytes()
+    if len(content) != byte_count or hashlib.sha256(content).hexdigest() != sha256:
+        raise AttachmentIntegrityError("attachment integrity mismatch")
+    return content
+
+
 def is_managed_attachment_name(name: str) -> bool:
     return _MANAGED_DOCX_NAME.fullmatch(name) is not None
 
