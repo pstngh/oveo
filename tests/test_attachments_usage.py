@@ -112,3 +112,13 @@ def test_word_count_and_precise_cost_formatting() -> None:
     assert format_lifetime_cost(0) == "$0.00"
     assert format_lifetime_cost(1) == "$0.000001"
     assert format_lifetime_cost(12_340_000) == "$12.34"
+
+
+def test_attachment_file_is_private_from_creation_and_never_overwritten(tmp_path: Path) -> None:
+    name = "00000000-0000-0000-0000-000000000001.docx"
+    stored = persist_attachment(tmp_path, name, b"first")
+
+    assert stored.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(FileExistsError):
+        persist_attachment(tmp_path, name, b"second")
+    assert stored.read_bytes() == b"first"

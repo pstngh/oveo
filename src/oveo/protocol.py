@@ -161,10 +161,18 @@ def _load_object(line: str) -> dict[str, object]:
         )
     except ProtocolError:
         raise
-    except (json.JSONDecodeError, UnicodeError, ValueError, TypeError) as exc:
+    except (json.JSONDecodeError, UnicodeError, ValueError, TypeError, RecursionError) as exc:
         raise ProtocolError("invalid_json") from exc
     if not isinstance(value, dict):
         raise ProtocolError("event_not_object")
+    if "\\u" in line:
+        # A `\ud83d` escape decodes to a lone surrogate, which is valid JSON but not
+        # text: it cannot be stored or sent back to the model, so the whole
+        # conversation would fail on every later turn.
+        try:
+            json.dumps(value, ensure_ascii=False).encode("utf-8")
+        except (UnicodeEncodeError, RecursionError) as exc:
+            raise ProtocolError("invalid_unicode") from exc
     return cast(dict[str, object], value)
 
 

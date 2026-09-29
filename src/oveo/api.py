@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from oveo.attachments import AttachmentError, validate_attachment_upload
@@ -317,6 +318,8 @@ async def list_threads(
     # join can match at most one active generation per thread.
     rows = await db.execute(
         select(Thread, Generation.id)
+        # The list never shows the compacted context, which can be long.
+        .options(defer(Thread.context_summary))
         .outerjoin(
             Generation,
             (Generation.thread_id == Thread.id) & Generation.status.in_(_ACTIVE_STATUSES),
@@ -386,16 +389,20 @@ async def thread_detail(
         user.id: user.username
         for user in (await db.execute(select(User).where(User.id.in_(actor_ids)))).scalars()
     }
-    attachment_rows = list(
-        (
-            await db.execute(
-                select(Attachment).where(
-                    Attachment.message_id.in_([message.id for message in messages])
-                )
-            )
-        ).scalars()
+    # Display metadata only: the stored block map of each document is not needed here.
+    attachment_rows = await db.execute(
+        select(
+            Attachment.message_id,
+            Attachment.original_name,
+            Attachment.role,
+            Attachment.byte_count,
+            Attachment.word_count,
+            Attachment.media_type,
+        )
+        .join(Message, Attachment.message_id == Message.id)
+        .where(Message.thread_id == thread.id, Message.ordinal > (after_ordinal or 0))
     )
-    attachments = {attachment.message_id: attachment for attachment in attachment_rows}
+    attachments = {row.message_id: row for row in attachment_rows}
     serialized_messages: list[dict[str, Any]] = []
     for message in messages:
         attachment = attachments.get(message.id)
@@ -447,7 +454,19 @@ async def thread_detail(
     handoff_snapshot = (
         await manager.get_snapshot(active_handoff) if active_handoff is not None else None
     )
-    latest_version = await _latest_work_version(db, thread.id)
+    # Two columns of the latest version, not its full source, output and block map.
+    latest_version = (
+        await db.execute(
+            select(
+                WorkVersion.docx_template_attachment_id,
+                WorkVersion.docx_blocks.is_not(None).label("has_docx_blocks"),
+            )
+            .join(WorkItem, WorkVersion.work_item_id == WorkItem.id)
+            .where(WorkItem.thread_id == thread.id, WorkItem.active.is_(True))
+            .order_by(WorkVersion.version_no.desc())
+            .limit(1)
+        )
+    ).first()
     return {
         **summary,
         "messages": serialized_messages,
@@ -456,7 +475,7 @@ async def thread_detail(
         "docx_exportable": bool(
             latest_version is not None
             and latest_version.docx_template_attachment_id is not None
-            and latest_version.docx_blocks is not None
+            and latest_version.has_docx_blocks
         ),
     }
 
@@ -665,7 +684,7 @@ async def download_document(
             "docx_export_unavailable",
             "The committed DOCX document could not be reproduced safely.",
         ) from exc
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise ApiError(
             409,
             "docx_export_unavailable",

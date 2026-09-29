@@ -16,6 +16,7 @@ from oveo.provider import (
     ProviderError,
     ProviderMessage,
     count_input_tokens,
+    input_tokens_upper_bound,
     parse_usage,
 )
 
@@ -386,3 +387,215 @@ def test_token_counts_are_cached_under_a_digest_only(monkeypatch: pytest.MonkeyP
     assert counted == [text]
     # Keys are SHA-256 digests: the cache never holds conversation text.
     assert [len(key) for key in provider_module._token_cache] == [32]
+
+
+async def _stream_text(
+    tmp_path: Path, content: bytes, **overrides: object
+) -> tuple[list[str], str]:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=content)
+
+    deltas: list[str] = []
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        provider = OpenRouterClient(settings(tmp_path, **overrides), client=http_client)
+        result = await provider.stream_chat(
+            [ProviderMessage("user", "synthetic")],
+            max_completion_tokens=100,
+            on_delta=deltas.append,
+        )
+    return deltas, result.text
+
+
+@pytest.mark.asyncio
+async def test_unicode_line_separators_inside_content_do_not_split_the_event(
+    tmp_path: Path,
+) -> None:
+    # JSON leaves these unescaped inside strings; only CR and LF end an SSE line.
+    text = "ligne\u2028suivante\u2029fin\x85points"
+    payload = json.dumps(
+        {"id": "generation-ls", "choices": [{"delta": {"content": text}}]},
+        ensure_ascii=False,
+    )
+    content = f"data: {payload}\r\n\r\ndata: [DONE]\r\n\r\n".encode()
+
+    deltas, joined = await _stream_text(tmp_path, content)
+
+    assert deltas == [text]
+    assert joined == text
+
+
+@pytest.mark.asyncio
+async def test_surrogate_pair_split_across_chunks_is_joined(tmp_path: Path) -> None:
+    content = (
+        b'data: {"id":"generation-sp","choices":[{"delta":{"content":"Bravo \\ud83d"}}]}\n\n'
+        b'data: {"id":"generation-sp","choices":[{"delta":{"content":"\\ude00!"}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    deltas, joined = await _stream_text(tmp_path, content)
+
+    assert deltas == ["Bravo ", "\U0001f600!"]
+    assert joined == "Bravo \U0001f600!"
+
+
+@pytest.mark.asyncio
+async def test_lone_surrogate_is_a_malformed_stream(tmp_path: Path) -> None:
+    content = (
+        b'data: {"id":"generation-ls","choices":[{"delta":{"content":"x\\ude00"}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    with pytest.raises(ProviderError) as caught:
+        await _stream_text(tmp_path, content)
+
+    assert caught.value.code == "provider_malformed_stream"
+    assert caught.value.provider_generation_id == "generation-ls"
+
+
+@pytest.mark.asyncio
+async def test_explicit_null_error_field_is_not_a_failure(tmp_path: Path) -> None:
+    content = (
+        sse({"id": "generation-null", "error": None, "choices": [{"delta": {"content": "ok"}}]})
+        + b"data: [DONE]\n\n"
+    )
+
+    deltas, _joined = await _stream_text(tmp_path, content)
+
+    assert deltas == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_unterminated_last_line_is_an_incomplete_stream(tmp_path: Path) -> None:
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # The connection ends in the middle of the first event.
+            return httpx.Response(200, content=b'data: {"id":"generation-cut","choi')
+        return httpx.Response(
+            200,
+            content=sse({"id": "generation-ok", "choices": [{"delta": {"content": "ok"}}]})
+            + b"data: [DONE]\n\n",
+        )
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        provider = OpenRouterClient(settings(tmp_path), client=http_client, sleep=no_sleep)
+        result = await provider.stream_chat(
+            [ProviderMessage("user", "synthetic")], max_completion_tokens=100, on_delta=print
+        )
+
+    assert calls == 2
+    assert result.text == "ok"
+
+
+@pytest.mark.asyncio
+async def test_retry_honors_a_short_retry_after_and_caps_a_long_one(tmp_path: Path) -> None:
+    delays: list[float] = []
+    responses = iter(
+        (
+            httpx.Response(429, headers={"retry-after": "7"}),
+            httpx.Response(503, headers={"retry-after": "3600"}),
+            httpx.Response(
+                200,
+                content=sse({"id": "generation-ra", "choices": [{"delta": {"content": "ok"}}]})
+                + b"data: [DONE]\n\n",
+            ),
+        )
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return next(responses)
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        provider = OpenRouterClient(settings(tmp_path), client=http_client, sleep=fake_sleep)
+        result = await provider.stream_chat(
+            [ProviderMessage("user", "synthetic")], max_completion_tokens=100, on_delta=print
+        )
+
+    assert result.text == "ok"
+    assert delays == [7.0, 30.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ProxyError("proxy refused"),
+        httpx.DecodingError("bad gzip"),
+        httpx.LocalProtocolError("bad request line"),
+    ],
+)
+async def test_every_request_error_is_a_retryable_network_failure(
+    tmp_path: Path, error: httpx.RequestError
+) -> None:
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise error
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        provider = OpenRouterClient(settings(tmp_path), client=http_client, sleep=no_sleep)
+        with pytest.raises(ProviderError) as caught:
+            await provider.stream_chat(
+                [ProviderMessage("user", "synthetic")], max_completion_tokens=100, on_delta=print
+            )
+
+    assert caught.value.code == "provider_network"
+    assert calls == 3
+
+
+@pytest.mark.asyncio
+async def test_malformed_chunk_keeps_the_attempts_ids_and_usage(tmp_path: Path) -> None:
+    content = (
+        sse(
+            {
+                "id": "generation-bad",
+                "choices": [{"delta": {"content": "partial"}}],
+                "usage": {"prompt_tokens": 5, "cost": "0.000002"},
+            }
+        )
+        + b"data: {not json}\n\n"
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=content, headers={"x-request-id": "req-bad"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        provider = OpenRouterClient(settings(tmp_path), client=http_client)
+        with pytest.raises(ProviderError) as caught:
+            await provider.stream_chat(
+                [ProviderMessage("user", "synthetic")],
+                max_completion_tokens=100,
+                on_delta=lambda _delta: None,
+            )
+
+    assert caught.value.code == "provider_malformed_stream"
+    assert caught.value.partial is True
+    assert caught.value.provider_request_id == "req-bad"
+    assert caught.value.provider_generation_id == "generation-bad"
+    assert caught.value.usage is not None
+    assert caught.value.usage.cost_microusd == 2
+
+
+def test_absurd_costs_are_not_charges() -> None:
+    assert parse_usage({"prompt_tokens": 1, "cost": "1e999999999"}).cost_microusd is None  # type: ignore[union-attr]
+    assert parse_usage({"prompt_tokens": 1, "cost": 1.7e308}).cost_microusd is None  # type: ignore[union-attr]
+
+
+def test_input_token_upper_bound_is_never_below_the_count() -> None:
+    for text in ("hello", "é" * 50, "😀 mixed <|endoftext|> text", " " * 1000, "a" * 5000):
+        messages = [ProviderMessage("system", "rules"), ProviderMessage("user", text)]
+        assert input_tokens_upper_bound(messages) >= count_input_tokens(messages)

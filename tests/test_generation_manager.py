@@ -23,6 +23,7 @@ from oveo.db import Database
 from oveo.docx import DocxBlock, docx_uncompressed_limit, extract_docx
 from oveo.generation import (
     ActiveGenerationError,
+    GenerationError,
     GenerationManager,
     OpenRouterProvider,
     ProviderCompletion,
@@ -1645,6 +1646,9 @@ def test_exact_replacements_use_one_immutable_base_and_reject_overlap() -> None:
         _apply_base_replacements("abcdef", [("missing", "X")], label="output")
     with pytest.raises(ProtocolError, match="ambiguous_output"):
         _apply_base_replacements("same and same", [("same", "X")], label="output")
+    # The second occurrence overlaps the first one.
+    with pytest.raises(ProtocolError, match="ambiguous_source"):
+        _apply_base_replacements("abcabcabc", [("abcabc", "X")], label="source")
 
 
 def test_snapshot_message_validation_preserves_call_site_error_codes() -> None:
@@ -1773,6 +1777,192 @@ async def test_append_derives_the_addition_and_refuses_ambiguous_whole_documents
     assert latest is not None
     assert (latest.source_text, latest.output_text) == ("One. Two.", "Un. Deux.")
     await manager.shutdown()
+
+
+async def test_whitespace_only_text_beside_an_attachment_is_an_attachment_only_turn(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, settings, user = manager_database
+    package = make_docx(
+        document_xml=(
+            f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<w:document xmlns:w="{W}"><w:body>'
+            "<w:p><w:r><w:t>First paragraph.</w:t></w:r></w:p>"
+            "<w:sectPr/></w:body></w:document>"
+        )
+    )
+    extracted = extract_docx(
+        package, max_uncompressed_bytes=docx_uncompressed_limit(settings.max_upload_bytes)
+    )
+    attachment = ValidatedAttachment(
+        original_name="plain.docx",
+        content=package,
+        byte_count=len(package),
+        word_count=2,
+        sha256=hashlib.sha256(package).hexdigest(),
+        document_blocks=extracted.blocks,
+        plain_text=extracted.plain_text,
+    )
+    manager = GenerationManager(database, settings, ScriptedProvider([_SUCCESS]))
+
+    submitted = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="whitespace-with-attachment",
+        text=" \n\t",
+        attachment=attachment,
+        owner_id=user.id,
+        mode="translate",
+    )
+    await _wait_status(manager, submitted.generation_id, {"completed"})
+
+    async with database.sessions() as db:
+        first = await db.scalar(
+            select(Message).where(Message.thread_id == submitted.thread_id, Message.ordinal == 1)
+        )
+    assert first is not None
+    assert first.content == []
+    await manager.shutdown()
+
+
+async def test_attachment_files_are_hashed_once_and_still_fail_closed_when_changed(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, settings, user = manager_database
+    package = make_docx(
+        document_xml=(
+            f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<w:document xmlns:w="{W}"><w:body>'
+            "<w:p><w:r><w:t>First paragraph.</w:t></w:r></w:p>"
+            "<w:sectPr/></w:body></w:document>"
+        )
+    )
+    extracted = extract_docx(
+        package, max_uncompressed_bytes=docx_uncompressed_limit(settings.max_upload_bytes)
+    )
+    attachment = ValidatedAttachment(
+        original_name="plain.docx",
+        content=package,
+        byte_count=len(package),
+        word_count=2,
+        sha256=hashlib.sha256(package).hexdigest(),
+        document_blocks=extracted.blocks,
+        plain_text=extracted.plain_text,
+    )
+    manager = GenerationManager(
+        database, settings, ScriptedProvider([_SUCCESS, b"Plain document title", _SUCCESS])
+    )
+    first = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="hash-once-1",
+        text="Translate this.",
+        attachment=attachment,
+        owner_id=user.id,
+        mode="translate",
+    )
+    await _wait_status(manager, first.generation_id, {"completed"})
+    (stored,) = settings.attachments_dir.glob("*.docx")
+    assert stored.name in manager._verified_files
+
+    second = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="hash-once-2",
+        text="Thanks.",
+        attachment=None,
+        thread_id=first.thread_id,
+    )
+    await _wait_status(manager, second.generation_id, {"completed"})
+
+    stored.write_bytes(package + b"tampered")
+    with pytest.raises(GenerationError) as changed:
+        await manager.submit_turn(
+            requester_id=user.id,
+            client_request_id="hash-once-3",
+            text="Again.",
+            attachment=None,
+            thread_id=first.thread_id,
+        )
+    assert changed.value.code == "attachment_unavailable"
+
+    stored.unlink()
+    with pytest.raises(GenerationError) as missing:
+        await manager.submit_turn(
+            requester_id=user.id,
+            client_request_id="hash-once-4",
+            text="Again.",
+            attachment=None,
+            thread_id=first.thread_id,
+        )
+    assert missing.value.code == "attachment_unavailable"
+    await manager.shutdown()
+
+
+async def test_requests_whose_bytes_fit_the_budget_are_not_tokenized(
+    manager_database: tuple[Database, Settings, User], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, settings, user = manager_database
+
+    def no_tokenizer(_messages: object) -> int:
+        raise AssertionError("a small request needs no tokenizer pass")
+
+    monkeypatch.setattr("oveo.generation.count_input_tokens", no_tokenizer)
+    manager = GenerationManager(database, settings, ScriptedProvider([_SUCCESS, b"A title"]))
+    submitted = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="small-request",
+        text="Translate: hello.",
+        attachment=None,
+        owner_id=user.id,
+        mode="translate",
+    )
+
+    await _wait_status(manager, submitted.generation_id, {"completed"})
+    await manager.shutdown()
+
+
+async def test_cancelling_a_task_waiting_for_a_provider_slot_does_not_leak_the_slot(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, base_settings, _user = manager_database
+    settings = base_settings.model_copy(update={"max_concurrent_provider_calls": 1})
+    manager = GenerationManager(database, settings, ScriptedProvider([]))
+    slots = manager._provider_slots
+    await slots.acquire()  # Another call holds the only slot.
+
+    waiter = asyncio.create_task(manager._acquire_provider_slot(asyncio.Event()))
+    await asyncio.sleep(0)
+    waiter.cancel()  # For example, shutdown cancelling a queued generation.
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    slots.release()
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert not slots.locked()
+    await manager.shutdown()
+
+
+async def test_a_restart_reports_interrupted_work_instead_of_a_user_stop(
+    manager_database: tuple[Database, Settings, User],
+) -> None:
+    database, settings, user = manager_database
+    provider = BlockingProvider()
+    manager = GenerationManager(database, settings, provider)
+    submitted = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="interrupted-by-restart",
+        text="Translate this.",
+        attachment=None,
+        owner_id=user.id,
+        mode="translate",
+    )
+    await asyncio.wait_for(provider.started.wait(), timeout=5)
+
+    await manager.shutdown()
+
+    async with database.sessions() as db:
+        generation = await db.get(Generation, submitted.generation_id)
+    assert generation is not None
+    assert (generation.status, generation.error_code) == ("failed", "restart_interrupted")
 
 
 async def test_outdated_stored_docx_map_fails_closed_and_keeps_the_response(

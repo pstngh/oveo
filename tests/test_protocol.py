@@ -550,3 +550,44 @@ def test_decoder_is_byte_split_invariant_and_linear_in_line_length() -> None:
     # The former re-concatenating buffer needed seconds for a line this long (audit
     # probe p09: 600,000 characters took 5.6 s); the pieces list keeps it linear.
     assert elapsed < 2.0
+
+
+@pytest.mark.parametrize(
+    "delta",
+    [
+        b'{"v":1,"event":"block_delta","id":"b1","text":"Smile \\ud83d"}\n',
+        b'{"v":1,"event":"block_delta","id":"b1","text":"\\ude00 lone"}\n',
+    ],
+)
+def test_decoder_rejects_half_of_a_surrogate_pair(delta: bytes) -> None:
+    # Such text could be stored but never sent to the model again.
+    decoder = ProtocolDecoder()
+    decoder.feed(
+        event({"v": 1, "event": "response_start"})
+        + event({"v": 1, "event": "block_start", "id": "b1", "type": "conversation"})
+    )
+
+    with pytest.raises(ProtocolError, match="invalid_unicode"):
+        decoder.feed(delta)
+
+
+def test_decoder_accepts_an_escaped_surrogate_pair() -> None:
+    decoder = ProtocolDecoder()
+    decoder.feed(
+        event({"v": 1, "event": "response_start"})
+        + event({"v": 1, "event": "block_start", "id": "b1", "type": "conversation"})
+        + b'{"v":1,"event":"block_delta","id":"b1","text":"Smile \\ud83d\\ude00"}\n'
+        + event({"v": 1, "event": "block_end", "id": "b1"})
+        + event({"v": 1, "event": "state", "operation": "none"})
+        + event({"v": 1, "event": "response_end"})
+    )
+
+    assert decoder.finish().blocks[0].text == "Smile \U0001f600"
+
+
+def test_deeply_nested_json_is_a_protocol_error() -> None:
+    decoder = ProtocolDecoder()
+    decoder.feed(event({"v": 1, "event": "response_start"}))
+    nested = b'{"v":1,"event":"state","operation":"none","x":' + b"[" * 50_000 + b"]" * 50_000
+    with pytest.raises(ProtocolError, match="invalid_json"):
+        decoder.feed(nested + b"}\n")

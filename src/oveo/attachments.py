@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from dataclasses import dataclass
 from functools import partial
@@ -100,6 +101,13 @@ def persist_attachment(directory: Path, storage_name: str, content: bytes) -> Pa
         raise ValueError("unsafe attachment storage name")
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     target = directory / storage_name
-    target.write_bytes(content)
-    target.chmod(0o600)
+    # Private from creation (not chmod-ed after the bytes are written), and never
+    # through an existing file or link: storage names are fresh UUIDs.
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
     return target

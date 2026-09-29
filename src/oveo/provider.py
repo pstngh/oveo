@@ -4,9 +4,10 @@ import asyncio
 import hashlib
 import inspect
 import json
+import re
 import threading
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from functools import lru_cache
@@ -29,6 +30,10 @@ _PROVIDER_ROUTING: dict[str, object] = {
 # Supported reasoning levels for GPT-5.6 Luna; keep effort explicit per workload.
 ReasoningEffort = Literal["max", "xhigh", "high", "medium", "low", "none"]
 _REASONING_EFFORTS: frozenset[str] = frozenset({"max", "xhigh", "high", "medium", "low", "none"})
+# Longest Retry-After the client waits before its next attempt.
+_MAX_RETRY_AFTER = 30.0
+# Costs above this are provider errors, not charges; a larger value could not be stored.
+_MAX_COST_USD = Decimal(1_000_000)
 
 Role = Literal["system", "user", "assistant"]
 DeltaCallback = Callable[[str], Awaitable[None] | None]
@@ -120,6 +125,21 @@ def count_input_tokens(messages: Sequence[ProviderMessage]) -> int:
     return total
 
 
+def input_tokens_upper_bound(messages: Sequence[ProviderMessage]) -> int:
+    """A cheap bound that `count_input_tokens` never exceeds.
+
+    Every o200k_base token encodes at least one UTF-8 byte, so a message never has more
+    tokens than bytes; the framing allowance matches `count_input_tokens`.
+    """
+
+    return 3 + sum(
+        4
+        + len(message.role.encode("utf-8"))
+        + len(message.content.encode("utf-8", "surrogatepass"))
+        for message in messages
+    )
+
+
 class ProviderError(RuntimeError):
     """A scrubbed provider failure that never retains a response or prompt body."""
 
@@ -134,6 +154,7 @@ class ProviderError(RuntimeError):
         provider_generation_id: str | None = None,
         provider_name: str | None = None,
         usage: ProviderUsage | None = None,
+        retry_after_seconds: float | None = None,
     ) -> None:
         self.code = code
         self.retryable = retryable
@@ -143,18 +164,34 @@ class ProviderError(RuntimeError):
         self.provider_generation_id = provider_generation_id
         self.provider_name = provider_name
         self.usage = usage
+        self.retry_after_seconds = retry_after_seconds
         super().__init__(f"OpenRouter request failed: {code}")
 
-    def with_partial(self) -> ProviderError:
+    def in_attempt(
+        self,
+        *,
+        partial: bool,
+        provider_request_id: str | None,
+        provider_generation_id: str | None,
+        provider_name: str | None,
+        usage: ProviderUsage | None,
+    ) -> ProviderError:
+        """Copy this error with what its attempt already knew filled in.
+
+        Errors raised while decoding one chunk know nothing about the attempt, but the
+        call may already have been named and billed.
+        """
+
         return ProviderError(
             self.code,
             retryable=self.retryable,
             status_code=self.status_code,
-            partial=True,
-            provider_request_id=self.provider_request_id,
-            provider_generation_id=self.provider_generation_id,
-            provider_name=self.provider_name,
-            usage=self.usage,
+            partial=self.partial or partial,
+            provider_request_id=self.provider_request_id or provider_request_id,
+            provider_generation_id=self.provider_generation_id or provider_generation_id,
+            provider_name=self.provider_name or provider_name,
+            usage=self.usage or usage,
+            retry_after_seconds=self.retry_after_seconds,
         )
 
 
@@ -177,7 +214,7 @@ def _cost(value: object) -> tuple[Decimal | None, int | None]:
         dollars = Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None, None
-    if not dollars.is_finite() or dollars < 0:
+    if not dollars.is_finite() or dollars < 0 or dollars > _MAX_COST_USD:
         return None, None
     microusd = int((dollars * Decimal(1_000_000)).to_integral_value(rounding=ROUND_HALF_UP))
     return dollars, microusd
@@ -233,7 +270,9 @@ def _is_transient_code(code: object) -> bool:
     }
 
 
-def _http_error(status_code: int, *, request_id: str | None) -> ProviderError:
+def _http_error(
+    status_code: int, *, request_id: str | None, retry_after: str | None = None
+) -> ProviderError:
     retryable = status_code in {408, 409, 425, 429} or status_code >= 500
     code = "provider_transient" if retryable else "provider_rejected"
     return ProviderError(
@@ -241,7 +280,67 @@ def _http_error(status_code: int, *, request_id: str | None) -> ProviderError:
         retryable=retryable,
         status_code=status_code,
         provider_request_id=request_id,
+        retry_after_seconds=_retry_after_seconds(retry_after) if retryable else None,
     )
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    """Parse a delay-seconds ``Retry-After`` header; an HTTP date is ignored."""
+
+    if value is None:
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        return None
+    return seconds if 0 <= seconds < float("inf") else None
+
+
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _split_trailing_surrogate(text: str) -> tuple[str, str]:
+    if text and "\ud800" <= text[-1] <= "\udbff":
+        return text[:-1], text[-1]
+    return text, ""
+
+
+def _joined_surrogates(text: str) -> str:
+    """Join a surrogate pair that JSON escapes split across chunks; refuse a lone half.
+
+    A lone surrogate cannot be encoded as UTF-8, so it would fail the response later.
+    """
+
+    if _SURROGATE.search(text) is None:
+        return text
+    try:
+        return text.encode("utf-16", "surrogatepass").decode("utf-16")
+    except UnicodeDecodeError as exc:
+        raise ProviderError("provider_malformed_stream", retryable=False) from exc
+
+
+# Server-sent events end a line only at CR, LF or CRLF. `httpx.Response.aiter_lines`
+# follows `str.splitlines`, which also breaks at U+2028, U+2029, U+0085 and other
+# separators that JSON leaves unescaped inside strings, cutting such a chunk in two.
+_SSE_LINE_BREAK = re.compile(r"\r\n|\r|\n")
+
+
+async def _sse_lines(chunks: AsyncIterable[str]) -> AsyncIterator[str]:
+    """Yield complete SSE lines; an unterminated last line is discarded, per the format."""
+
+    tail = ""
+    async for chunk in chunks:
+        if not chunk:
+            continue
+        text = tail + chunk
+        # A trailing CR may be the first half of a CRLF split across two chunks.
+        held = "\r" if text.endswith("\r") else ""
+        lines = _SSE_LINE_BREAK.split(text[: len(text) - len(held)])
+        tail = lines.pop() + held
+        for line in lines:
+            yield line
+    if tail.endswith("\r"):
+        yield tail[:-1]
 
 
 class OpenRouterClient:
@@ -326,7 +425,12 @@ class OpenRouterClient:
             except ProviderError as exc:
                 if not exc.retryable or exc.partial or attempt + 1 >= attempts:
                     raise
-                await self._sleep(float(2**attempt))
+                # Honor a short Retry-After (rate limits); a longer one is capped so a
+                # waiting request never outlives the attempt it would retry.
+                delay = max(
+                    float(2**attempt), min(exc.retry_after_seconds or 0.0, _MAX_RETRY_AFTER)
+                )
+                await self._sleep(delay)
         raise AssertionError("provider retry loop did not return or raise")
 
     async def generation_cost(self, provider_generation_id: str) -> int | None:
@@ -346,7 +450,7 @@ class OpenRouterClient:
                 headers=headers,
                 timeout=self._settings.provider_metadata_timeout_seconds,
             )
-        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+        except httpx.RequestError as exc:
             raise ProviderError("provider_network", retryable=True) from exc
         if response.status_code == 404:
             return None
@@ -391,6 +495,8 @@ class OpenRouterClient:
         usage: ProviderUsage | None = None
         finish_reason: str | None = None
         done = False
+        # A high surrogate whose low half may arrive in the next chunk.
+        held_surrogate = ""
 
         def failure(code: str, *, retryable: bool) -> ProviderError:
             return ProviderError(
@@ -412,8 +518,12 @@ class OpenRouterClient:
             ):
                 request_id = _safe_string(response.headers.get("x-request-id"))
                 if response.status_code < 200 or response.status_code >= 300:
-                    raise _http_error(response.status_code, request_id=request_id)
-                async for line in response.aiter_lines():
+                    raise _http_error(
+                        response.status_code,
+                        request_id=request_id,
+                        retry_after=response.headers.get("retry-after"),
+                    )
+                async for line in _sse_lines(response.aiter_text()):
                     if not line or line.startswith(":"):
                         continue
                     if not line.startswith("data:"):
@@ -431,27 +541,36 @@ class OpenRouterClient:
                     parsed_usage = parse_usage(payload.get("usage"))
                     if parsed_usage is not None:
                         usage = parsed_usage
-                    if "error" in payload:
+                    if payload.get("error") is not None:
                         transient = _is_transient_code(_error_code(payload.get("error")))
                         raise failure(
                             "provider_transient" if transient else "provider_rejected",
                             retryable=transient,
                         )
                     finish_reason = self._finish_reason(payload) or finish_reason
-                    for delta in self._content_deltas(payload):
+                    for content in self._content_deltas(payload):
+                        delta, held_surrogate = _split_trailing_surrogate(held_surrogate + content)
+                        delta = _joined_surrogates(delta)
+                        if not delta:
+                            continue
                         parts.append(delta)
                         emitted = True
                         callback_result = on_delta(delta)
                         if inspect.isawaitable(callback_result):
                             await callback_result
         except ProviderError as exc:
-            if emitted and not exc.partial:
-                raise exc.with_partial() from exc
-            raise
+            raise exc.in_attempt(
+                partial=emitted,
+                provider_request_id=request_id,
+                provider_generation_id=generation_id,
+                provider_name=provider_name,
+                usage=usage,
+            ) from exc
         except TimeoutError as exc:
             # A stalled attempt is not replayed automatically: it may already be billed.
             raise failure("provider_timeout", retryable=False) from exc
-        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+        except httpx.RequestError as exc:
+            # Transport, proxy, protocol and content-decoding failures alike.
             raise failure("provider_network", retryable=True) from exc
 
         # A truncated or filtered response is final; replaying it would bill the same
@@ -463,6 +582,8 @@ class OpenRouterClient:
             raise failure("provider_content_filter", retryable=False)
         if not done:
             raise failure("provider_incomplete_stream", retryable=True)
+        if held_surrogate:
+            raise failure("provider_malformed_stream", retryable=False)
         return ProviderCompletion(
             text="".join(parts),
             provider_request_id=request_id,

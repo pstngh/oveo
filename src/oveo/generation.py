@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -78,6 +78,7 @@ from oveo.provider import (
     ReasoningEffort,
     count_input_tokens,
     count_text_tokens,
+    input_tokens_upper_bound,
 )
 from oveo.provider import ProviderError as OpenRouterError
 from oveo.usage import append_usage_event
@@ -361,6 +362,9 @@ _STATE_FRAMING_TOKENS = 100
 _DOCX_BLOCK_FRAMING_TOKENS = 11
 
 
+# Attachment files remembered as verified (see GenerationManager._verified_files).
+_VERIFIED_FILE_CACHE_SIZE = 1_024
+
 _KEEPALIVE_SECONDS = 15.0
 # How often an open event stream re-checks that its sign-in session is still valid.
 _SESSION_CHECK_SECONDS = 5.0
@@ -499,7 +503,8 @@ def _replacement_span(text: str, anchor: str, *, label: str) -> tuple[int, int]:
     first = text.find(anchor)
     if first < 0:
         raise ProtocolError(f"state_missing_{label}_anchor")
-    if text.find(anchor, first + len(anchor)) >= 0:
+    # Search from the next character: an anchor can overlap its own second occurrence.
+    if text.find(anchor, first + 1) >= 0:
         raise ProtocolError(f"state_ambiguous_{label}_anchor")
     return first, first + len(anchor)
 
@@ -569,6 +574,7 @@ _REPAIRABLE_STATE_CODES = frozenset(
         "state_overlapping_source_anchors",
         "invalid_docx_blocks",
         "invalid_docx_hyperlinks",
+        "invalid_docx_text",
         "state_docx_blocks_missing",
         "state_docx_blocks_unexpected",
         "state_docx_append_unsupported",
@@ -635,6 +641,11 @@ _PROTOCOL_RETRY_GUIDANCE: dict[str, str] = {
         "or Markdown fence."
     ),
     "blank_line": "Emit one JSON object per line, with no blank lines between events.",
+    "invalid_unicode": (
+        "A string held half of a surrogate pair. Write characters such as emoji whole, "
+        "never as separate \\ud83d-style escapes, and split deltas only between whole "
+        "characters."
+    ),
     "invalid_block_order": (
         "Use either exactly one conversation block, or one or more deliverable "
         "blocks followed by at most one advice block."
@@ -658,7 +669,11 @@ _PROTOCOL_RETRY_GUIDANCE: dict[str, str] = {
     ),
     "invalid_docx_hyperlinks": (
         "Every protected hyperlink wrapper must appear exactly once, in its original block "
-        "and order; only its display text may change."
+        "and order; only its display text may change, and it must not become empty."
+    ),
+    "invalid_docx_text": (
+        "Word block text cannot contain control characters other than tab and line break. "
+        "Remove them from docx_blocks and the deliverable."
     ),
     "state_missing_output_anchor": _MISSING_ANCHOR_GUIDANCE,
     "state_missing_source_anchor": _MISSING_ANCHOR_GUIDANCE,
@@ -686,10 +701,30 @@ _PROTOCOL_RETRY_GUIDANCE: dict[str, str] = {
 }
 
 
+class _BoundedChunks:
+    """Collect a small maintenance response, failing once it exceeds its byte limit."""
+
+    def __init__(self, limit: int, error_code: str) -> None:
+        self._limit = limit
+        self._error_code = error_code
+        self._parts: list[bytes] = []
+        self._size = 0
+
+    async def collect(self, chunk: bytes) -> None:
+        # A running total: re-summing every chunk made long answers quadratic.
+        self._size += len(chunk)
+        if self._size > self._limit:
+            raise ProviderError(self._error_code)
+        self._parts.append(chunk)
+
+    def joined(self) -> bytes:
+        return b"".join(self._parts)
+
+
 def _parse_context_summary(raw: bytes) -> str:
     try:
         payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise SummaryFormatError from exc
     if not isinstance(payload, dict) or set(payload) != {
         "version",
@@ -713,6 +748,11 @@ def _parse_context_summary(raw: bytes) -> str:
     unresolved_text = [item.strip() for item in unresolved if item.strip()]
     if unresolved_text:
         compacted += "\n\nUnresolved:\n" + "\n".join(f"- {item}" for item in unresolved_text)
+    try:
+        # A lone surrogate escape would make every later request unencodable.
+        compacted.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise SummaryFormatError from exc
     return compacted
 
 
@@ -748,6 +788,10 @@ class GenerationManager:
         self._reconcile_timer: asyncio.TimerHandle | None = None
         # Per pending-row attempts and next eligible time (monotonic seconds).
         self._reconcile_backoff: dict[str, tuple[int, float]] = {}
+        # Attachment files already checked against their stored hash, with the file
+        # identity seen then. Every turn re-sends the conversation's documents, and
+        # re-reading and hashing each one (up to 25 MB) would block the event loop.
+        self._verified_files: OrderedDict[str, tuple[str, tuple[int, int, int]]] = OrderedDict()
         self._shutting_down = False
 
     def _is_live(self, generation_id: str) -> bool:
@@ -1042,9 +1086,18 @@ class GenerationManager:
         self.docx_worker.close()
         self.token_worker.close()
 
-    async def _snapshot_tokens(self, snapshot: Mapping[str, Any]) -> int:
+    async def _snapshot_fits(self, snapshot: Mapping[str, Any], budget: int) -> bool:
+        """Whether a request snapshot's estimated input tokens are within ``budget``.
+
+        A snapshot whose byte size already fits needs no tokenizer pass (every token
+        covers at least one byte); most turns are far below the compaction budget.
+        """
+
         messages = _snapshot_messages(snapshot)
-        return await self.token_worker.run(partial(count_input_tokens, messages), wait=True)
+        if input_tokens_upper_bound(messages) <= budget:
+            return True
+        tokens = await self.token_worker.run(partial(count_input_tokens, messages), wait=True)
+        return tokens <= budget
 
     def _schedule(self, generation_id: str, thread_id: str | None) -> None:
         if generation_id in self._tasks:
@@ -1180,15 +1233,36 @@ class GenerationManager:
             ],
         }
 
+    def _remember_verified_file(self, path: Path, storage_name: str, sha256: str) -> None:
+        stat = path.stat()
+        self._verified_files[storage_name] = (
+            sha256,
+            (stat.st_size, stat.st_mtime_ns, stat.st_ino),
+        )
+        self._verified_files.move_to_end(storage_name)
+        while len(self._verified_files) > _VERIFIED_FILE_CACHE_SIZE:
+            self._verified_files.popitem(last=False)
+
+    def _verify_attachment_file(self, path: Path, attachment: Attachment) -> None:
+        """Fail unless the stored file is the uploaded one (hashed once per file)."""
+
+        stat = path.stat()
+        identity = (stat.st_size, stat.st_mtime_ns, stat.st_ino)
+        if self._verified_files.get(attachment.storage_name) == (attachment.sha256, identity):
+            self._verified_files.move_to_end(attachment.storage_name)
+            return
+        content = path.read_bytes()
+        if (
+            len(content) != attachment.byte_count
+            or hashlib.sha256(content).hexdigest() != attachment.sha256
+        ):
+            raise OSError("attachment integrity mismatch")
+        self._remember_verified_file(path, attachment.storage_name, attachment.sha256)
+
     def _attachment_document(self, attachment: Attachment) -> AttachmentDocument:
         path = self.settings.attachments_dir / attachment.storage_name
         try:
-            content = path.read_bytes()
-            if (
-                len(content) != attachment.byte_count
-                or hashlib.sha256(content).hexdigest() != attachment.sha256
-            ):
-                raise OSError("attachment integrity mismatch")
+            self._verify_attachment_file(path, attachment)
             if attachment.media_type != DOCX_MEDIA_TYPE:
                 raise OSError("unsupported attachment media type")
             document_blocks = docx_blocks_from_storage(attachment.document_blocks)
@@ -1377,16 +1451,18 @@ class GenerationManager:
                 thread_id=thread.id,
                 role="user",
                 actor_user_id=requester_id,
-                content=([{"type": "conversation", "text": text}] if text else []),
+                # Whitespace-only text beside an attachment is not a visible block.
+                content=([{"type": "conversation", "text": text}] if clean_text else []),
             )
             if attachment is not None:
                 attachment_id = new_id()
                 storage_name = f"{attachment_id}.docx"
-                staged_files.append(
-                    persist_attachment(
-                        self.settings.attachments_dir, storage_name, attachment.content
-                    )
+                stored_file = persist_attachment(
+                    self.settings.attachments_dir, storage_name, attachment.content
                 )
+                staged_files.append(stored_file)
+                # These bytes were hashed at upload; do not read them back to check.
+                self._remember_verified_file(stored_file, storage_name, attachment.sha256)
                 db.add(
                     Attachment(
                         id=attachment_id,
@@ -2478,17 +2554,22 @@ class GenerationManager:
             raise asyncio.CancelledError
         acquire = asyncio.ensure_future(self._provider_slots.acquire())
         stopped = asyncio.ensure_future(stop_requested.wait())
+        acquired = False
         try:
             await asyncio.wait({acquire, stopped}, return_when=asyncio.FIRST_COMPLETED)
+            acquired = acquire.done() and not acquire.cancelled() and not stop_requested.is_set()
         finally:
             stopped.cancel()
-        if acquire.done() and not acquire.cancelled():
-            if not stop_requested.is_set():
-                return
-            self._provider_slots.release()
-        else:
-            acquire.cancel()
-        raise asyncio.CancelledError
+            if not acquired:
+                # Stop won, or this task itself was cancelled while waiting: hand back a
+                # slot already granted, and withdraw a pending request (the semaphore
+                # returns a slot granted to a cancelled waiter), so none is leaked.
+                if not acquire.done():
+                    acquire.cancel()
+                elif not acquire.cancelled():
+                    self._provider_slots.release()
+        if not acquired:
+            raise asyncio.CancelledError
 
     async def _record_provider_ids(
         self,
@@ -2655,12 +2736,7 @@ class GenerationManager:
             )
             await db.commit()
 
-        parts: list[bytes] = []
-
-        async def collect(chunk: bytes) -> None:
-            if sum(map(len, parts)) + len(chunk) > 1_024:
-                raise ProviderError("title_too_large")
-            parts.append(chunk)
+        parts = _BoundedChunks(1_024, "title_too_large")
 
         request = ProviderRequest(
             generation_id=f"{generation_id}:title",
@@ -2672,12 +2748,12 @@ class GenerationManager:
             await self._call_provider(
                 usage,
                 request,
-                collect,
+                parts.collect,
                 asyncio.Event(),
                 ledger_purpose="title",
                 dedupe_scope=request.generation_id,
             )
-            title = b"".join(parts).decode("utf-8").strip()
+            title = parts.joined().decode("utf-8").strip()
             if not title or len(title) > 60 or "\n" in title or not 2 <= len(title.split()) <= 6:
                 return
             async with self.database.sessions() as db:
@@ -2783,7 +2859,7 @@ class GenerationManager:
         snapshot = generation.request_snapshot
         if generation.purpose not in {"chat", "prompt_handoff"}:
             return snapshot
-        if await self._snapshot_tokens(snapshot) <= self.settings.context_compaction_tokens:
+        if await self._snapshot_fits(snapshot, self.settings.context_compaction_tokens):
             return snapshot
         if generation.thread_id is None:
             raise ProviderError("context_compaction_failed")
@@ -2795,7 +2871,7 @@ class GenerationManager:
         snapshot: Mapping[str, Any] = generation.request_snapshot
         budget = self.settings.context_compaction_tokens
         await self._require_compactable_floor(generation, budget)
-        while await self._snapshot_tokens(snapshot) > budget:
+        while not await self._snapshot_fits(snapshot, budget):
             async with self.database.sessions() as db:
                 thread = await db.get(Thread, generation.thread_id)
                 if thread is None:
@@ -2886,7 +2962,7 @@ class GenerationManager:
             floor = await self._request_snapshot(
                 db, thread, purpose="chat", after_ordinal=floor_after
             )
-        if await self._snapshot_tokens(floor) > budget:
+        if not await self._snapshot_fits(floor, budget):
             raise ProviderError("context_budget_exceeded")
 
     async def _largest_bounded_summary_snapshot(
@@ -2907,7 +2983,7 @@ class GenerationManager:
                 purpose="summary",
                 through_ordinal=cutoff,
             )
-            if await self._snapshot_tokens(candidate) <= self.settings.context_compaction_tokens:
+            if await self._snapshot_fits(candidate, self.settings.context_compaction_tokens):
                 best = (cutoff, candidate)
                 low = middle + 1
             else:
@@ -2921,14 +2997,6 @@ class GenerationManager:
         cutoff: int,
         summary_snapshot: Mapping[str, Any],
     ) -> str:
-        def bounded_collector(parts: list[bytes]) -> EmitChunk:
-            async def collect(chunk: bytes) -> None:
-                if sum(map(len, parts)) + len(chunk) > 131_072:
-                    raise ProviderError("context_compaction_failed")
-                parts.append(chunk)
-
-            return collect
-
         for attempt in range(1, 3):
             if attempt == 2:
                 async with self.database.sessions() as db:
@@ -2945,8 +3013,7 @@ class GenerationManager:
                     )
                     await db.commit()
 
-            parts: list[bytes] = []
-            collect = bounded_collector(parts)
+            parts = _BoundedChunks(131_072, "context_compaction_failed")
 
             request = ProviderRequest(
                 generation_id=f"{generation.id}:summary:{cutoff}:attempt:{attempt}",
@@ -2958,7 +3025,7 @@ class GenerationManager:
                 await self._call_provider(
                     _usage_of(generation),
                     request,
-                    collect,
+                    parts.collect,
                     asyncio.Event(),
                     ledger_purpose="summary",
                     dedupe_scope=request.generation_id,
@@ -2970,7 +3037,7 @@ class GenerationManager:
                 raise
 
             try:
-                return _parse_context_summary(b"".join(parts))
+                return _parse_context_summary(parts.joined())
             except SummaryFormatError as exc:
                 if attempt == 1:
                     continue
@@ -3009,7 +3076,7 @@ class GenerationManager:
                         after_ordinal=after_ordinal,
                         through_ordinal=user_ordinals[middle],
                     )
-                    if await self._snapshot_tokens(candidate) <= budget:
+                    if await self._snapshot_fits(candidate, budget):
                         best_end = middle
                         best_snapshot = candidate
                         low = middle + 1
@@ -3036,7 +3103,7 @@ class GenerationManager:
                 generation.request_snapshot,
                 build_handoff_merge_messages(extracts),
             )
-            if await self._snapshot_tokens(final_snapshot) <= budget:
+            if await self._snapshot_fits(final_snapshot, budget):
                 break
             groups = await self._bounded_handoff_groups(generation.request_snapshot, extracts)
             if len(groups) >= len(extracts):
@@ -3074,11 +3141,9 @@ class GenerationManager:
                 base_snapshot,
                 build_handoff_merge_messages(candidate),
             )
-            within_budget = (
-                await self._snapshot_tokens(candidate_snapshot)
-                <= self.settings.context_compaction_tokens
-            )
-            if within_budget:
+            if await self._snapshot_fits(
+                candidate_snapshot, self.settings.context_compaction_tokens
+            ):
                 current = candidate
                 continue
             if not current:
@@ -3362,7 +3427,12 @@ class GenerationManager:
                     blocks=self._live_blocks(generation_id),
                 )
         except asyncio.CancelledError:
-            await asyncio.shield(self._finish_stopped(generation_id))
+            if self._shutting_down:
+                # A restart ended this run, not the user: say so (a Stop they already
+                # asked for still wins), as the next startup would.
+                await asyncio.shield(self._fail(generation_id, "restart_interrupted"))
+            else:
+                await asyncio.shield(self._finish_stopped(generation_id))
         except ProviderError as error:
             await self._fail(generation_id, error.code)
         except Exception as error:
