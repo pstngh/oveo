@@ -366,6 +366,71 @@ describe("L-10 / F-3, F-5, F-6, F-7: failures are reported and recoverable", () 
     expect(generation.mock.calls.length).toBe(polls);
   });
 
+  it("rides out a transient failure while following a prompt handoff", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(null, "", `/conversations/${T}`);
+    signedIn([summary(T, "Thread T")]);
+    vi.spyOn(api, "thread").mockResolvedValue(detailFor(T, [message("m1", 1, "Some request")]));
+    vi.spyOn(api, "handoff").mockResolvedValue({ generation_id: "h" });
+    vi.spyOn(api, "generation")
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValue(snapshot("h", T, "completed", 5, { blocks: [{ type: "deliverable", text: "Finished handoff" }] }));
+    const stop = vi.spyOn(api, "stop").mockResolvedValue(undefined);
+
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "Create prompt handoff" }));
+    const dialog = await screen.findByRole("dialog", { name: "Prompt handoff" });
+
+    expect(await within(dialog).findByText("Finished handoff", undefined, { timeout: 3000 })).toBeInTheDocument();
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("cancels a prompt handoff it can no longer follow", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(null, "", `/conversations/${T}`);
+    signedIn([summary(T, "Thread T")]);
+    vi.spyOn(api, "thread").mockResolvedValue(detailFor(T, [message("m1", 1, "Some request")]));
+    vi.spyOn(api, "handoff").mockResolvedValue({ generation_id: "h" });
+    vi.spyOn(api, "generation").mockRejectedValue(new ApiError(403, "forbidden", "The request could not be verified."));
+    const stop = vi.spyOn(api, "stop").mockResolvedValue(undefined);
+
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "Create prompt handoff" }));
+
+    await waitFor(() => expect(stop).toHaveBeenCalledWith("h"));
+    expect(screen.queryByRole("dialog", { name: "Prompt handoff" })).not.toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent("The request could not be verified.");
+  });
+
+  it("keeps a finished answer in view until the refreshed conversation shows it", async () => {
+    window.history.replaceState(null, "", `/conversations/${T}`);
+    signedIn([summary(T, "Thread T")]);
+    const refresh = deferred<ThreadDetail>();
+    vi.spyOn(api, "thread")
+      .mockResolvedValueOnce(detailFor(T, [message("m1", 1, "Translate: hello")], { generation: snapshot("g1", T, "running", 2) }))
+      .mockReturnValueOnce(refresh.promise);
+
+    render(<App />);
+    await screen.findByText("Translate: hello");
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    act(() => {
+      FakeEventSource.instances[0].emit("snapshot", snapshot("g1", T, "completed", 4, {
+        blocks: [{ type: "deliverable", text: "Bonjour" }],
+      }));
+    });
+
+    // The refresh has not answered yet: the answer must not disappear meanwhile.
+    expect(screen.getByText("Bonjour")).toBeInTheDocument();
+
+    await act(async () => {
+      refresh.resolve(detailFor(T, [{
+        ...message("m2", 2, "", "assistant"),
+        blocks: [{ type: "deliverable", text: "Bonjour" }],
+      }]));
+    });
+    expect(screen.getAllByText("Bonjour")).toHaveLength(1);
+  });
+
   it("follows a handoff that is already running instead of starting another", async () => {
     const user = userEvent.setup();
     window.history.replaceState(null, "", `/conversations/${T}`);

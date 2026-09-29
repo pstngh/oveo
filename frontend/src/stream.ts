@@ -16,6 +16,8 @@ const TERMINAL = new Set<GenerationSnapshot["status"]>(["completed", "failed", "
 const POLL_MS = 2000;
 const RENDER_MS = 50;
 const MAX_RESYNCS = 3;
+// Reconnecting after a missed delta waits a little longer each time.
+const RESYNC_DELAY_MS = 250;
 
 export function isTerminal(status: GenerationSnapshot["status"]) {
   return TERMINAL.has(status);
@@ -55,6 +57,7 @@ export function followGeneration(
   let resyncs = 0;
   let pollTimer: number | undefined;
   let renderTimer: number | undefined;
+  let reopenTimer: number | undefined;
 
   const publish = (immediate: boolean) => {
     if (stopped || !current) return;
@@ -79,10 +82,13 @@ export function followGeneration(
   const poll = async () => {
     if (stopped) return;
     try {
-      current = await api.generation(id);
+      const snapshot = await api.generation(id);
+      if (stopped) return;
+      current = snapshot;
       publish(true);
       if (isTerminal(current.status)) return;
     } catch (reason) {
+      if (stopped) return;
       if (reason instanceof ApiError && (reason.status === 401 || reason.status === 404)) {
         handlers.onUnavailable?.();
         return;
@@ -101,7 +107,6 @@ export function followGeneration(
     source = stream;
     stream.addEventListener("snapshot", (event) => {
       current = JSON.parse((event as MessageEvent<string>).data) as GenerationSnapshot;
-      resyncs = 0;
       publish(true);
       if (isTerminal(current.status)) close();
     });
@@ -109,12 +114,15 @@ export function followGeneration(
       if (!current) return;
       const next = applyDelta(current, JSON.parse((event as MessageEvent<string>).data) as GenerationDelta);
       if (!next) {
-        // A missed delta: reconnect, which starts over from a fresh snapshot.
+        // A missed delta: reconnect, which starts over from a fresh snapshot. Every
+        // reconnect starts with a snapshot, so only an applied delta shows the stream
+        // is healthy again; repeated gaps fall back to polling.
         close();
-        if (resyncs++ < MAX_RESYNCS) open();
+        if (resyncs++ < MAX_RESYNCS) reopenTimer = window.setTimeout(open, RESYNC_DELAY_MS * resyncs);
         else void poll();
         return;
       }
+      resyncs = 0;
       // Status changes render at once; text deltas are coalesced.
       const statusChanged = next.status !== current.status;
       current = next;
@@ -136,5 +144,6 @@ export function followGeneration(
     close();
     window.clearTimeout(pollTimer);
     window.clearTimeout(renderTimer);
+    window.clearTimeout(reopenTimer);
   };
 }

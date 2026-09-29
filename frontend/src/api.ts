@@ -29,7 +29,8 @@ export class ApiError extends Error {
 // never address another route.
 const segment = encodeURIComponent;
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+/** Send a request and return its successful response; failures become `ApiError`. */
+async function send(path: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
   if (init.body && !(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
   if (init.method && !["GET", "HEAD"].includes(init.method.toUpperCase())) {
@@ -41,8 +42,27 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const body = await response.json().catch(() => ({}));
     throw new ApiError(response.status, body.code ?? "request_failed", body.message ?? "Request failed.");
   }
+  return response;
+}
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const response = await send(path, init);
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
+}
+
+/** The file name a `Content-Disposition` header offers, preferring its UTF-8 form. */
+export function attachmentFilename(disposition: string | null, fallback: string): string {
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(disposition ?? "");
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded[1]);
+    } catch {
+      // Fall through to the plain name.
+    }
+  }
+  const plain = /filename="([^"]+)"/i.exec(disposition ?? "");
+  return plain ? plain[1] : fallback;
 }
 
 export const api = {
@@ -57,7 +77,14 @@ export const api = {
     request<ThreadDetail>(
       `/api/threads/${segment(id)}${afterOrdinal === undefined ? "" : `?after_ordinal=${afterOrdinal}`}`,
     ),
-  documentUrl: (id: string) => `/api/threads/${segment(id)}/document.docx`,
+  /** The latest DOCX export, fetched so that a refused export can be reported in place. */
+  document: async (id: string) => {
+    const response = await send(`/api/threads/${segment(id)}/document.docx`);
+    return {
+      blob: await response.blob(),
+      filename: attachmentFilename(response.headers.get("Content-Disposition"), "document-oveo.docx"),
+    };
+  },
   rename: (id: string, title: string) =>
     request<ThreadSummary>(`/api/threads/${segment(id)}`, { method: "PATCH", body: JSON.stringify({ title }) }),
   deleteThread: (id: string) => request<void>(`/api/threads/${segment(id)}`, { method: "DELETE" }),

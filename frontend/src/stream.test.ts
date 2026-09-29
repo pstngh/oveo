@@ -64,6 +64,8 @@ describe("followGeneration", () => {
 
     first.emit("delta", { from: 9, seq: 9, ops: [{ op: "append", text: "lost" }] });
     expect(first.readyState).toBe(FakeEventSource.CLOSED);
+    expect(FakeEventSource.instances).toHaveLength(1); // reconnects after a short pause
+    vi.advanceTimersByTime(250);
     const second = FakeEventSource.instances[1];
     second.emit("snapshot", { ...base, status: "completed", seq: 12, blocks: [{ type: "deliverable", text: "ABCD" }] });
     expect(updates.at(-1)).toMatchObject({ status: "completed", blocks: [{ text: "ABCD" }] });
@@ -96,5 +98,44 @@ describe("followGeneration", () => {
     stream.onerror?.();
     await vi.waitFor(() => expect(unavailable).toHaveBeenCalledOnce());
     stop();
+  });
+
+  it("falls back to polling when every reconnect misses a delta again", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    const poll = vi.spyOn(api, "generation").mockResolvedValue({ ...base, status: "completed" });
+    const stop = followGeneration("g1", { onUpdate: vi.fn() });
+
+    // Each reconnect starts with a snapshot; that alone must not reset the count.
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const stream = FakeEventSource.instances.at(-1)!;
+      stream.emit("snapshot", base);
+      stream.emit("delta", { from: 9, seq: 9, ops: [] });
+      await vi.advanceTimersByTimeAsync(2_000);
+    }
+
+    expect(FakeEventSource.instances).toHaveLength(4);
+    expect(poll).toHaveBeenCalled();
+    stop();
+  });
+
+  it("stays silent once stopped, even if a poll answers afterwards", async () => {
+    vi.stubGlobal("EventSource", FakeEventSource);
+    let reject: (reason: unknown) => void = () => undefined;
+    vi.spyOn(api, "generation").mockReturnValue(new Promise((_resolve, fail) => { reject = fail; }));
+    const unavailable = vi.fn();
+    const updates = vi.fn();
+    const stop = followGeneration("g1", { onUpdate: updates, onUnavailable: unavailable });
+    const stream = FakeEventSource.instances[0];
+    stream.readyState = FakeEventSource.CLOSED;
+    stream.onerror?.();
+
+    stop();
+    reject(new ApiError(404, "generation_not_found", "Generation not found."));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(unavailable).not.toHaveBeenCalled();
+    expect(updates).not.toHaveBeenCalled();
   });
 });

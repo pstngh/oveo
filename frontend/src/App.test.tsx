@@ -1,9 +1,9 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useState } from "react";
 import App, { canonicalPath, Composer, conversationIdFromPath, conversationPath, EmptyThread, Login, MessageList, Modal, ResponseBlocks, SidebarHeader } from "./App";
-import { api } from "./api";
+import { api, ApiError, attachmentFilename } from "./api";
 import type { GenerationSnapshot, ThreadDetail } from "./types";
 
 const THREAD_ID = "3f2c8a1e-5b7d-4c9a-8e1f-2a6b9c0d4e57";
@@ -11,6 +11,7 @@ const THREAD_ID = "3f2c8a1e-5b7d-4c9a-8e1f-2a6b9c0d4e57";
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   window.history.replaceState(null, "", "/");
 });
 
@@ -78,12 +79,55 @@ describe("authenticated bootstrap", () => {
     });
     vi.spyOn(api, "usage").mockResolvedValue({ formatted: "$0.00" });
 
-    render(<App />);
+    const exported = new Blob(["docx"]);
+    const download = vi.spyOn(api, "document").mockResolvedValue({ blob: exported, filename: "Rapport-oveo.docx" });
+    const createObjectURL = vi.fn(() => "blob:oveo-export");
+    class ObjectUrls extends URL {
+      static createObjectURL = createObjectURL;
+      static revokeObjectURL = vi.fn();
+    }
+    vi.stubGlobal("URL", ObjectUrls);
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
 
-    expect(await screen.findByRole("link", { name: "Download DOCX" })).toHaveAttribute(
-      "href",
-      `/api/threads/${THREAD_ID}/document.docx`,
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "Download DOCX" }));
+
+    expect(download).toHaveBeenCalledWith(THREAD_ID);
+    expect(createObjectURL).toHaveBeenCalledWith(exported);
+    expect(click).toHaveBeenCalledOnce();
+    expect(click.mock.contexts[0]).toMatchObject({ download: "Rapport-oveo.docx", href: "blob:oveo-export" });
+  });
+
+  it("reports a refused export without leaving the app", async () => {
+    vi.spyOn(api, "me").mockResolvedValue({
+      id: "user-1",
+      username: "charles",
+      display_name: "Charles",
+      csrf_token: "csrf",
+    });
+    window.history.replaceState(null, "", `/conversations/${THREAD_ID}`);
+    vi.spyOn(api, "threads").mockResolvedValue([]);
+    vi.spyOn(api, "thread").mockResolvedValue({
+      id: THREAD_ID,
+      owner_id: "user-1",
+      owner_username: "charles",
+      mode: "translate",
+      title: "Word translation",
+      updated_at: "2026-09-16T00:00:00Z",
+      active_generation_id: null,
+      docx_exportable: true,
+      messages: [],
+    });
+    vi.spyOn(api, "usage").mockResolvedValue({ formatted: "$0.00" });
+    vi.spyOn(api, "document").mockRejectedValue(
+      new ApiError(503, "document_worker_busy", "Oveo is processing another document. Try again in a moment."),
     );
+
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "Download DOCX" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Oveo is processing another document.");
+    expect(window.location.pathname).toBe(`/conversations/${THREAD_ID}`);
   });
 });
 
@@ -401,5 +445,56 @@ describe("conversation addresses", () => {
     expect(canonicalPath("/new", true)).toBe("/new");
     expect(canonicalPath(`/conversations/${THREAD_ID}/`, true)).toBe(`/conversations/${THREAD_ID}`);
     expect(canonicalPath("/conversations/..%2Fauth%2Fme", true)).toBe("/new");
+  });
+});
+
+describe("download file names", () => {
+  it("prefers the UTF-8 name and falls back to the plain one", () => {
+    expect(attachmentFilename(`attachment; filename="Rapport-oveo.docx"; filename*=UTF-8''R%C3%A9sum%C3%A9-oveo.docx`, "x.docx")).toBe("Résumé-oveo.docx");
+    expect(attachmentFilename('attachment; filename="Rapport-oveo.docx"', "x.docx")).toBe("Rapport-oveo.docx");
+    expect(attachmentFilename(null, "x.docx")).toBe("x.docx");
+  });
+});
+
+describe("composer safeguards", () => {
+  it("freezes the draft while it is being sent, so nothing typed meanwhile is lost", async () => {
+    const user = userEvent.setup();
+    let accept: () => void = () => undefined;
+    const onSend = vi.fn(() => new Promise<void>((resolve) => { accept = resolve; }));
+    render(<Composer activeGeneration={null} onSend={onSend} onStop={vi.fn()} onRetry={vi.fn()} />);
+    const box = screen.getByRole("textbox", { name: "Message" });
+
+    await user.type(box, "First{Enter}");
+    expect(onSend).toHaveBeenCalledWith("First");
+    expect(box).toHaveAttribute("readonly");
+    expect(screen.getByRole("button", { name: "Attach a DOCX file" })).toBeDisabled();
+    await user.type(box, " more");
+    expect(box).toHaveValue("First");
+
+    accept();
+    await waitFor(() => expect(box).toHaveValue(""));
+    expect(box).not.toHaveAttribute("readonly");
+  });
+
+  it("does not send when Enter confirms an input-method composition", () => {
+    const onSend = vi.fn(async () => undefined);
+    render(<Composer activeGeneration={null} onSend={onSend} onStop={vi.fn()} onRetry={vi.fn()} />);
+    const box = screen.getByRole("textbox", { name: "Message" });
+    fireEvent.change(box, { target: { value: "日本" } });
+
+    fireEvent.keyDown(box, { key: "Enter", isComposing: true });
+
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("offers Retry only when the server says the generation can be retried", () => {
+    const failed = (retryable: boolean): GenerationSnapshot => ({
+      id: "g1", thread_id: "t1", status: "failed", blocks: [], seq: 3, retryable,
+    });
+    const { rerender } = render(<Composer activeGeneration={failed(false)} onSend={vi.fn()} onStop={vi.fn()} onRetry={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+
+    rerender(<Composer activeGeneration={failed(true)} onSend={vi.fn()} onStop={vi.fn()} onRetry={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
   });
 });

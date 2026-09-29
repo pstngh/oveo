@@ -17,8 +17,8 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { type FormEvent, type KeyboardEvent, type ReactNode, useCallback, useEffect, useId, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import { type FormEvent, type KeyboardEvent, type ReactNode, memo, useCallback, useEffect, useId, useRef, useState } from "react";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api, ApiError, setCsrfToken } from "./api";
 import BrandLogo from "./BrandLogo";
@@ -27,6 +27,7 @@ import type {
   AttachmentRole,
   ContentBlock,
   GenerationSnapshot,
+  Message,
   Mode,
   SessionUser,
   ThreadDetail,
@@ -40,6 +41,10 @@ const CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
 // The list only shows titles and activity, so a hidden tab does not poll at all.
 const THREAD_LIST_POLL_MS = 15_000;
 const HANDOFF_POLL_MS = 700;
+// Failed handoff progress reads retried (with growing pauses) before giving up.
+const HANDOFF_POLL_RETRIES = 4;
+// The history follows new text only while the reader is this close to its end.
+const FOLLOW_THRESHOLD_PX = 80;
 // Matches the breakpoint in styles.css where the sidebar becomes an off-canvas panel.
 const MOBILE_LAYOUT = "(max-width: 760px)";
 const UNCONFIRMED_SEND = "Oveo could not confirm that your message was sent. Send it again; it will not be duplicated.";
@@ -102,6 +107,32 @@ function delay(ms: number) {
   return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 }
 
+/** Read a prompt handoff's progress, riding out a few transient failures. */
+async function readHandoff(id: string, running: () => boolean): Promise<GenerationSnapshot> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await api.generation(id);
+    } catch (reason) {
+      const final = reason instanceof ApiError && [401, 403, 404].includes(reason.status);
+      if (final || attempt >= HANDOFF_POLL_RETRIES || !running()) throw reason;
+      await delay(HANDOFF_POLL_MS * 2 ** attempt);
+    }
+  }
+}
+
+/** Save a downloaded file under the name the server gave it. */
+function saveFile(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  // Some browsers read the object URL after the click has returned.
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
 /** What the workspace shows: a new conversation (with or without a chosen mode) or one conversation. */
 type View = { kind: "new"; mode: Mode | null } | { kind: "thread"; id: string };
 
@@ -133,7 +164,11 @@ export function mergeDetail(previous: ThreadDetail | undefined, loaded: ThreadDe
 
 /** A refresh can return an older copy of the generation the stream already advanced. */
 function newerGeneration(previous: GenerationSnapshot | null, loaded: GenerationSnapshot | null) {
-  return previous && loaded && previous.id === loaded.id && previous.seq > loaded.seq ? previous : loaded;
+  if (!previous || !loaded || previous.id !== loaded.id) return loaded;
+  // A finished generation never runs again, and the sequence numbers of a live draft
+  // and of a stored row are not comparable.
+  if (isTerminal(previous.status) && !isTerminal(loaded.status)) return previous;
+  return previous.seq > loaded.seq ? previous : loaded;
 }
 
 function statusAnnouncement(status: GenerationSnapshot["status"], error?: string | null) {
@@ -251,19 +286,26 @@ function ModeBadge({ mode }: { mode: Mode }) {
   return <span className={`mode-badge ${mode}`}>{MODE_COPY[mode].label}</span>;
 }
 
-function Markdown({ text }: { text: string }) {
+// Stable options, so a memoized message is not parsed again on every render.
+const MARKDOWN_PLUGINS = [remarkGfm];
+const MARKDOWN_ELEMENTS = ["p", "strong", "em", "ul", "ol", "li", "a", "code", "blockquote", "br"];
+const MARKDOWN_COMPONENTS: Components = {
+  a: ({ href, children }) => <a href={href} rel="noreferrer" target="_blank">{children}</a>,
+};
+
+const Markdown = memo(function Markdown({ text }: { text: string }) {
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
+      remarkPlugins={MARKDOWN_PLUGINS}
       skipHtml
-      allowedElements={["p", "strong", "em", "ul", "ol", "li", "a", "code", "blockquote", "br"]}
+      allowedElements={MARKDOWN_ELEMENTS}
       unwrapDisallowed
-      components={{ a: ({ href, children }) => <a href={href} rel="noreferrer" target="_blank">{children}</a> }}
+      components={MARKDOWN_COMPONENTS}
     >
       {text}
     </ReactMarkdown>
   );
-}
+});
 
 export function ResponseBlocks({ blocks, streaming = false }: { blocks: ContentBlock[]; streaming?: boolean }) {
   const [copied, setCopied] = useState<{ index: number; ok: boolean } | null>(null);
@@ -307,31 +349,55 @@ export function ResponseBlocks({ blocks, streaming = false }: { blocks: ContentB
   );
 }
 
+// Memoized: a streamed delta re-renders only the pending answer, not every earlier
+// message (whose Markdown would otherwise be parsed again many times a second).
+const MessageItem = memo(function MessageItem({ message, ownerUsername }: { message: Message; ownerUsername: string }) {
+  return (
+    <article className={`message ${message.role}`}>
+      <div className="message-inner">
+        {message.role === "assistant" ? <ResponseBlocks blocks={message.blocks} /> : (
+          <>
+            {message.actor_username && message.actor_username !== ownerUsername && <div className="message-author">{message.actor_username}</div>}
+            {message.blocks.map((block, index) => <p className="user-text" key={index}>{block.text}</p>)}
+            {message.attachment && <div className="sent-attachment"><FileText /> <span>{message.attachment.filename}</span><small>{message.attachment.role === "reference" ? "Reference" : "Source"}</small></div>}
+          </>
+        )}
+      </div>
+    </article>
+  );
+});
+
 export function MessageList({ detail, generation }: { detail: ThreadDetail; generation: GenerationSnapshot | null }) {
   const messagesRef = useRef<HTMLDivElement>(null);
+  // Whether the view follows new text: a reader who scrolled up to read earlier text is
+  // not pulled back down by the streaming answer. A new message is always shown.
+  const following = useRef(true);
+  const messageCount = detail.messages.length;
+  useEffect(() => {
+    following.current = true;
+  }, [messageCount]);
   useEffect(() => {
     const messages = messagesRef.current;
-    if (messages) messages.scrollTop = messages.scrollHeight;
-  }, [detail.messages.length, generation?.seq]);
+    if (messages && following.current) messages.scrollTop = messages.scrollHeight;
+  }, [messageCount, generation?.seq]);
+  function trackPosition() {
+    const messages = messagesRef.current;
+    if (messages) following.current = messages.scrollHeight - messages.scrollTop - messages.clientHeight < FOLLOW_THRESHOLD_PX;
+  }
   // Not a live region: streamed text would be read out chunk by chunk. The workspace
   // announces coarse status changes in its own status region instead.
   return (
-    <div ref={messagesRef} className="messages">
+    <div ref={messagesRef} className="messages" onScroll={trackPosition}>
       {detail.messages.map((message) => (
-        <article className={`message ${message.role}`} key={message.id}>
-          <div className="message-inner">
-            {message.role === "assistant" ? <ResponseBlocks blocks={message.blocks} /> : (
-              <>
-                {message.actor_username && message.actor_username !== detail.owner_username && <div className="message-author">{message.actor_username}</div>}
-                {message.blocks.map((block, index) => <p className="user-text" key={index}>{block.text}</p>)}
-                {message.attachment && <div className="sent-attachment"><FileText /> <span>{message.attachment.filename}</span><small>{message.attachment.role === "reference" ? "Reference" : "Source"}</small></div>}
-              </>
-            )}
-          </div>
-        </article>
+        <MessageItem key={message.id} message={message} ownerUsername={detail.owner_username} />
       ))}
       {generation && !isTerminal(generation.status) && (
         <article className="message assistant pending"><div className="message-inner"><ResponseBlocks blocks={generation.blocks} streaming /></div></article>
+      )}
+      {generation?.status === "completed" && generation.blocks.length > 0 && (
+        // The finished answer stays in view until the refreshed conversation holds it
+        // as a message (the refresh then clears the generation in the same render).
+        <article className="message assistant"><div className="message-inner"><ResponseBlocks blocks={generation.blocks} /></div></article>
       )}
       {generation?.status === "failed" && generation.blocks.length > 0 && (
         <article className="message assistant preserved"><div className="message-inner"><ResponseBlocks blocks={generation.blocks} /></div></article>
@@ -375,7 +441,14 @@ export function Composer({
   const fileRef = useRef<HTMLInputElement>(null);
   const { text, attachment, attachmentRole } = draft;
   const generating = Boolean(activeGeneration && !isTerminal(activeGeneration.status));
-  const retryable = Boolean(activeGeneration && ["failed", "stopped"].includes(activeGeneration.status));
+  // While a message is being sent the draft is frozen: clearing it afterwards must not
+  // discard what was typed meanwhile.
+  const sending = busy === "send";
+  const retryable = Boolean(
+    activeGeneration
+      && ["failed", "stopped"].includes(activeGeneration.status)
+      && activeGeneration.retryable !== false,
+  );
 
   function change(next: Partial<ComposerDraft>) {
     const merged = { ...draft, ...next };
@@ -423,7 +496,8 @@ export function Composer({
     }
   }
   function keyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey) {
+    // Enter that confirms an input-method composition is not a send.
+    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
       void send();
     }
@@ -436,7 +510,7 @@ export function Composer({
         </button>
       )}
       <div className="composer">
-        {attachment && <div className="attachment-chip"><FileText /><span>{attachment.name}</span><select aria-label="Use attachment as" value={attachmentRole} onChange={(event) => change({ attachmentRole: event.target.value as AttachmentRole })}><option value="source">Source document</option><option value="reference">Style reference</option></select><button onClick={removeAttachment} aria-label="Remove attachment"><X /></button></div>}
+        {attachment && <div className="attachment-chip"><FileText /><span>{attachment.name}</span><select aria-label="Use attachment as" value={attachmentRole} disabled={sending} onChange={(event) => change({ attachmentRole: event.target.value as AttachmentRole })}><option value="source">Source document</option><option value="reference">Style reference</option></select><button onClick={removeAttachment} disabled={sending} aria-label="Remove attachment"><X /></button></div>}
         <textarea
           aria-label="Message"
           placeholder="Message"
@@ -445,10 +519,11 @@ export function Composer({
           onKeyDown={keyDown}
           rows={3}
           disabled={generating}
+          readOnly={sending}
         />
         <div className="composer-actions">
           {onCreateHandoff && <button className="icon-button handoff-button" onClick={onCreateHandoff} disabled={generating} aria-label="Create prompt handoff" title="Create prompt handoff"><Sparkles /></button>}
-          <button className="icon-button attach" onClick={() => fileRef.current?.click()} disabled={generating} aria-label="Attach a DOCX file"><Paperclip /></button>
+          <button className="icon-button attach" onClick={() => fileRef.current?.click()} disabled={generating || sending} aria-label="Attach a DOCX file"><Paperclip /></button>
           <input ref={fileRef} className="file-input" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={(e) => acceptFile(e.target.files?.[0])} />
           {generating ? (
             <button
@@ -521,6 +596,7 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
   const [notice, setNotice] = useState("");
   const [announcement, setAnnouncement] = useState("");
   const [signingOut, setSigningOut] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const sidebarId = useId();
 
   // Every navigation stores a new view object here, so a response that arrives for a
@@ -531,6 +607,9 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
   // so an older refresh cannot put back the generation it read.
   const generationEpoch = useRef(0);
   const listRequest = useRef(0);
+  // Conversation loads and refreshes, newest last: an older response that arrives late
+  // must not replace what a newer one showed.
+  const detailRequest = useRef(0);
   const handoffRun = useRef(0);
   const lifetime = useRef<AbortSignal | null>(null);
   const drafts = useRef(new Map<string, ComposerDraft>());
@@ -575,9 +654,10 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
   const openView = useCallback((next: View, address: "push" | "replace" | "none") => {
     enter(next, address);
     if (next.kind !== "thread") return;
+    const request = ++detailRequest.current;
     void api.thread(next.id).then(
       (loaded) => {
-        if (viewRef.current !== next) return;
+        if (viewRef.current !== next || detailRequest.current !== request) return;
         setDetail(loaded);
         setGeneration(loaded.generation ?? null);
       },
@@ -596,9 +676,11 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
     const shown = detailRef.current?.id === id ? detailRef.current : undefined;
     const after = shown ? knownOrdinal(shown) : undefined;
     const epoch = generationEpoch.current;
+    const request = ++detailRequest.current;
     try {
       const loaded = await api.thread(id, after);
-      if (viewRef.current !== target) return true;
+      // A newer load or refresh answers for this view; this older copy could undo it.
+      if (viewRef.current !== target || detailRequest.current !== request) return true;
       setDetail((previous) => mergeDetail(previous, loaded, after !== undefined));
       if (generationEpoch.current === epoch) {
         setGeneration((previous) => newerGeneration(previous, loaded.generation ?? null));
@@ -751,6 +833,8 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
     // The server has the turn now; nothing below may report the message as unsent.
     requestIds.current.delete(requestKey);
     drafts.current.delete(key);
+    // Signed out meanwhile: this workspace is gone and must not change the address.
+    if (lifetime.current?.aborted) return;
     void refreshThreads();
     // The user moved on while this was sending: leave them where they are.
     if (viewRef.current !== origin) return;
@@ -820,7 +904,10 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
     setHandoff({ threadId, generationId, blocks: [], finished: false });
     try {
       if (!generationId) {
-        generationId = (await api.handoff(threadId, requestIdFor(requestKey, []))).generation_id;
+        // A handoff requested after new turns is a new request, even if an earlier
+        // attempt's outcome was unknown.
+        const requestId = requestIdFor(requestKey, [knownOrdinal(conversation)]);
+        generationId = (await api.handoff(threadId, requestId)).generation_id;
         requestIds.current.delete(requestKey);
         if (!running()) {
           // Closed while it was being created.
@@ -829,14 +916,14 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
         }
         setHandoff({ threadId, generationId, blocks: [], finished: false });
       }
-      let snapshot = await api.generation(generationId);
+      let snapshot = await readHandoff(generationId, running);
       while (running()) {
         const finished = isTerminal(snapshot.status);
         setHandoff({ threadId, generationId, blocks: snapshot.blocks, finished });
         if (finished) break;
         await delay(HANDOFF_POLL_MS);
         if (!running()) return;
-        snapshot = await api.generation(generationId);
+        snapshot = await readHandoff(generationId, running);
       }
       if (!running()) return;
       setDetail((shown) => (shown?.id === threadId && shown.handoff ? { ...shown, handoff: null } : shown));
@@ -845,7 +932,30 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
     } catch (reason) {
       if (!running()) return;
       setHandoff(null);
-      if (!isUnauthorized(reason)) setGlobalError(errorMessage(reason, "Prompt handoff could not be created."));
+      if (isUnauthorized(reason)) return;
+      if (generationId !== null) {
+        // No longer followed, it would keep running (and be paid for) unseen and keep
+        // the conversation busy, as when the dialog is closed.
+        const abandoned = generationId;
+        void api.stop(abandoned).catch(() => undefined);
+        setDetail((shown) => (shown?.handoff?.id === abandoned ? { ...shown, handoff: null } : shown));
+      }
+      setGlobalError(errorMessage(reason, "Prompt handoff could not be created."));
+    }
+  }
+
+  async function downloadDocument(conversation: ThreadDetail) {
+    if (downloading) return;
+    setDownloading(true);
+    try {
+      // Fetched rather than followed as a link: a refused export (busy, outdated) is
+      // reported here instead of replacing the app, and its unsent drafts, with an error.
+      const { blob, filename } = await api.document(conversation.id);
+      saveFile(blob, filename);
+    } catch (reason) {
+      if (!isUnauthorized(reason)) setGlobalError(errorMessage(reason, "The Word document could not be downloaded. Try again."));
+    } finally {
+      setDownloading(false);
     }
   }
 
@@ -902,9 +1012,9 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
       </aside>
       <main className="workspace">
         {current?.docx_exportable && (
-          <a className="docx-download" href={api.documentUrl(current.id)}>
-            <Download aria-hidden="true" /> Download DOCX
-          </a>
+          <button className="docx-download" onClick={() => void downloadDocument(current)} disabled={downloading}>
+            <Download aria-hidden="true" /> {downloading ? "Preparing DOCX…" : "Download DOCX"}
+          </button>
         )}
         <section className="conversation-area">
           {view.kind === "thread"
@@ -925,11 +1035,11 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
         )}
       </main>
       {deleteTarget && (
-        <Modal title="Delete conversation?" onClose={closeDelete}>
+        <Modal title="Delete conversation?" onClose={() => { if (!deletion.busy) closeDelete(); }}>
           <p className="modal-copy">Delete “{deleteTarget.title}”? This permanently deletes the conversation and its attachments. This cannot be undone.</p>
           {deletion.error && <p className="form-error" role="alert">{deletion.error}</p>}
           <div className="modal-actions">
-            <button onClick={closeDelete}>Cancel</button>
+            <button onClick={closeDelete} disabled={deletion.busy}>Cancel</button>
             <button className="danger-button" onClick={() => void removeThread()} disabled={deletion.busy}>{deletion.busy ? "Deleting…" : "Delete permanently"}</button>
           </div>
         </Modal>
