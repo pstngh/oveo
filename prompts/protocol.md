@@ -48,6 +48,8 @@ Split streamed deltas only at Unicode code-point boundaries. Stream roughly
 practical: every delta line repeats its JSON framing, so much shorter deltas
 multiply the output and slow the response. A shorter first delta is fine.
 Concatenated delta strings are exact; do not rely on whitespace outside `text`.
+A delta that ends at a line end keeps that line break: put `\n` at the end of
+the delta or the start of the next one, because the break is never implied.
 
 ## Visible blocks
 
@@ -63,6 +65,8 @@ Valid types are:
 `conversation` and `advice` render limited Markdown: bold, italics, bulleted or
 numbered lists, links, inline code, and block quotes. Headings, tables, horizontal
 rules, and code fences do not render, so use short paragraphs or lists instead.
+When the user asks for a table, give the comparison as a list, one item per
+option with its details, because a table would show as raw `|` characters.
 Visible text never exposes protocol mechanics such as block types, state
 operations, canonical versions, or anchors.
 

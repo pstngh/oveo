@@ -501,9 +501,21 @@ def _spoken(day: date) -> str:
     return f"{_MONTHS[day.month - 1]} {day.day}, {day.year}"
 
 
+def _thanksgiving(after: date) -> date:
+    """Canada's next Thanksgiving, the second Monday of October, after a date."""
+
+    for year in (after.year, after.year + 1):
+        october = date(year, 10, 1)
+        day = october + timedelta(days=(7 - october.weekday()) % 7 + 7)
+        if day > after:
+            return day
+    raise AssertionError("unreachable")
+
+
 # The date scenarios need an event that is really past when the model runs, so they
 # use the latest finished Friday-to-Sunday weekend in the users' default time zone.
 _TODAY = datetime.now(ZoneInfo("America/Toronto")).date()
+_THANKSGIVING = _thanksgiving(_TODAY)
 _RIDE_END = _TODAY - timedelta(days=(_TODAY.weekday() - 6) % 7 or 7)
 _RIDE = f"{_spoken(_RIDE_END - timedelta(days=2))} to {_spoken(_RIDE_END)}"
 _RIDE_NOTES = (
@@ -594,10 +606,11 @@ _NOTE = f"Remarque{NBSP}: la réunion commence à 14{NBSP}h{NBSP}30 dans la gran
 _TIME = f"14{NBSP}h{NBSP}30"
 _SUBJECTS = "\n".join(f"Parking update {index}: new rules from October 1" for index in range(20))
 _BILINGUAL = (
-    "Le bureau de Montréal sera fermé le lundi 13 octobre pour l'Action de grâce. "
-    "Le centre d'assistance reste joignable par courriel à aide@example.com.\n\n---\n\n"
-    "The Montreal office will be closed on Monday, October 13, for Thanksgiving. "
-    "The help desk remains reachable by email at aide@example.com."
+    f"Le bureau de Montréal sera fermé le lundi {_THANKSGIVING.day} octobre "
+    f"{_THANKSGIVING.year} pour l'Action de grâce. Le centre d'assistance reste joignable "
+    "par courriel à aide@example.com.\n\n---\n\n"
+    f"The Montreal office will be closed on Monday, {_spoken(_THANKSGIVING)}, for "
+    "Thanksgiving. The help desk remains reachable by email at aide@example.com."
 )
 
 SCENARIOS: tuple[Scenario, ...] = (
@@ -866,12 +879,14 @@ SCENARIOS: tuple[Scenario, ...] = (
         turns=(
             Turn(
                 "Draft a short announcement in both English and French: the Montreal "
-                "office will be closed on Monday, October 13, for Thanksgiving; the help "
-                "desk stays reachable by email at aide@example.com."
+                f"office will be closed on Monday, {_spoken(_THANKSGIVING)}, for "
+                "Thanksgiving; the help desk stays reachable by email at aide@example.com."
             ),
         ),
         check=_check_bilingual_draft,
-        good=(_establish(_BILINGUAL, "Office closed October 13; help desk by email."),),
+        good=(
+            _establish(_BILINGUAL, f"Office closed {_spoken(_THANKSGIVING)}; help desk by email."),
+        ),
         bad=(
             ndjson(
                 [

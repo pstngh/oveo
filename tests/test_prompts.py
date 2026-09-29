@@ -371,3 +371,26 @@ def test_alithya_legal_name_and_chez_are_always_used_in_french() -> None:
     assert "never `À Alithya, nous ...`" in shared
     assert "Keep `à`, `au`, or `dans` for a place, an event, or a public body" in shared
     assert "correct `à` used this way in French text you revise" in shared
+
+
+def test_required_advice_merges_named_varieties_and_stream_line_breaks() -> None:
+    shared = normalized_prompt("alithya_rules.md")
+    # The feminine-title question is required advice, even for one sentence.
+    assert "This question is required advice: ask it even for a single sentence" in shared
+    assert "Advice these shared rules require, such as the feminine job-title" in shared
+    for name in MODE_PROMPTS:
+        assert (
+            "advice a shared rule requires, such as the feminine job-title question, is "
+            "always material" in normalized_prompt(name)
+        )
+    # Replacing one paragraph still merges a repeated thank-you and keeps the user's closing.
+    assert "This holds when the user asked to change only one passage" in shared
+    assert "keep their closing line exactly as written" in shared
+    assert "check that no two paragraphs thank the same people" in shared
+    # No space of any kind before ? or ! in French.
+    assert "with no space of any kind, not even a narrow one" in shared
+    # A variety the request names is never asked for again.
+    assert "never ask for it again" in normalized_prompt("translate.md")
+    protocol = normalized_prompt("protocol.md")
+    assert "A delta that ends at a line end keeps that line break" in protocol
+    assert "When the user asks for a table, give the comparison as a list" in protocol
