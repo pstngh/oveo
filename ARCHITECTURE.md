@@ -89,6 +89,10 @@ canonical versions.
 SQLite foreign keys, check/unique constraints, and partial unique indexes protect
 invariants. Connections enable WAL, foreign keys, normal synchronous mode, and a
 bounded busy timeout. Model calls and streaming never hold transactions open.
+Migrations run with foreign keys off (batch table rebuilds would cascade), so every
+pending migration, its revision stamp, and a `foreign_key_check` share one
+transaction: a dangling reference rolls the whole upgrade back, and every restart
+refuses it again.
 
 ## Generation and canonical state
 
