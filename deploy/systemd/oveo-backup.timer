@@ -1,8 +1,9 @@
 [Unit]
-Description=Run the Oveo encrypted backup nightly
+Description=Run the Oveo encrypted backup after each workday
 
 [Timer]
-OnCalendar=*-*-* 03:15:00 UTC
+# Oveo is used on workdays only: the Tuesday to Saturday runs cover Monday to Friday.
+OnCalendar=Tue..Sat *-*-* 03:15:00 UTC
 Persistent=true
 RandomizedDelaySec=10m
 Unit=oveo-backup.service

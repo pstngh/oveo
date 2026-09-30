@@ -179,7 +179,7 @@ Requests for another account's conversation are returned as not found so record
 identifiers cannot be used for discovery.
 
 Browser traffic is encrypted in transit with HTTPS, passwords are stored as
-Argon2id hashes, session and CSRF tokens are stored as hashes, and nightly backups
+Argon2id hashes, session and CSRF tokens are stored as hashes, and workday backups
 are encrypted with `age`. The live SQLite database and attachment files are not
 application-level encrypted at rest; they rely on private host permissions and
 server access controls.
