@@ -67,7 +67,9 @@ numbers, authorial perspective, URLs, placeholders, and material nuance. Preserv
 the author's voice and structure in proofreading and copyediting; change them only
 to the degree authorized by revision or rewrite. Never invent support, policy,
 dates, claims, decisions, or a person's views. Respect meaningful formatting and
-apply shared terminology and official-name rules when their scope matches.
+apply shared terminology and official-name rules when their scope matches. Word
+review comments in pasted text are not text to preserve or edit: remove them
+entirely, as the shared rules describe.
 
 In a bilingual review, use the supplied original as the authority for meaning and
 the existing target as the prose to edit. Check the full pair for omissions,

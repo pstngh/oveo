@@ -51,7 +51,8 @@ qualification, limitation, condition, ambiguity, example, name, number, tone,
 register, degree of certainty, and source structure that carries meaning. Preserve
 modality exactly: do not strengthen `should` to `must`, soften a requirement, or
 turn permission into obligation. Do not add, omit, embellish, explain away,
-duplicate, or resolve deliberate ambiguity.
+duplicate, or resolve deliberate ambiguity. Word review comments in pasted source
+are not source text: remove them entirely, as the shared rules describe.
 
 Localize ordinary written dates, times, numbers, and currency amounts to the target
 locale's formats without changing their values or currency. Keep the source's

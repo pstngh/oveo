@@ -395,3 +395,32 @@ def test_required_advice_merges_named_varieties_and_stream_line_breaks() -> None
     protocol = normalized_prompt("protocol.md")
     assert "A delta that ends at a line end keeps that line break" in protocol
     assert "When the user asks for a table, give the comparison as a list" in protocol
+
+
+def test_senior_vp_and_cio_titles_word_comments_and_replace_everywhere() -> None:
+    shared = normalized_prompt("alithya_rules.md")
+    # Alithya's titles: never `premier vice-président` or `direction de l'information`.
+    assert "| Senior Vice President / Senior Vice-President | vice-président principal |" in shared
+    assert "never `premier vice-président`" in shared
+    assert "| Chief Information Officer | chef de la direction informatique |" in shared
+    assert "never `chef de la direction de l'information`" in shared
+    assert (
+        "| Senior Vice President and Chief Information Officer | Vice-président principal et "
+        "chef de la direction informatique |" in shared
+    )
+    # Comments pasted from Word are dropped, markers and text alike, in every mode.
+    assert "## Word comments in pasted text" in shared
+    assert "such as `[AD7]` or `[AD7.1]`" in shared
+    assert "Remove them entirely" in shared
+    assert "out of the source text you record" in shared
+    assert "Word review comments in pasted source are not source text" in normalized_prompt(
+        "translate.md"
+    )
+    assert "Word review comments in pasted text are not text to preserve or edit" in (
+        normalized_prompt("revision.md")
+    )
+    # "Replace every X" reaches titles, and "No, not in Robert's title" means fix it there.
+    assert "change every occurrence in the complete current work, including titles" in shared
+    assert "without first checking the complete current text word for word" in shared
+    assert "`Non, pas dans le titre de Robert`" in shared
+    assert "not asking you to leave that place alone" in shared

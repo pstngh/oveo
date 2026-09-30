@@ -473,6 +473,44 @@ def _check_revised_french_uses_chez_and_legal_name(outcome: Outcome) -> None:
     _check_legal_name_is_groupe_alithya(outcome)
 
 
+_COMMENT_MARKER = re.compile(r"\[[^\W\d_]{1,9}\d")
+
+
+def _check_word_comments_are_removed(outcome: Outcome) -> None:
+    completed(outcome)
+    latest = outcome.latest
+    expect(latest is not None, "no work was saved", outcome)
+    assert latest is not None
+    expect("trudel" in latest.output_text.casefold(), "the text was not translated", outcome)
+    for label, text in (
+        ("deliverable", outcome.deliverable()),
+        ("saved translation", latest.output_text),
+        ("saved source", latest.source_text),
+    ):
+        found = _COMMENT_MARKER.search(text)
+        expect(found is None, f"the {label} keeps a comment marker: {found}", outcome)
+        expect("ahmed" not in text.casefold(), f"the {label} keeps a comment's text", outcome)
+
+
+def _check_senior_vp_and_cio_titles(outcome: Outcome) -> None:
+    completed(outcome)
+    text = _saved_text(outcome)
+    expect("vice-président principal" in text, "not “vice-président principal”", outcome)
+    expect("chef de la direction informatique" in text, "not “direction informatique”", outcome)
+    expect("premier vice-président" not in text, "“premier vice-président” was used", outcome)
+    expect(
+        "direction de l'information" not in text, "“direction de l'information” was used", outcome
+    )
+
+
+def _check_every_occurrence_is_replaced(outcome: Outcome) -> None:
+    completed(outcome)
+    text = _saved_text(outcome)
+    expect("direction de l'information" not in text, "an occurrence was left unchanged", outcome)
+    expect("chef de la direction informatique" in text, "the title was not changed", outcome)
+    expect("nouvel outil" in text, "the first paragraph was lost", outcome)
+
+
 def _check_side_text_keeps_word_work(outcome: Outcome) -> None:
     completed(outcome)
     latest = outcome.latest
@@ -600,6 +638,34 @@ _RESPECT = (
 _RESPECT_FIXED = _RESPECT.replace("À Alithya", "Chez Alithya").replace(
     "Alithya Group Inc.", "Groupe Alithya inc."
 )
+
+# Word puts a comment's marker after the passage and its text after the document.
+_UNCOMMENTED = (
+    "Information Systems\n"
+    "Sébastien Trudel will rejoin the CIO organization after more than a year supporting "
+    "Operations and Finance."
+)
+_COMMENTED = (
+    _UNCOMMENTED.replace("Systems", "Systems[AD7.1][AD7.2]")
+    + "\n\n[AD7.1]Check this heading with Ahmed before sending.\n"
+    "[AD7.2]Done, Ahmed approved it."
+)
+_COMMENTED_FR = (
+    "Systèmes d'information\n"
+    "Sébastien Trudel réintégrera l'organisation du CIO après avoir soutenu les secteurs des "
+    "Opérations et des Finances pendant plus d'un an."
+)
+_SIGNATURE = "Robert Lamarre\nSenior Vice President and Chief Information Officer"
+_SIGNATURE_FR = "Robert Lamarre\nVice-président principal et chef de la direction informatique"
+_SIGNATURE_PREMIER = (
+    "Robert Lamarre\nPremier vice-président et chef de la direction de l'information"
+)
+_DIRECTION = (
+    "La direction de l'information déploie un nouvel outil de gestion des demandes. Pour "
+    "toute question, communiquez avec l'équipe de soutien.\n\n"
+    "Robert Lamarre\nVice-président principal et chef de la direction de l'information"
+)
+_DIRECTION_FIXED = _DIRECTION.replace("direction de l'information", "direction informatique")
 
 _EN_TO_CA = "Translate into Canadian French: "
 _NOTE = f"Remarque{NBSP}: la réunion commence à 14{NBSP}h{NBSP}30 dans la grande salle."
@@ -1125,6 +1191,55 @@ SCENARIOS: tuple[Scenario, ...] = (
         check=_check_revised_french_uses_chez_and_legal_name,
         good=(_establish(_RESPECT_FIXED, _RESPECT),),
         bad=(_establish(_RESPECT, _RESPECT),),
+    ),
+    Scenario(
+        name="pasted-word-comments-are-removed",
+        mode="translate",
+        turns=(Turn(_EN_TO_CA + "\n\n" + _COMMENTED),),
+        check=_check_word_comments_are_removed,
+        good=(_establish(_COMMENTED_FR, _UNCOMMENTED),),
+        bad=(
+            _establish(
+                _COMMENTED_FR.replace("d'information", "d'information[AD7.1][AD7.2]")
+                + "\n\n[AD7.1]Vérifier ce titre avec Ahmed avant l'envoi.",
+                _COMMENTED,
+            ),
+        ),
+    ),
+    Scenario(
+        name="senior-vp-and-cio-use-approved-titles",
+        mode="translate",
+        turns=(Turn(_EN_TO_CA + _SIGNATURE),),
+        check=_check_senior_vp_and_cio_titles,
+        good=(
+            _establish(
+                _SIGNATURE_FR,
+                _SIGNATURE,
+                advice="Faut-il le titre au féminin (vice-présidente principale et cheffe "
+                "de la direction informatique)?",
+            ),
+        ),
+        bad=(_establish(_SIGNATURE_PREMIER, _SIGNATURE),),
+    ),
+    Scenario(
+        name="replace-everywhere-includes-the-title",
+        mode="revision",
+        turns=(
+            Turn("Proofread this Canadian French text: " + _DIRECTION),
+            Turn("Corrige tous les « direction de l'information » par « direction informatique »."),
+        ),
+        check=_check_every_occurrence_is_replaced,
+        good=(
+            _establish(_DIRECTION, _DIRECTION),
+            ndjson([("deliverable", _DIRECTION_FIXED)], {"operation": "full", "base_version": 1}),
+        ),
+        bad=(
+            _establish(_DIRECTION, _DIRECTION),
+            _answer(
+                "La version actuelle utilise déjà « direction informatique » partout. Aucun "
+                "autre changement n'est nécessaire."
+            ),
+        ),
     ),
 )
 
