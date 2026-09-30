@@ -131,7 +131,6 @@ async def _orphan(database: Database, user: User, status: str, **values: Any) ->
             client_request_id=f"orphan-{status}",
             purpose="chat",
             status=status,
-            request_snapshot={"schema_version": 1, "provider_messages": []},
             **values,
         )
         db.add(generation)
@@ -255,7 +254,6 @@ async def test_stop_at_natural_completion_timing_never_wedges_or_duplicates(
             assert row is not None
             assert row.status in {"completed", "stopped"}  # never left `stopping`
             assert (row.status == "completed") == (row.result_message_id is not None)
-            assert row.request_snapshot == {}
         outcomes.append(str(final["status"]))
         answers = await _assistant_count(database, seed.thread_id)
         assert answers == 1 + outcomes.count("completed")
@@ -394,7 +392,6 @@ async def test_startup_completes_rows_whose_answer_was_committed(
                 purpose="chat",
                 status=status,
                 error_code="restart_interrupted" if status == "failed" else None,
-                request_snapshot={"schema_version": 1, "provider_messages": []},
             )
             db.add(generation)
             await db.flush()
@@ -418,9 +415,6 @@ async def test_startup_completes_rows_whose_answer_was_committed(
     assert stopped is not None and stopped["status"] == "stopped"
     assert interrupted is not None and interrupted["error_code"] == "restart_interrupted"
     assert await _assistant_count(database, thread.id) == 3  # history untouched
-    async with database.sessions() as db:
-        snapshots = list((await db.execute(select(Generation.request_snapshot))).scalars())
-    assert all(value == {} for value in snapshots)
     await manager.shutdown()
 
 
@@ -512,10 +506,10 @@ async def test_simultaneous_retries_create_one_new_attempt(
     await manager.shutdown()
 
 
-# --- M-7: derived request snapshots -------------------------------------------------
+# --- M-7: finished generations -----------------------------------------------------
 
 
-async def test_terminal_generations_drop_their_request_snapshot(
+async def test_finished_generations_keep_their_content_free_diagnostics(
     manager_database: tuple[Database, Settings, User],
 ) -> None:
     database, settings, user = manager_database
@@ -554,7 +548,6 @@ async def test_terminal_generations_drop_their_request_snapshot(
             ).scalars()
         )
     assert {row.status for row in rows} == {"completed", "failed", "stopped"}
-    assert all(row.request_snapshot == {} for row in rows)
     # Content-free diagnostics stay.
     assert any(row.error_code == "provider_network" for row in rows)
     assert all(row.finished_at is not None for row in rows)
