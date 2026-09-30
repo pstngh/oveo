@@ -118,6 +118,8 @@ if args[0] == "compose":
         (state / "running").write_text(image)
         (state / "healthy").write_text("yes" if healthy else "no")
         log(f"up {image[-6:]} marker={marker}")
+        with (state / "compose-files.log").open("a") as handle:
+            handle.write(f"{image[-6:]} {args[args.index('-f') + 1]}\n")
     elif command == "stop":
         (state / "running").write_text("")
         (state / "healthy").write_text("no")
@@ -592,6 +594,64 @@ def test_install_host_installs_the_bundle_and_drops_the_old_rehearsal_record(hos
     assert (host.root / "etc/systemd/system/oveo-backup.timer").exists()
     assert (host.state / "systemctl.log").read_text() == "daemon-reload\n"
     assert outcome.owners["oveo"] == "10001:10001"
+
+
+def _installed(host: Host) -> dict[Path, bytes]:
+    return {
+        path: path.read_bytes()
+        for directory in ("opt/oveo", "usr/local/sbin", "usr/local/lib/oveo", "etc/systemd/system")
+        for path in sorted((host.root / directory).rglob("*"))
+        if path.is_file()
+    }
+
+
+def _compose_files(host: Host) -> list[str]:
+    log = host.state / "compose-files.log"
+    return log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+
+
+def test_bundle_deploy_installs_the_bundle_once_the_candidate_passed(host: Host) -> None:
+    host.deployment_files()
+    host.data_directory(revision="rev1", attachments={})
+    stage = host.bundle()
+
+    outcome = host.run(str(stage / "deploy/oveo-deploy.sh"), "--bundle", str(stage), CANDIDATE)
+
+    assert outcome.status == 0, outcome.stderr
+    assert _compose_files(host) == [f"{CANDIDATE[-6:]} {stage / 'compose.yml'}"]
+    installed = (host.root / "opt/oveo/compose.yml").read_text(encoding="utf-8")
+    assert installed == (stage / "compose.yml").read_text(encoding="utf-8")
+    assert (host.root / "usr/local/sbin/oveo-deploy").read_bytes() == (
+        stage / "deploy/oveo-deploy.sh"
+    ).read_bytes()
+    assert (host.state / "systemctl.log").read_text() == "daemon-reload\n"
+    assert _deployed(host) == f"OVEO_IMAGE={CANDIDATE}"
+
+
+@pytest.mark.parametrize("candidate_revisions", [["rev1"], ["rev2", "rev1"]])
+def test_failed_bundle_deploy_keeps_the_running_release_s_host_files(
+    host: Host, candidate_revisions: list[str]
+) -> None:
+    host.deployment_files()
+    host.data_directory(revision="rev1", attachments={})
+    host.configure(
+        revisions={PREVIOUS: ["rev1"], CANDIDATE: candidate_revisions}, broken=(CANDIDATE,)
+    )
+    stage = host.bundle()
+    before = _installed(host)
+
+    outcome = host.run(str(stage / "deploy/oveo-deploy.sh"), "--bundle", str(stage), CANDIDATE)
+
+    assert outcome.status == 1
+    # The preceding image comes back under the compose file it was verified with.
+    assert _compose_files(host) == [
+        f"{CANDIDATE[-6:]} {stage / 'compose.yml'}",
+        f"{PREVIOUS[-6:]} {host.root / 'opt/oveo/compose.yml'}",
+    ]
+    assert _installed(host) == before
+    assert not (host.state / "systemctl.log").exists()
+    assert _deployed(host) == f"OVEO_IMAGE={PREVIOUS}"
+    assert (host.state / "healthy").read_text() == "yes"
 
 
 # --- L-19: backups, alerts and restores ------------------------------------------------

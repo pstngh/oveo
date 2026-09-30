@@ -3,6 +3,7 @@ set -eu
 umask 077
 
 repo=ghcr.io/pstngh/oveo
+# The compose file of the running release; a rollback starts the preceding image with it.
 compose_file=/opt/oveo/compose.yml
 deploy_env=/etc/oveo/deploy.env
 runtime_env=/etc/oveo/runtime.env
@@ -21,18 +22,41 @@ die() {
   exit 1
 }
 
+usage="usage: $0 [--bundle STAGED_BUNDLE_DIRECTORY] ghcr.io/pstngh/oveo@sha256:DIGEST"
 [ "$(id -u)" -eq 0 ] || die "must run as root"
-[ "$#" -eq 1 ] || die "usage: $0 ghcr.io/pstngh/oveo@sha256:DIGEST"
+# With --bundle, the candidate runs with the staged bundle's compose file and tools, and
+# the bundle is installed only once the candidate passed its checks: a failed deployment
+# leaves the running release's compose file and host scripts as they were.
+bundle=
+if [ "$#" -eq 3 ] && [ "$1" = --bundle ]; then
+  bundle=$2
+  shift 2
+fi
+[ "$#" -eq 1 ] || die "$usage"
 image=$1
+candidate_compose=$compose_file
+if [ -n "$bundle" ]; then
+  case "$bundle" in
+    /*) ;;
+    *) die "the bundle directory must be an absolute path" ;;
+  esac
+  for file in compose.yml deploy/install-host.sh deploy/validate_staging.py deploy/backup_tool.py; do
+    [ -f "$bundle/$file" ] && [ ! -L "$bundle/$file" ] \
+      || die "bundle file is missing or unsafe: $bundle/$file"
+  done
+  candidate_compose=$bundle/compose.yml
+  staging_validator=$bundle/deploy/validate_staging.py
+  backup_tool=$bundle/deploy/backup_tool.py
+fi
 printf '%s\n' "$image" | grep -Eq '^ghcr\.io/pstngh/oveo@sha256:[0-9a-f]{64}$' \
   || die "deployment requires the exact Oveo repository and an immutable sha256 digest"
 
-[ -f "$compose_file" ] || die "$compose_file is missing"
+[ -f "$candidate_compose" ] || die "$candidate_compose is missing"
 [ -f "$runtime_env" ] && [ ! -L "$runtime_env" ] || die "$runtime_env is missing or unsafe"
 [ "$(stat -c '%U:%G:%a' "$runtime_env")" = "root:root:600" ] \
   || die "$runtime_env must be root:root mode 0600"
-[ -x "$staging_validator" ] || die "$staging_validator is not installed"
-[ -x "$backup_tool" ] || die "$backup_tool is not installed"
+[ -f "$staging_validator" ] || die "$staging_validator is not installed"
+[ -f "$backup_tool" ] || die "$backup_tool is not installed"
 python3 "$staging_validator" --runtime "$runtime_env" \
   || die "staged credentials did not pass content-free validation"
 
@@ -65,6 +89,7 @@ fi
 if [ -n "$previous" ]; then
   printf '%s\n' "$previous" | grep -Eq '^ghcr\.io/pstngh/oveo@sha256:[0-9a-f]{64}$' \
     || die "recorded previous image is not a valid immutable Oveo image"
+  [ -f "$compose_file" ] || die "$compose_file is missing, so the running release could not be restored"
 fi
 
 docker manifest inspect "$image" >/dev/null \
@@ -75,11 +100,16 @@ docker image inspect "$image" --format '{{range .RepoDigests}}{{println .}}{{end
   || die "pulled image does not expose the requested repository digest"
 
 OVEO_IMAGE=$image docker compose --project-name oveo --env-file "$deploy_env" \
-  -f "$compose_file" config --quiet 2>/dev/null \
-  || OVEO_IMAGE=$image docker compose --project-name oveo -f "$compose_file" config --quiet
+  -f "$candidate_compose" config --quiet 2>/dev/null \
+  || OVEO_IMAGE=$image docker compose --project-name oveo -f "$candidate_compose" config --quiet
 
+# The running (or preceding) release and the candidate may use different compose files.
 compose() {
   docker compose --project-name oveo --env-file "$deploy_env" -f "$compose_file" "$@"
+}
+
+candidate() {
+  docker compose --project-name oveo --env-file "$deploy_env" -f "$candidate_compose" "$@"
 }
 
 write_image_env() {
@@ -113,6 +143,10 @@ ready() {
 
 start_image() {
   write_image_env "$1" && compose up --detach --remove-orphans app
+}
+
+start_candidate() {
+  write_image_env "$image" && candidate up --detach --remove-orphans app
 }
 
 rollback() {
@@ -175,12 +209,12 @@ fi
 
 # With the marker in place the candidate serves reads and health checks but accepts no
 # writes until every check passed, so undoing it can lose no user data.
-if start_image "$image" && ready; then
+if start_candidate && ready; then
   rm -f -- "$maintenance_marker"
 else
   if [ "$migrating" = true ]; then
     echo "Candidate failed; putting back the data directory from before its migration." >&2
-    compose stop app || true
+    candidate stop app || true
     mv -T -- "$data_dir" "$failed_dir" \
       || die "could not set the candidate's data aside; Oveo is stopped (see OPERATIONS.md)"
     mv -T -- "$snapshot_dir" "$data_dir" \
@@ -200,6 +234,12 @@ printf '%s\n' "$image" >"$data_dir/deployed-image"
 chown 10001:10001 "$data_dir/deployed-image"
 chmod 0600 "$data_dir/deployed-image"
 
+# The candidate is live, so its compose file and host scripts now describe the host.
+if [ -n "$bundle" ]; then
+  "$bundle/deploy/install-host.sh" \
+    || die "$image is live, but installing its host bundle failed; $compose_file and the host scripts are from the preceding release until the bundle is installed (see OPERATIONS.md)"
+fi
+
 # Remove only superseded images from this exact GHCR repository. Never prune globally.
 docker image ls --digests --format '{{.Repository}}@{{.Digest}}' | sort -u \
   | while IFS= read -r old_image; do
@@ -213,7 +253,7 @@ docker image ls --digests --format '{{.Repository}}@{{.Digest}}' | sort -u \
       docker image rm "$old_image" >/dev/null 2>&1 || true
     done
 
-compose ps
+candidate ps
 if [ "$migrating" = true ]; then
   echo "Pre-deployment data kept at $snapshot_dir; remove that exact directory once this release is verified."
 fi
