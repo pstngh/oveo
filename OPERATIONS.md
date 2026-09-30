@@ -57,7 +57,6 @@ Copy the deployment artifacts with root ownership:
 /usr/local/sbin/oveo-backup-alert            <- deploy/oveo-backup-alert.sh
 /usr/local/lib/oveo/backup_tool.py            <- deploy/backup_tool.py
 /usr/local/lib/oveo/validate_staging.py       <- deploy/validate_staging.py
-/opt/oveo/rehearsal.env                       <- exact-image CI rehearsal attestation
 /etc/systemd/system/oveo-backup.service       <- deploy/systemd/oveo-backup.service
 /etc/systemd/system/oveo-backup-failure.service <- deploy/systemd/oveo-backup-failure.service
 /etc/systemd/system/oveo-backup.timer         <- deploy/systemd/oveo-backup.timer

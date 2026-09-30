@@ -148,6 +148,27 @@ LOGGER_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >>"$STUB_STATE/logger.log"
 """
 
+SYSTEMCTL_STUB = """#!/bin/sh
+printf '%s\\n' "$*" >>"$STUB_STATE/systemctl.log"
+"""
+
+# What the deploy job packs into the host bundle, relative to the repository root.
+BUNDLE = (
+    "compose.yml",
+    "deploy/install-host.sh",
+    "deploy/oveo-deploy.sh",
+    "deploy/oveo-backup.sh",
+    "deploy/oveo-restore.sh",
+    "deploy/oveo-backup-alert.sh",
+    "deploy/backup_tool.py",
+    "deploy/validate_staging.py",
+    "deploy/runtime.env.example",
+    "deploy/backup.env.example",
+    "deploy/systemd/oveo-backup.service",
+    "deploy/systemd/oveo-backup-failure.service",
+    "deploy/systemd/oveo-backup.timer",
+)
+
 
 def _namespaces_work(probe: Path) -> bool:
     if UNSHARE is None:
@@ -193,7 +214,13 @@ class Host:
         self.bin = self.state / "bin"
         self.data = self.root / "var/lib/oveo"
         self.backups = self.root / "var/backups/oveo"
-        for directory in ("etc/oveo", "opt/oveo", "usr/local/lib/oveo", "usr/local/sbin"):
+        for directory in (
+            "etc/oveo",
+            "etc/systemd/system",
+            "opt/oveo",
+            "usr/local/lib/oveo",
+            "usr/local/sbin",
+        ):
             (self.root / directory).mkdir(parents=True)
         (self.root / "var/lib").mkdir(parents=True)
         (self.root / "var/backups").mkdir(parents=True)
@@ -222,6 +249,7 @@ class Host:
             ("curl", CURL_STUB),
             ("age", AGE_STUB),
             ("logger", LOGGER_STUB),
+            ("systemctl", SYSTEMCTL_STUB),
             ("sleep", "#!/bin/sh\nexit 0\n"),
         ):
             (self.bin / name).write_text(body, encoding="utf-8")
@@ -231,6 +259,15 @@ class Host:
                 gnu = Path(f"/usr/bin/gnu{name}")
                 if gnu.exists():
                     (self.bin / name).symlink_to(gnu)
+
+    def bundle(self) -> Path:
+        """Extract a host bundle the way the deploy job stages it, in /var/tmp."""
+
+        stage = self.root / "var/tmp/oveo-host-synthetic"
+        for name in BUNDLE:
+            (stage / name).parent.mkdir(parents=True, exist_ok=True)
+            self._install(ROOT / name, stage / name)
+        return stage
 
     def configure(self, *, revisions: dict[str, list[str]], broken: tuple[str, ...] = ()) -> None:
         payload = {"revisions": revisions, "broken": list(broken)}
@@ -534,6 +571,27 @@ def test_first_deploy_creates_the_data_directory_on_a_fresh_host(host: Host) -> 
     assert outcome.status == 0, outcome.stderr
     assert _deployed(host) == f"OVEO_IMAGE={CANDIDATE}"
     assert (host.data / "attachments").is_dir()
+
+
+# --- Host bundle installation ----------------------------------------------------------
+
+
+def test_install_host_installs_the_bundle_and_drops_the_old_rehearsal_record(host: Host) -> None:
+    stage = host.bundle()
+    stale = host.root / "opt/oveo/rehearsal.env"
+    stale.write_text("OVEO_REHEARSED_IMAGE=synthetic\n", encoding="utf-8")
+
+    outcome = host.run(str(stage / "deploy/install-host.sh"))
+
+    assert outcome.status == 0, outcome.stderr
+    assert not stale.exists()
+    installed = (host.root / "opt/oveo/compose.yml").read_text(encoding="utf-8")
+    assert installed == (stage / "compose.yml").read_text(encoding="utf-8")
+    for name in ("oveo-deploy", "oveo-backup", "oveo-restore", "oveo-backup-alert"):
+        assert os.access(host.root / "usr/local/sbin" / name, os.X_OK), name
+    assert (host.root / "etc/systemd/system/oveo-backup.timer").exists()
+    assert (host.state / "systemctl.log").read_text() == "daemon-reload\n"
+    assert outcome.owners["oveo"] == "10001:10001"
 
 
 # --- L-19: backups, alerts and restores ------------------------------------------------

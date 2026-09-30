@@ -168,8 +168,6 @@ jobs:
           printf '%s\n' "$head" | grep -Eq '^[A-Za-z0-9_]+$'
           docker exec --env EXPECTED_HEAD="$head" "$container" python -c \
             "import os, sqlite3; db=sqlite3.connect('/data/oveo.sqlite3'); assert db.execute('SELECT username FROM users ORDER BY username').fetchall() == [('charles',), ('yousra',)]; assert 'role' not in {row[1] for row in db.execute('PRAGMA table_info(users)')}; assert db.execute('SELECT version_num FROM alembic_version').fetchone() == (os.environ['EXPECTED_HEAD'],); attachment_columns={row[1]: row[3] for row in db.execute('PRAGMA table_info(attachments)')}; assert attachment_columns['document_blocks'] == 1; assert attachment_columns['role'] == 1; attachment_schema=db.execute(\"SELECT sql FROM sqlite_master WHERE type='table' AND name='attachments'\").fetchone()[0]; assert 'ck_attachments_docx_media_type' in attachment_schema; assert 'ck_attachments_role' in attachment_schema"
-          printf 'OVEO_REHEARSED_IMAGE=%s\nOVEO_REHEARSED_COMMIT=%s\n' \
-            "$IMAGE" "$GITHUB_SHA" > REHEARSAL
   deploy:
     if: >-
       github.ref == 'refs/heads/main' &&
@@ -179,7 +177,6 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     permissions:
-      actions: read
       contents: read
       packages: read
     concurrency:
@@ -187,15 +184,11 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - name: Package and verify host bundle
-        env:
-          IMAGE: ghcr.io/pstngh/oveo@${{ needs.publish.outputs.digest }}
+      # The checksum travels with the bundle; the host checks it before extracting.
+      - name: Package host bundle
         run: |
-          printf '%s\n' "$IMAGE" > IMAGE
-          printf 'OVEO_REHEARSED_IMAGE=%s\nOVEO_REHEARSED_COMMIT=%s\n' \
-            "$IMAGE" "$GITHUB_SHA" > REHEARSAL
           tar --create --gzip --file "oveo-host-${GITHUB_SHA}.tar.gz" \
-            compose.yml OPERATIONS.md IMAGE REHEARSAL deploy/install-host.sh \
+            compose.yml deploy/install-host.sh \
             deploy/oveo-deploy.sh \
             deploy/oveo-backup.sh deploy/oveo-restore.sh deploy/oveo-backup-alert.sh \
             deploy/backup_tool.py \
@@ -203,7 +196,6 @@ jobs:
             deploy/runtime.env.example deploy/backup.env.example deploy/systemd
           sha256sum "oveo-host-${GITHUB_SHA}.tar.gz" \
             > "oveo-host-${GITHUB_SHA}.tar.gz.sha256"
-          sha256sum --check "oveo-host-${GITHUB_SHA}.tar.gz.sha256"
       - name: Prepare pinned SSH access
         env:
           VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
