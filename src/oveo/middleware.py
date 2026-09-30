@@ -33,6 +33,14 @@ def _error(status_code: int, code: str, message: str, **headers: str) -> JSONRes
     )
 
 
+class BodyTooLarge(HTTPException):
+    """A streamed body passed its limit; carries the refusal a declared size gets."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(status_code=413, detail=message)
+        self.code = code
+
+
 class RequestBodyLimit:
     """Reject oversized bodies before anything buffers or parses them.
 
@@ -49,11 +57,11 @@ class RequestBodyLimit:
     def _is_upload(scope: Scope) -> bool:
         return scope["method"] == "POST" and _UPLOAD_ROUTES.fullmatch(scope["path"]) is not None
 
-    def _too_large(self, scope: Scope) -> JSONResponse:
+    def _refusal(self, scope: Scope) -> tuple[str, str]:
         # A refused upload names the file limit instead of a generic request error.
         if self._is_upload(scope):
-            return _error(413, "attachment_too_large", upload_limit_message(self.max_upload_bytes))
-        return _error(413, "request_too_large", "The request is too large.")
+            return "attachment_too_large", upload_limit_message(self.max_upload_bytes)
+        return "request_too_large", "The request is too large."
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -72,7 +80,7 @@ class RequestBodyLimit:
                 )
                 return
             if lengths.pop() > limit:
-                await self._too_large(scope)(scope, receive, send)
+                await _error(413, *self._refusal(scope))(scope, receive, send)
                 return
 
         received = 0
@@ -84,7 +92,7 @@ class RequestBodyLimit:
                 received += len(message.get("body", b""))
                 if received > limit:
                     # FastAPI re-raises HTTPException from body parsing unchanged.
-                    raise HTTPException(status_code=413)
+                    raise BodyTooLarge(*self._refusal(scope))
             return message
 
         await self.app(scope, limited_receive, send)

@@ -189,6 +189,61 @@ async def test_upload_routes_allow_the_configured_file_size_and_no_more(
     assert malformed.json() == {"code": "invalid_request", "message": "The request is invalid."}
 
 
+_UPLOAD_PART = (
+    b"--abc\r\n"
+    b'Content-Disposition: form-data; name="attachment"; filename="large.docx"\r\n'
+    b"Content-Type: application/octet-stream\r\n\r\n"
+)
+
+
+async def test_an_upload_is_not_read_before_its_sender_is_signed_in(
+    client: httpx.AsyncClient,
+) -> None:
+    # FastAPI would parse declared form fields, spooling the file into the small /tmp,
+    # before the sign-in check; the upload routes read their form only afterwards.
+    sent = {"bytes": 0}
+
+    async def chunks() -> AsyncIterator[bytes]:
+        yield _UPLOAD_PART
+        for _ in range(64):
+            sent["bytes"] += 64 * 1024
+            yield b"a" * (64 * 1024)
+
+    for path in ("/api/threads", "/api/threads/any/messages"):
+        sent["bytes"] = 0
+        response = await client.post(
+            path, content=chunks(), headers={"Content-Type": "multipart/form-data; boundary=abc"}
+        )
+        assert response.status_code == 401
+        assert response.json()["code"] == "authentication_required"
+        assert sent["bytes"] <= 64 * 1024
+
+
+async def test_a_streamed_upload_over_the_limit_names_the_file_limit(
+    client: httpx.AsyncClient,
+) -> None:
+    settings: Settings = client.app.state.settings  # type: ignore[attr-defined]
+    headers = await _login(client)
+    chunk = b"a" * (1 << 20)
+
+    async def chunks() -> AsyncIterator[bytes]:
+        yield _UPLOAD_PART
+        for _ in range((settings.max_upload_bytes + UPLOAD_OVERHEAD) // len(chunk) + 1):
+            yield chunk
+
+    response = await client.post(
+        "/api/threads",
+        content=chunks(),
+        headers={**headers, "Content-Type": "multipart/form-data; boundary=abc"},
+    )
+    assert response.status_code == 413
+    assert response.json() == {
+        "code": "attachment_too_large",
+        "message": f"The Word file is larger than the {settings.max_upload_bytes / 1_000_000:g} "
+        "MB limit.",
+    }
+
+
 # --- M-1: sign-in work is bounded and the lockout cannot be raced ---------------------
 
 

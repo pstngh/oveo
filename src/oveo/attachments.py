@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
-from fastapi import UploadFile
+from starlette.datastructures import UploadFile
 
 from oveo.docx import DocxBlock, DocxError, docx_uncompressed_limit, extract_docx
 from oveo.workers import BoundedWorker, WorkerBusy

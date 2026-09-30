@@ -27,6 +27,7 @@ from oveo.generation import (
 from oveo.logging_config import install_error_file_handler, remove_error_file_handler
 from oveo.login_guard import LoginGuard
 from oveo.middleware import (
+    BodyTooLarge,
     ContentFreeErrors,
     ImmutableStaticFiles,
     MaintenanceGate,
@@ -228,9 +229,12 @@ def create_app(
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error_handler(_request: Request, exc: StarletteHTTPException) -> Response:
-        code, message = _HTTP_ERRORS.get(
-            exc.status_code, ("request_failed", "The request could not be completed.")
-        )
+        if isinstance(exc, BodyTooLarge):
+            code, message = exc.code, exc.detail
+        else:
+            code, message = _HTTP_ERRORS.get(
+                exc.status_code, ("request_failed", "The request could not be completed.")
+            )
         return JSONResponse(
             status_code=exc.status_code,
             content={"code": code, "message": message},

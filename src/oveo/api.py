@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import re
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, cast, get_args
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
-from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.datastructures import FormData, UploadFile
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from oveo.attachments import AttachmentError, read_stored_attachment, validate_attachment_upload
 from oveo.auth import (
@@ -447,46 +450,98 @@ async def _validated_upload(request: Request, attachment: UploadFile | None) -> 
     except AttachmentError as exc:
         headers = _BUSY_RETRY_AFTER if exc.status_code == 503 else None
         raise ApiError(exc.status_code, exc.code, exc.message, headers=headers) from exc
-    finally:
-        await attachment.close()
 
 
-async def _reject_multiple_attachments(request: Request) -> None:
-    form = await request.form()
+@dataclass(frozen=True)
+class _TurnForm:
+    text: str
+    client_request_id: str
+    attachment: UploadFile | None
+    attachment_role: AttachmentRoleInput
+    mode: ThreadModeInput | None
+
+
+def _invalid_form() -> ApiError:
+    return ApiError(422, "invalid_request", "The request is invalid.")
+
+
+def _form_text(form: FormData, name: str) -> str:
+    value = form.get(name)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise _invalid_form()
+    return value
+
+
+def _form_choice(form: FormData, name: str, choices: tuple[str, ...]) -> str | None:
+    value = _form_text(form, name)
+    if not value:
+        return None
+    if value not in choices:
+        raise _invalid_form()
+    return value
+
+
+def _parsed_turn_form(form: FormData) -> _TurnForm:
+    role = _form_choice(form, "attachment_role", get_args(AttachmentRoleInput)) or "source"
+    mode = _form_choice(form, "mode", get_args(ThreadModeInput))
     uploads = form.getlist("attachment")
-    if len(uploads) <= 1:
-        return
-    for upload in uploads:
-        if isinstance(upload, StarletteUploadFile):
-            await upload.close()
-    raise ApiError(
-        422,
-        "multiple_attachments",
-        "Only one DOCX attachment is allowed per message.",
+    if len(uploads) > 1:
+        raise ApiError(
+            422,
+            "multiple_attachments",
+            "Only one DOCX attachment is allowed per message.",
+        )
+    attachment = uploads[0] if uploads else None
+    if isinstance(attachment, str):
+        if attachment:
+            raise _invalid_form()
+        attachment = None
+    return _TurnForm(
+        text=_form_text(form, "text"),
+        client_request_id=_form_text(form, "client_request_id"),
+        attachment=attachment,
+        attachment_role=cast(AttachmentRoleInput, role),
+        mode=cast(ThreadModeInput | None, mode),
     )
 
 
+@asynccontextmanager
+async def _turn_form(request: Request) -> AsyncIterator[_TurnForm]:
+    """Read a turn's form, which the route does only after checking the sign-in.
+
+    FastAPI reads declared form parameters before it resolves any dependency, so an
+    anonymous request's upload would first be spooled into the container's small /tmp.
+    The uploaded file is closed once the turn is done with it.
+    """
+
+    try:
+        form = await request.form()
+    except StarletteHTTPException:
+        raise  # The body limit, or a malformed multipart body.
+    except Exception as exc:
+        # As FastAPI's own form parsing does: a body cut off mid-way is a bad request.
+        raise ApiError(400, "invalid_request", "The request is invalid.") from exc
+    try:
+        yield _parsed_turn_form(form)
+    finally:
+        await form.close()
+
+
 @router.post("/api/threads")
-async def create_thread(
-    request: Request,
-    principal: CsrfPrincipal,
-    text: Annotated[str, Form()] = "",
-    client_request_id: Annotated[str, Form()] = "",
-    mode: Annotated[ThreadModeInput | None, Form()] = None,
-    attachment: Annotated[UploadFile | None, File()] = None,
-    attachment_role: Annotated[AttachmentRoleInput, Form()] = "source",
-) -> dict[str, str]:
-    await _reject_multiple_attachments(request)
-    validated = await _validated_upload(request, attachment)
+async def create_thread(request: Request, principal: CsrfPrincipal) -> dict[str, str]:
+    async with _turn_form(request) as form:
+        validated = await _validated_upload(request, form.attachment)
     try:
         result = await _manager(request).submit_turn(
             requester_id=principal.user.id,
-            client_request_id=client_request_id,
-            text=text,
+            client_request_id=form.client_request_id,
+            text=form.text,
             attachment=validated,
-            attachment_role=attachment_role,
+            attachment_role=form.attachment_role,
             owner_id=principal.user.id,
-            mode=mode,
+            mode=form.mode,
         )
     except GenerationError as exc:
         raise ApiError(exc.status_code, exc.code, exc.message) from exc
@@ -499,21 +554,17 @@ async def submit_message(
     request: Request,
     principal: CsrfPrincipal,
     db: Db,
-    text: Annotated[str, Form()] = "",
-    client_request_id: Annotated[str, Form()] = "",
-    attachment: Annotated[UploadFile | None, File()] = None,
-    attachment_role: Annotated[AttachmentRoleInput, Form()] = "source",
 ) -> dict[str, str]:
     _require_thread(principal, await db.get(Thread, thread_id))
-    await _reject_multiple_attachments(request)
-    validated = await _validated_upload(request, attachment)
+    async with _turn_form(request) as form:
+        validated = await _validated_upload(request, form.attachment)
     try:
         result = await _manager(request).submit_turn(
             requester_id=principal.user.id,
-            client_request_id=client_request_id,
-            text=text,
+            client_request_id=form.client_request_id,
+            text=form.text,
             attachment=validated,
-            attachment_role=attachment_role,
+            attachment_role=form.attachment_role,
             thread_id=thread_id,
         )
     except GenerationError as exc:
