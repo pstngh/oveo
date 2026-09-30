@@ -217,7 +217,8 @@ def test_protocol_has_closed_technical_grammar_without_mode_behavior() -> None:
 
 def test_brand_logo_keeps_the_verified_oveo_semantics() -> None:
     logo = (ROOT / "frontend" / "src" / "BrandLogo.tsx").read_text(encoding="utf-8")
-    assert 'aria-label={decorative ? undefined : "Oveo"}' in logo
+    assert 'aria-label="Oveo"' in logo
+    assert 'role="img"' in logo
     assert 'className="brand-mark"' in logo
     assert 'className="brand-wordmark"' in logo
     assert ">OVEO<" in logo

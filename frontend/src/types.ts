@@ -7,19 +7,15 @@ export interface ContentBlock {
   text: string;
 }
 
-export interface Account {
+export interface SessionUser {
   id: string;
   username: "charles" | "yousra";
   display_name: string;
-}
-
-export interface SessionUser extends Account {
   csrf_token?: string;
 }
 
 export interface ThreadSummary {
   id: string;
-  owner_id: string;
   mode: Mode;
   title: string;
   updated_at: string;
@@ -36,23 +32,21 @@ export interface AttachmentInfo {
 
 export interface Message {
   id: string;
-  /** Position in the conversation; absent only from servers older than this client. */
-  ordinal?: number;
+  /** Position in the conversation. */
+  ordinal: number;
   role: "user" | "assistant";
-  actor_username: string | null;
   blocks: ContentBlock[];
   attachment: AttachmentInfo | null;
   created_at: string;
 }
 
 export interface ThreadDetail extends ThreadSummary {
-  owner_username: string;
   messages: Message[];
-  docx_exportable?: boolean;
+  docx_exportable: boolean;
   /** The latest chat generation unless it completed. */
-  generation?: GenerationSnapshot | null;
+  generation: GenerationSnapshot | null;
   /** A prompt handoff that is still running, reported apart from the chat turn. */
-  handoff?: GenerationSnapshot | null;
+  handoff: GenerationSnapshot | null;
 }
 
 export interface GenerationSnapshot {
@@ -60,8 +54,8 @@ export interface GenerationSnapshot {
   thread_id: string | null;
   status: "queued" | "running" | "stopping" | "completed" | "failed" | "stopped";
   blocks: ContentBlock[];
-  error_code?: string | null;
-  error_message?: string | null;
-  retryable?: boolean;
+  error_code: string | null;
+  error_message: string | null;
+  retryable: boolean;
   seq: number;
 }

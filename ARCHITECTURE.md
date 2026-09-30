@@ -78,8 +78,8 @@ canonical versions.
 - `users` and `sessions` hold identities and revocable authentication state.
 - `threads`, immutable `messages`, and one optional role-tagged `.docx` attachment
   per user message form the visible conversation.
-- `generations` hold idempotency keys, frozen request context, status, replayable
-  partial blocks, provider IDs, and safe errors.
+- `generations` hold idempotency keys, status, the visible blocks of a finished or
+  preserved response, provider IDs, and safe errors.
 - `work_items` use kinds `translation`, `revision`, or `draft`; immutable
   `work_versions` hold complete canonical source/output/brief snapshots plus,
   when applicable, a DOCX template attachment reference and block replacements.
@@ -93,7 +93,9 @@ bounded busy timeout. Model calls and streaming never hold transactions open.
 ## Generation and canonical state
 
 The server atomically stores validated input and a queued generation, then starts
-an independent task. It composes a frozen context, calls the fixed model with
+an independent task. It composes the request context in memory (outside any write
+transaction; nothing else can change the conversation while its one generation is
+active) and keeps it for the attempt's protocol retries, calls the fixed model with
 privacy routing, and incrementally validates typed NDJSON into an in-memory draft
 (drafts are not rewritten to SQLite for every delta; only status changes and the
 final result are stored, and a restart discards drafts). Each SSE connection first
@@ -121,8 +123,8 @@ reconciliation completes any row whose answer was already committed. Retry is
 offered only for the latest chat turn that has no answer; prompt handoffs are
 reported separately from the chat turn. Message ordinals are allocated inside the
 insert, and a concurrent or repeated submission resolves to the idempotent result or
-409. The frozen request snapshot is cleared when a generation finishes; error
-codes, provider IDs, and timestamps remain as content-free diagnostics. Each
+409. The request context is never stored; error codes, provider IDs, and timestamps
+remain as content-free diagnostics. Each
 provider generation ID is recorded as a reconcilable pending usage row as soon as
 the stream names it, so stopped, cut-off, and retried calls are charged from
 OpenRouter's metadata without ever inventing an unknown amount.
@@ -162,11 +164,16 @@ event streams, timers, the tab title) belongs to a workspace that is created at 
 and discarded at sign-out or on any 401, so the next account starts from nothing. Every
 navigation invalidates responses still in flight for the previous view: a slow load,
 or a send that finishes after the user moved on, can neither replace what is shown nor
-pull the user back. Unsent text and attachments are kept per conversation. A message
-whose submission outcome is unknown stays in the composer and is sent again with the
+pull the user back. Unsent text and attachments, and whether they are being sent, are
+kept per conversation: a message still being sent stays frozen in its conversation's
+composer when the user leaves and comes back, and its answer is followed once the
+server accepts it. A message whose submission outcome is unknown (including a proxy
+error page instead of Oveo's answer) stays in the composer and is sent again with the
 same idempotency key, so the server returns the turn it may already hold instead of
 creating a second one; once the server accepts a turn, a failed refresh is reported as
-such, never as an unsent message. Conversation addresses must be UUIDs and every
+such, never as an unsent message. A startup that cannot reach Oveo offers to try again
+rather than asking for the password. Chat responses and prompt handoffs follow the
+same event stream. Conversation addresses must be UUIDs and every
 identifier is one encoded path segment. The CSRF header is read from the cookie at
 request time. The conversation list is polled every 15 seconds and only while the tab
 is visible; after a response the browser fetches only newer messages. Streamed text is

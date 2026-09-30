@@ -279,7 +279,6 @@ def test_login_submit_idempotency_handoff_and_cost(api_client: TestClient) -> No
     detail = _wait_title(api_client, ids["thread_id"])
     assert [message["role"] for message in detail["messages"]] == ["user", "assistant"]
     assert detail["title"] == "Canadian French Translation"
-    assert detail["owner_username"] == "charles"
 
     handoff = api_client.post(
         f"/api/threads/{ids['thread_id']}/prompt-handoff",
@@ -502,17 +501,11 @@ def test_charles_cannot_discover_or_access_yousra_conversations(
     assert api_client.get("/api/usage/lifetime").json() == {"formatted": "$0.000246"}
     assert api_client.post("/api/auth/logout", headers=yousra_headers).status_code == 204
 
-    charles_id, charles_csrf = _login(api_client, "charles", "charles password")
+    _charles_id, charles_csrf = _login(api_client, "charles", "charles password")
     charles_headers = {"X-CSRF-Token": charles_csrf, "Origin": "http://testserver"}
-    assert api_client.get("/api/accounts").json() == [
-        {
-            "id": charles_id,
-            "username": "charles",
-            "display_name": "Charles",
-        }
-    ]
     assert api_client.get("/api/threads").json() == []
-    assert api_client.get(f"/api/threads?owner_id={yousra_id}").status_code == 403
+    # There is no account selector: naming another account shows only one's own list.
+    assert api_client.get(f"/api/threads?owner_id={yousra_id}").json() == []
 
     thread_response = api_client.get(f"/api/threads/{ids['thread_id']}")
     assert thread_response.status_code == 404
@@ -526,19 +519,6 @@ def test_charles_cannot_discover_or_access_yousra_conversations(
         headers=charles_headers,
     )
     assert message_response.status_code == 404
-    assert (
-        api_client.post(
-            "/api/threads",
-            data={
-                "owner_id": yousra_id,
-                "mode": "translate",
-                "text": "Cross-account attempt",
-                "client_request_id": "blocked-create",
-            },
-            headers=charles_headers,
-        ).status_code
-        == 403
-    )
     # Cost is shared operational metadata; conversation content remains private.
     assert api_client.get("/api/usage/lifetime").json() == {"formatted": "$0.000246"}
 

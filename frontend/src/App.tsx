@@ -20,7 +20,7 @@ import {
 import { type FormEvent, type KeyboardEvent, type ReactNode, memo, useCallback, useEffect, useId, useRef, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { api, ApiError, setCsrfToken } from "./api";
+import { api, ApiError, NO_ANSWER, setCsrfToken } from "./api";
 import BrandLogo from "./BrandLogo";
 import { followGeneration, isTerminal } from "./stream";
 import type {
@@ -40,9 +40,6 @@ const uuid = () => crypto.randomUUID();
 const CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // The list only shows titles and activity, so a hidden tab does not poll at all.
 const THREAD_LIST_POLL_MS = 15_000;
-const HANDOFF_POLL_MS = 700;
-// Failed handoff progress reads retried (with growing pauses) before giving up.
-const HANDOFF_POLL_RETRIES = 4;
 // The history follows new text only while the reader is this close to its end.
 const FOLLOW_THRESHOLD_PX = 80;
 // Matches the breakpoint in styles.css where the sidebar becomes an off-canvas panel.
@@ -103,21 +100,16 @@ function isUnauthorized(reason: unknown) {
   return reason instanceof ApiError && reason.status === 401;
 }
 
-function delay(ms: number) {
-  return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+/** What a send reports when it failed: the server's reason, or that the outcome is unknown. */
+function sendFailure(reason: unknown) {
+  // Without an answer from Oveo (network failure, proxy error page) the message may or
+  // may not have arrived. Sending it again reuses the same request identifier.
+  return reason instanceof ApiError && reason.code !== NO_ANSWER ? reason.message : UNCONFIRMED_SEND;
 }
 
-/** Read a prompt handoff's progress, riding out a few transient failures. */
-async function readHandoff(id: string, running: () => boolean): Promise<GenerationSnapshot> {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      return await api.generation(id);
-    } catch (reason) {
-      const final = reason instanceof ApiError && [401, 403, 404].includes(reason.status);
-      if (final || attempt >= HANDOFF_POLL_RETRIES || !running()) throw reason;
-      await delay(HANDOFF_POLL_MS * 2 ** attempt);
-    }
-  }
+/** A generation the server has just accepted, shown until its first snapshot arrives. */
+function queued(id: string, threadId: string | null): GenerationSnapshot {
+  return { id, thread_id: threadId, status: "queued", blocks: [], error_code: null, error_message: null, retryable: false, seq: 0 };
 }
 
 /** Save a downloaded file under the name the server gave it. */
@@ -145,14 +137,9 @@ function viewKey(view: View) {
   return view.kind === "thread" ? `thread:${view.id}` : `new:${view.mode ?? ""}`;
 }
 
-/** The newest message ordinal shown, or undefined when a message has none (older server). */
-function knownOrdinal(detail: ThreadDetail): number | undefined {
-  let highest = 0;
-  for (const message of detail.messages) {
-    if (typeof message.ordinal !== "number") return undefined;
-    highest = Math.max(highest, message.ordinal);
-  }
-  return highest;
+/** The newest message shown (messages arrive in order). */
+function lastOrdinal(detail: ThreadDetail) {
+  return detail.messages.at(-1)?.ordinal ?? 0;
 }
 
 /** Add the messages of an incremental refresh to the conversation already shown. */
@@ -165,9 +152,10 @@ export function mergeDetail(previous: ThreadDetail | undefined, loaded: ThreadDe
 /** A refresh can return an older copy of the generation the stream already advanced. */
 function newerGeneration(previous: GenerationSnapshot | null, loaded: GenerationSnapshot | null) {
   if (!previous || !loaded || previous.id !== loaded.id) return loaded;
-  // A finished generation never runs again, and the sequence numbers of a live draft
-  // and of a stored row are not comparable.
-  if (isTerminal(previous.status) && !isTerminal(loaded.status)) return previous;
+  // A finished generation never runs again, so a finished copy wins. The sequence
+  // numbers of a live draft and of a stored row are not comparable.
+  const finished = isTerminal(previous.status);
+  if (finished !== isTerminal(loaded.status)) return finished ? previous : loaded;
   return previous.seq > loaded.seq ? previous : loaded;
 }
 
@@ -260,11 +248,9 @@ export function Login({ onLogin }: { onLogin: (user: SessionUser) => void }) {
     setBusy(true);
     setError("");
     try {
-      const user = await api.login(username.trim(), password);
-      if (user.csrf_token) setCsrfToken(user.csrf_token);
-      onLogin(user);
+      onLogin(await api.login(username.trim(), password));
     } catch (reason) {
-      setError(reason instanceof ApiError ? reason.message : "Sign-in failed. Please try again.");
+      setError(errorMessage(reason, "Sign-in failed. Please try again."));
     } finally {
       setBusy(false);
     }
@@ -351,13 +337,12 @@ export function ResponseBlocks({ blocks, streaming = false }: { blocks: ContentB
 
 // Memoized: a streamed delta re-renders only the pending answer, not every earlier
 // message (whose Markdown would otherwise be parsed again many times a second).
-const MessageItem = memo(function MessageItem({ message, ownerUsername }: { message: Message; ownerUsername: string }) {
+const MessageItem = memo(function MessageItem({ message }: { message: Message }) {
   return (
     <article className={`message ${message.role}`}>
       <div className="message-inner">
         {message.role === "assistant" ? <ResponseBlocks blocks={message.blocks} /> : (
           <>
-            {message.actor_username && message.actor_username !== ownerUsername && <div className="message-author">{message.actor_username}</div>}
             {message.blocks.map((block, index) => <p className="user-text" key={index}>{block.text}</p>)}
             {message.attachment && <div className="sent-attachment"><FileText /> <span>{message.attachment.filename}</span><small>{message.attachment.role === "reference" ? "Reference" : "Source"}</small></div>}
           </>
@@ -388,9 +373,7 @@ export function MessageList({ detail, generation }: { detail: ThreadDetail; gene
   // announces coarse status changes in its own status region instead.
   return (
     <div ref={messagesRef} className="messages" onScroll={trackPosition}>
-      {detail.messages.map((message) => (
-        <MessageItem key={message.id} message={message} ownerUsername={detail.owner_username} />
-      ))}
+      {detail.messages.map((message) => <MessageItem key={message.id} message={message} />)}
       {generation && !isTerminal(generation.status) && (
         <article className="message assistant pending"><div className="message-inner"><ResponseBlocks blocks={generation.blocks} streaming /></div></article>
       )}
@@ -417,9 +400,16 @@ export interface ComposerDraft {
   attachmentRole: AttachmentRole;
 }
 
+export const EMPTY_DRAFT: ComposerDraft = { text: "", attachmentRole: "source" };
+
+/**
+ * The message box of one conversation. Its draft belongs to the workspace, so leaving
+ * and coming back (even while it is being sent) shows the same draft in the same state.
+ */
 export function Composer({
   activeGeneration,
-  readDraft,
+  draft,
+  sending,
   onDraftChange,
   onSend,
   onStop,
@@ -427,33 +417,26 @@ export function Composer({
   onCreateHandoff,
 }: {
   activeGeneration: GenerationSnapshot | null;
-  /** The unsent draft this conversation had when its composer was last shown. */
-  readDraft?: () => ComposerDraft | undefined;
-  onDraftChange?: (draft: ComposerDraft) => void;
-  onSend: (text: string, attachment?: File, attachmentRole?: AttachmentRole) => Promise<void>;
+  draft: ComposerDraft;
+  /** The draft is being sent: it stays frozen until the server answers. */
+  sending: boolean;
+  onDraftChange: (draft: ComposerDraft) => void;
+  onSend: (draft: ComposerDraft) => Promise<void>;
   onStop: () => Promise<void>;
   onRetry: () => Promise<void>;
   onCreateHandoff?: () => void;
 }) {
-  const [draft, setDraft] = useState<ComposerDraft>(() => readDraft?.() ?? { text: "", attachmentRole: "source" });
   const [error, setError] = useState("");
-  const [busy, setBusy] = useState<"send" | "stop" | "retry" | null>(null);
+  const [busy, setBusy] = useState<"stop" | "retry" | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const { text, attachment, attachmentRole } = draft;
   const generating = Boolean(activeGeneration && !isTerminal(activeGeneration.status));
-  // While a message is being sent the draft is frozen: clearing it afterwards must not
-  // discard what was typed meanwhile.
-  const sending = busy === "send";
   const retryable = Boolean(
-    activeGeneration
-      && ["failed", "stopped"].includes(activeGeneration.status)
-      && activeGeneration.retryable !== false,
+    activeGeneration && ["failed", "stopped"].includes(activeGeneration.status) && activeGeneration.retryable,
   );
 
   function change(next: Partial<ComposerDraft>) {
-    const merged = { ...draft, ...next };
-    setDraft(merged);
-    onDraftChange?.(merged);
+    onDraftChange({ ...draft, ...next });
   }
   function acceptFile(file?: File) {
     if (!file) return;
@@ -467,20 +450,14 @@ export function Composer({
     if (fileRef.current) fileRef.current.value = "";
   }
   async function send() {
-    if ((!text.trim() && !attachment) || busy || generating) return;
-    setBusy("send");
+    if ((!text.trim() && !attachment) || sending || busy || generating) return;
     setError("");
     try {
-      if (attachment) await onSend(text, attachment, attachmentRole);
-      else await onSend(text);
-      change({ text: "", attachment: undefined, attachmentRole: "source" });
+      await onSend(draft);
       if (fileRef.current) fileRef.current.value = "";
     } catch (reason) {
-      // Without an answer from the server the message may or may not have arrived. The
-      // text stays here, and sending it again reuses the same request identifier.
-      setError(errorMessage(reason, UNCONFIRMED_SEND));
-    } finally {
-      setBusy(null);
+      // The text stays here, so it can be sent again.
+      setError(sendFailure(reason));
     }
   }
   async function run(action: "stop" | "retry", call: () => Promise<void>, fallback: string) {
@@ -526,16 +503,12 @@ export function Composer({
           <button className="icon-button attach" onClick={() => fileRef.current?.click()} disabled={generating || sending} aria-label="Attach a DOCX file"><Paperclip /></button>
           <input ref={fileRef} className="file-input" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={(e) => acceptFile(e.target.files?.[0])} />
           {generating ? (
-            <button
-              className="send-button stop"
-              onClick={() => void run("stop", onStop, "The response could not be stopped. Try again.")}
-              disabled={busy === "stop" || activeGeneration?.status === "stopping"}
-              aria-label="Stop generation"
-            >
+            // Enabled while stopping too: a second Stop finishes a stop the server lost.
+            <button className="send-button stop" onClick={() => void run("stop", onStop, "The response could not be stopped. Try again.")} disabled={busy === "stop"} aria-label="Stop generation">
               <Square />
             </button>
           ) : (
-            <button className="send-button" onClick={() => void send()} disabled={busy !== null || (!text.trim() && !attachment)} aria-label="Send message"><Send /></button>
+            <button className="send-button" onClick={() => void send()} disabled={sending || busy !== null || (!text.trim() && !attachment)} aria-label="Send message"><Send /></button>
           )}
         </div>
       </div>
@@ -570,7 +543,6 @@ export function SidebarHeader({ onClose }: { onClose: () => void }) {
 }
 
 interface HandoffView {
-  threadId: string;
   generationId: string | null;
   blocks: ContentBlock[];
   finished: boolean;
@@ -597,6 +569,9 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
   const [announcement, setAnnouncement] = useState("");
   const [signingOut, setSigningOut] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  // Unsent drafts, and the ones being sent, by conversation (see viewKey).
+  const [drafts, setDrafts] = useState<ReadonlyMap<string, ComposerDraft>>(() => new Map());
+  const [sending, setSending] = useState<ReadonlySet<string>>(() => new Set());
   const sidebarId = useId();
 
   // Every navigation stores a new view object here, so a response that arrives for a
@@ -611,18 +586,38 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
   // must not replace what a newer one showed.
   const detailRequest = useRef(0);
   const handoffRun = useRef(0);
-  const lifetime = useRef<AbortSignal | null>(null);
-  const drafts = useRef(new Map<string, ComposerDraft>());
+  const stopHandoffFollow = useRef<(() => void) | null>(null);
+  // Set at sign-out: a response that arrives afterwards must change nothing, not even
+  // the address.
+  const closed = useRef(false);
   const requestIds = useRef(new Map<string, { id: string; parts: unknown[] }>());
 
   useEffect(() => { detailRef.current = detail; }, [detail]);
   useEffect(() => {
-    const controller = new AbortController();
-    lifetime.current = controller.signal;
+    closed.current = false;
     return () => {
-      controller.abort();
+      closed.current = true;
+      stopHandoffFollow.current?.();
       document.title = "Oveo";
     };
+  }, []);
+
+  const setDraft = useCallback((key: string, draft: ComposerDraft | null) => {
+    setDrafts((previous) => {
+      const next = new Map(previous);
+      if (draft) next.set(key, draft);
+      else next.delete(key);
+      return next;
+    });
+  }, []);
+
+  const markSending = useCallback((key: string, active: boolean) => {
+    setSending((previous) => {
+      const next = new Set(previous);
+      if (active) next.add(key);
+      else next.delete(key);
+      return next;
+    });
   }, []);
 
   const refreshUsage = useCallback(() => {
@@ -642,6 +637,7 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
   }, []);
 
   const enter = useCallback((next: View, address: "push" | "replace" | "none") => {
+    if (closed.current) return;
     viewRef.current = next;
     generationEpoch.current += 1;
     setView(next);
@@ -659,7 +655,7 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
       (loaded) => {
         if (viewRef.current !== next || detailRequest.current !== request) return;
         setDetail(loaded);
-        setGeneration(loaded.generation ?? null);
+        setGeneration(loaded.generation);
       },
       (reason: unknown) => {
         if (viewRef.current !== next || isUnauthorized(reason)) return;
@@ -674,7 +670,7 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
     const target = viewRef.current;
     if (target.kind !== "thread" || target.id !== id) return true;
     const shown = detailRef.current?.id === id ? detailRef.current : undefined;
-    const after = shown ? knownOrdinal(shown) : undefined;
+    const after = shown ? lastOrdinal(shown) : undefined;
     const epoch = generationEpoch.current;
     const request = ++detailRequest.current;
     try {
@@ -683,7 +679,7 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
       if (viewRef.current !== target || detailRequest.current !== request) return true;
       setDetail((previous) => mergeDetail(previous, loaded, after !== undefined));
       if (generationEpoch.current === epoch) {
-        setGeneration((previous) => newerGeneration(previous, loaded.generation ?? null));
+        setGeneration((previous) => newerGeneration(previous, loaded.generation));
       }
       return true;
     } catch (reason) {
@@ -819,31 +815,43 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
     return id;
   }
 
-  async function send(origin: View, text: string, attachment?: File, attachmentRole?: AttachmentRole) {
+  /** A turn was refused because another one is running (for example from another tab): show that one. */
+  function showRunningTurn(reason: unknown, threadId: string | null) {
+    if (threadId && reason instanceof ApiError && reason.status === 409) void refreshDetail(threadId);
+  }
+
+  async function send(origin: View, draft: ComposerDraft) {
     const key = viewKey(origin);
     const requestKey = `send:${key}`;
-    const result = await api.submit({
-      threadId: origin.kind === "thread" ? origin.id : undefined,
-      mode: origin.kind === "new" ? origin.mode ?? undefined : undefined,
-      text,
-      attachment,
-      attachmentRole,
-      clientRequestId: requestIdFor(requestKey, [text, attachment, attachmentRole]),
-    });
+    const { text, attachment, attachmentRole } = draft;
+    markSending(key, true);
+    let result: { thread_id: string; generation_id: string };
+    try {
+      result = await api.submit({
+        threadId: origin.kind === "thread" ? origin.id : undefined,
+        mode: origin.kind === "new" ? origin.mode ?? undefined : undefined,
+        text,
+        attachment,
+        attachmentRole,
+        clientRequestId: requestIdFor(requestKey, [text, attachment, attachmentRole]),
+      });
+    } catch (reason) {
+      showRunningTurn(reason, origin.kind === "thread" ? origin.id : null);
+      throw reason;
+    } finally {
+      markSending(key, false);
+    }
     // The server has the turn now; nothing below may report the message as unsent.
     requestIds.current.delete(requestKey);
-    drafts.current.delete(key);
-    // Signed out meanwhile: this workspace is gone and must not change the address.
-    if (lifetime.current?.aborted) return;
+    setDraft(key, null);
+    if (closed.current) return;
     void refreshThreads();
-    // The user moved on while this was sending: leave them where they are.
-    if (viewRef.current !== origin) return;
-    let target = origin;
-    if (origin.kind === "new") {
-      target = { kind: "thread", id: result.thread_id };
-      enter(target, "replace");
-    }
-    adoptGeneration({ id: result.generation_id, thread_id: result.thread_id, status: "queued", blocks: [], seq: 0 });
+    // The user moved on while this was sending: leave them where they are. Coming back
+    // to the same conversation counts as being there.
+    if (viewKey(viewRef.current) !== key) return;
+    if (origin.kind === "new") enter({ kind: "thread", id: result.thread_id }, "replace");
+    const target = viewRef.current;
+    adoptGeneration(queued(result.generation_id, result.thread_id));
     if (!(await refreshDetail(result.thread_id)) && viewRef.current === target) {
       setNotice("Your message was sent, but the conversation could not be refreshed. Reload the page if it does not update.");
     }
@@ -852,10 +860,16 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
   async function retry(failed: GenerationSnapshot) {
     const origin = viewRef.current;
     const requestKey = `retry:${failed.id}`;
-    const result = await api.retry(failed.id, requestIdFor(requestKey, []));
+    let result: { generation_id: string };
+    try {
+      result = await api.retry(failed.id, requestIdFor(requestKey, []));
+    } catch (reason) {
+      showRunningTurn(reason, failed.thread_id);
+      throw reason;
+    }
     requestIds.current.delete(requestKey);
     if (viewRef.current !== origin) return;
-    adoptGeneration({ id: result.generation_id, thread_id: failed.thread_id, status: "queued", blocks: [], seq: 0 });
+    adoptGeneration(queued(result.generation_id, failed.thread_id));
   }
 
   function openThread(id: string) {
@@ -886,62 +900,80 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
       }
     }
     closeDelete();
-    drafts.current.delete(viewKey({ kind: "thread", id: target.id }));
+    setDraft(viewKey({ kind: "thread", id: target.id }), null);
     const shown = viewRef.current;
     if (shown.kind === "thread" && shown.id === target.id) enter({ kind: "new", mode: null }, "replace");
     void refreshThreads();
   }
 
+  function clearShownHandoff(generationId: string) {
+    setDetail((shown) => (shown?.handoff?.id === generationId ? { ...shown, handoff: null } : shown));
+  }
+
+  function stopFollowingHandoff() {
+    stopHandoffFollow.current?.();
+    stopHandoffFollow.current = null;
+  }
+
   async function createHandoff(conversation: ThreadDetail) {
+    stopFollowingHandoff();
     const run = ++handoffRun.current;
-    const signal = lifetime.current;
-    const running = () => handoffRun.current === run && !signal?.aborted;
-    const threadId = conversation.id;
-    const requestKey = `handoff:${threadId}`;
+    const running = () => handoffRun.current === run && !closed.current;
     // A handoff still running from before (for example across a reload) is followed
     // instead of starting a second one, which the server would refuse.
     let generationId = conversation.handoff && !isTerminal(conversation.handoff.status) ? conversation.handoff.id : null;
-    setHandoff({ threadId, generationId, blocks: [], finished: false });
-    try {
-      if (!generationId) {
+    setHandoff({ generationId, blocks: [], finished: false });
+    if (!generationId) {
+      const requestKey = `handoff:${conversation.id}`;
+      try {
         // A handoff requested after new turns is a new request, even if an earlier
         // attempt's outcome was unknown.
-        const requestId = requestIdFor(requestKey, [knownOrdinal(conversation)]);
-        generationId = (await api.handoff(threadId, requestId)).generation_id;
-        requestIds.current.delete(requestKey);
-        if (!running()) {
-          // Closed while it was being created.
-          void api.stop(generationId).catch(() => undefined);
-          return;
-        }
-        setHandoff({ threadId, generationId, blocks: [], finished: false });
-      }
-      let snapshot = await readHandoff(generationId, running);
-      while (running()) {
-        const finished = isTerminal(snapshot.status);
-        setHandoff({ threadId, generationId, blocks: snapshot.blocks, finished });
-        if (finished) break;
-        await delay(HANDOFF_POLL_MS);
+        generationId = (await api.handoff(conversation.id, requestIdFor(requestKey, [lastOrdinal(conversation)]))).generation_id;
+      } catch (reason) {
         if (!running()) return;
-        snapshot = await readHandoff(generationId, running);
+        setHandoff(null);
+        if (!isUnauthorized(reason)) setGlobalError(errorMessage(reason, "Prompt handoff could not be created."));
+        return;
       }
-      if (!running()) return;
-      setDetail((shown) => (shown?.id === threadId && shown.handoff ? { ...shown, handoff: null } : shown));
-      if (snapshot.status !== "completed") setGlobalError(snapshot.error_message ?? "Prompt handoff could not be created.");
-      refreshUsage();
-    } catch (reason) {
-      if (!running()) return;
-      setHandoff(null);
-      if (isUnauthorized(reason)) return;
-      if (generationId !== null) {
-        // No longer followed, it would keep running (and be paid for) unseen and keep
-        // the conversation busy, as when the dialog is closed.
-        const abandoned = generationId;
-        void api.stop(abandoned).catch(() => undefined);
-        setDetail((shown) => (shown?.handoff?.id === abandoned ? { ...shown, handoff: null } : shown));
+      requestIds.current.delete(requestKey);
+      if (!running()) {
+        // Closed while it was being created.
+        void api.stop(generationId).catch(() => undefined);
+        return;
       }
-      setGlobalError(errorMessage(reason, "Prompt handoff could not be created."));
+      setHandoff({ generationId, blocks: [], finished: false });
     }
+    const followed = generationId;
+    stopHandoffFollow.current = followGeneration(followed, {
+      onUpdate: (snapshot) => {
+        const finished = isTerminal(snapshot.status);
+        setHandoff({ generationId: followed, blocks: snapshot.blocks, finished });
+        if (!finished) return;
+        clearShownHandoff(followed);
+        if (snapshot.status !== "completed") setGlobalError(snapshot.error_message ?? "Prompt handoff could not be created.");
+        refreshUsage();
+      },
+      onUnavailable: () => {
+        // Signed out, or its conversation was deleted: nothing is left to follow or stop.
+        stopFollowingHandoff();
+        setHandoff(null);
+        clearShownHandoff(followed);
+        setGlobalError("The prompt handoff is no longer available.");
+      },
+    });
+  }
+
+  function closeHandoff() {
+    handoffRun.current += 1;
+    stopFollowingHandoff();
+    const closing = handoff;
+    setHandoff(null);
+    if (!closing?.generationId || closing.finished) return;
+    // A handoff is shown only in this dialog: left running, it would be paid for without
+    // ever being seen and would keep the conversation busy. The dialog says so.
+    const generationId = closing.generationId;
+    void api.stop(generationId).catch(() => undefined);
+    clearShownHandoff(generationId);
   }
 
   async function downloadDocument(conversation: ThreadDetail) {
@@ -957,18 +989,6 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
     } finally {
       setDownloading(false);
     }
-  }
-
-  function closeHandoff() {
-    handoffRun.current += 1;
-    const closing = handoff;
-    setHandoff(null);
-    if (!closing?.generationId || closing.finished) return;
-    // A handoff is shown only in this dialog: left running, it would be paid for without
-    // ever being seen and would keep the conversation busy. The dialog says so.
-    const generationId = closing.generationId;
-    void api.stop(generationId).catch(() => undefined);
-    setDetail((shown) => (shown?.handoff?.id === generationId ? { ...shown, handoff: null } : shown));
   }
 
   async function logout() {
@@ -1025,9 +1045,10 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
           <Composer
             key={draftKey}
             activeGeneration={active}
-            readDraft={() => drafts.current.get(draftKey)}
-            onDraftChange={(next) => drafts.current.set(draftKey, next)}
-            onSend={(text, attachment, attachmentRole) => send(view, text, attachment, attachmentRole)}
+            draft={drafts.get(draftKey) ?? EMPTY_DRAFT}
+            sending={sending.has(draftKey)}
+            onDraftChange={(next) => setDraft(draftKey, next)}
+            onSend={(next) => send(view, next)}
             onStop={() => (active ? api.stop(active.id) : Promise.resolve())}
             onRetry={() => (active ? retry(active) : Promise.resolve())}
             onCreateHandoff={current ? () => void createHandoff(current) : undefined}
@@ -1062,19 +1083,27 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
 }
 
 export default function App() {
+  // undefined while the session is being checked; null when signed out.
   const [session, setSession] = useState<{ user: SessionUser; key: number } | null | undefined>(undefined);
+  const [unreachable, setUnreachable] = useState(false);
   const signIns = useRef(0);
 
-  const bootstrap = useCallback(async () => {
-    try {
-      const current = await api.me();
-      if (current.csrf_token) setCsrfToken(current.csrf_token);
-      signIns.current += 1;
-      setSession({ user: current, key: signIns.current });
-    } catch {
-      setSession(null);
-    }
+  const start = useCallback((user: SessionUser) => {
+    if (user.csrf_token) setCsrfToken(user.csrf_token);
+    signIns.current += 1;
+    setSession({ user, key: signIns.current });
   }, []);
+  const bootstrap = useCallback(async () => {
+    setUnreachable(false);
+    try {
+      start(await api.me());
+    } catch (reason) {
+      // Only a refused session means signed out. Anything else (offline, a restart in
+      // progress) must not ask for the password again and start a second session.
+      if (isUnauthorized(reason)) setSession(null);
+      else setUnreachable(true);
+    }
+  }, [start]);
   useEffect(() => { void bootstrap(); }, [bootstrap]);
   useEffect(() => {
     const unauthorized = () => setSession(null);
@@ -1089,7 +1118,18 @@ export default function App() {
     return () => window.removeEventListener("popstate", normalizeAddress);
   }, [session]);
 
+  if (unreachable) {
+    return (
+      <main className="login-page">
+        <div className="login-card">
+          <BrandLogo />
+          <p className="form-error" role="alert">Oveo could not be reached. Check your connection and try again.</p>
+          <button className="primary-button" onClick={() => void bootstrap()}>Try again</button>
+        </div>
+      </main>
+    );
+  }
   if (session === undefined) return <div className="app-loading"><BrandLogo /></div>;
-  if (!session) return <Login onLogin={() => void bootstrap()} />;
+  if (!session) return <Login onLogin={start} />;
   return <Workspace key={session.key} user={session.user} onSignedOut={() => setSession(null)} />;
 }

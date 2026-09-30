@@ -1,4 +1,4 @@
-import type { Account, AttachmentRole, GenerationSnapshot, SessionUser, ThreadDetail, ThreadSummary } from "./types";
+import type { AttachmentRole, GenerationSnapshot, SessionUser, ThreadDetail, ThreadSummary } from "./types";
 
 // Used only when the cookie below cannot be read (a server configured with another
 // cookie name). The cookie is authoritative: signing in again, in this tab or another
@@ -14,6 +14,9 @@ function cookie(name: string): string {
 export function setCsrfToken(token: string): void {
   fallbackCsrfToken = token;
 }
+
+/** The code of a failure that Oveo itself did not answer, whatever its outcome. */
+export const NO_ANSWER = "request_failed";
 
 export class ApiError extends Error {
   constructor(
@@ -39,8 +42,9 @@ async function send(path: string, init: RequestInit = {}): Promise<Response> {
   const response = await fetch(path, { ...init, headers, credentials: "same-origin" });
   if (response.status === 401) window.dispatchEvent(new Event("oveo:unauthorized"));
   if (!response.ok) {
+    // A proxy error page (502, 504) is not JSON: Oveo itself did not answer.
     const body = await response.json().catch(() => ({}));
-    throw new ApiError(response.status, body.code ?? "request_failed", body.message ?? "Request failed.");
+    throw new ApiError(response.status, body.code ?? NO_ANSWER, body.message ?? "Request failed.");
   }
   return response;
 }
@@ -70,7 +74,6 @@ export const api = {
   login: (username: string, password: string) =>
     request<SessionUser>("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<void>("/api/auth/logout", { method: "POST" }),
-  accounts: () => request<Account[]>("/api/accounts"),
   threads: () => request<ThreadSummary[]>("/api/threads"),
   /** A conversation; with `afterOrdinal`, only the messages newer than that one. */
   thread: (id: string, afterOrdinal?: number) =>
@@ -85,8 +88,6 @@ export const api = {
       filename: attachmentFilename(response.headers.get("Content-Disposition"), "document-oveo.docx"),
     };
   },
-  rename: (id: string, title: string) =>
-    request<ThreadSummary>(`/api/threads/${segment(id)}`, { method: "PATCH", body: JSON.stringify({ title }) }),
   deleteThread: (id: string) => request<void>(`/api/threads/${segment(id)}`, { method: "DELETE" }),
   submit: async (args: {
     threadId?: string;

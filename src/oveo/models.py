@@ -13,13 +13,20 @@ from sqlalchemy import (
     Index,
     Integer,
     LargeBinary,
+    Select,
     String,
     Text,
     UniqueConstraint,
     event,
+    select,
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+# A conversation keeps this title until its first answer names it.
+DEFAULT_THREAD_TITLE = "New conversation"
+# Generation statuses that still own their thread (at most one per thread).
+ACTIVE_GENERATION_STATUSES = ("queued", "running", "stopping")
 
 
 def new_id() -> str:
@@ -310,3 +317,15 @@ class UsageEvent(Base, TimestampMixin):
 @event.listens_for(UsageEvent, "before_delete")
 def _usage_events_are_append_only(*_args: object, **_kwargs: object) -> None:
     raise ValueError("usage events are append-only")
+
+
+def latest_work_version(thread_id: str) -> Select[tuple[WorkVersion]]:
+    """The newest version of a conversation's active work item (at most one row)."""
+
+    return (
+        select(WorkVersion)
+        .join(WorkItem, WorkVersion.work_item_id == WorkItem.id)
+        .where(WorkItem.thread_id == thread_id, WorkItem.active.is_(True))
+        .order_by(WorkVersion.version_no.desc())
+        .limit(1)
+    )

@@ -79,6 +79,9 @@ case "$status" in
   *) die "the backup could not be created" ;;
 esac
 age --recipient "$AGE_RECIPIENT" --output "$encrypted" "$plain"
+# Each plaintext step is removed once the next one exists, so the staging directory
+# never holds more than three copies of the data (the host disk is small).
+rm -f -- "$plain"
 age --decrypt --identity "$AGE_IDENTITY_FILE" --output "$verified" "$encrypted"
 verify_dir=$staging/verified
 if [ "$complete" = true ]; then
@@ -86,6 +89,7 @@ if [ "$complete" = true ]; then
 else
   python3 "$tool" restore --allow-incomplete --archive "$verified" --destination "$verify_dir"
 fi
+rm -rf -- "$verified" "$verify_dir"
 chmod 0600 "$encrypted"
 
 if [ "$complete" = false ]; then

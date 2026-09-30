@@ -30,6 +30,15 @@ jobs:
       - run: uv run --frozen ruff check .
       - run: uv run --frozen mypy
       - run: uv run --frozen pytest
+      # The host scripts move production data. The runner has no unprivileged user
+      # namespaces, so their tests run here as root, and must run rather than skip.
+      - name: Host-script tests as root
+        env:
+          OVEO_REQUIRE_HOST_TESTS: "1"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: >-
+          sudo --preserve-env=OVEO_REQUIRE_HOST_TESTS,PYTHONDONTWRITEBYTECODE
+          .venv/bin/python -m pytest -p no:cacheprovider -rs tests/test_host_scripts.py
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import hashlib
 import re
 from collections.abc import AsyncIterator
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 from urllib.parse import quote
@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from oveo.attachments import AttachmentError, validate_attachment_upload
+from oveo.attachments import AttachmentError, read_stored_attachment, validate_attachment_upload
 from oveo.auth import (
     InvalidCredentials,
     LoginThrottled,
@@ -28,20 +28,21 @@ from oveo.auth import (
     session_is_active,
     validate_csrf,
 )
-from oveo.authorization import may_access_thread
 from oveo.config import Settings
 from oveo.db import Database
 from oveo.docx import DOCX_MEDIA_TYPE, DocxError, docx_uncompressed_limit, render_docx
 from oveo.generation import GenerationError, GenerationManager
 from oveo.login_guard import LoginBusy, LoginGuard
 from oveo.models import (
+    ACTIVE_GENERATION_STATUSES,
+    DEFAULT_THREAD_TITLE,
     Attachment,
     Generation,
     Message,
     Thread,
     User,
-    WorkItem,
     WorkVersion,
+    latest_work_version,
 )
 from oveo.usage import format_lifetime_cost, lifetime_total
 from oveo.workers import WorkerBusy
@@ -139,11 +140,9 @@ def _account(user: User) -> dict[str, str]:
 
 
 def _require_thread(principal: SessionPrincipal, thread: Thread | None) -> Thread:
-    if thread is None:
-        raise ApiError(404, "thread_not_found", "Conversation not found.")
-    if not may_access_thread(principal.user, thread):
-        # Match the missing-record response so conversation IDs cannot be used to
-        # discover another account's records.
+    # Every conversation is private to its owner. Another account's conversation gets the
+    # missing-record response, so its ID cannot be used to discover it.
+    if thread is None or thread.owner_id != principal.user.id:
         raise ApiError(404, "thread_not_found", "Conversation not found.")
     return thread
 
@@ -274,23 +273,11 @@ async def me(request: Request, principal: Principal) -> dict[str, str]:
     return result
 
 
-@router.get("/api/accounts")
-async def accounts(principal: Principal) -> list[dict[str, str]]:
-    return [_account(principal.user)]
-
-
-_ACTIVE_STATUSES = ("queued", "running", "stopping")
-
-
-def _thread_summary(
-    thread: Thread, *, owner_username: str, active_generation_id: str | None
-) -> dict[str, Any]:
+def _thread_summary(thread: Thread, *, active_generation_id: str | None) -> dict[str, Any]:
     return {
         "id": thread.id,
-        "owner_id": thread.owner_id,
-        "owner_username": owner_username,
         "mode": thread.mode,
-        "title": thread.title or "New conversation",
+        "title": thread.title or DEFAULT_THREAD_TITLE,
         "updated_at": thread.updated_at.isoformat(),
         "active_generation_id": active_generation_id,
     }
@@ -302,18 +289,15 @@ async def _active_generation_id(db: AsyncSession, thread_id: str) -> str | None:
         str | None,
         await db.scalar(
             select(Generation.id).where(
-                Generation.thread_id == thread_id, Generation.status.in_(_ACTIVE_STATUSES)
+                Generation.thread_id == thread_id,
+                Generation.status.in_(ACTIVE_GENERATION_STATUSES),
             )
         ),
     )
 
 
 @router.get("/api/threads")
-async def list_threads(
-    principal: Principal, db: Db, owner_id: str | None = None
-) -> list[dict[str, Any]]:
-    if owner_id is not None and owner_id != principal.user.id:
-        raise ApiError(403, "forbidden", "You cannot view that account.")
+async def list_threads(principal: Principal, db: Db) -> list[dict[str, Any]]:
     # One query for the whole list: every thread here belongs to the principal, and the
     # join can match at most one active generation per thread.
     rows = await db.execute(
@@ -322,17 +306,13 @@ async def list_threads(
         .options(defer(Thread.context_summary))
         .outerjoin(
             Generation,
-            (Generation.thread_id == Thread.id) & Generation.status.in_(_ACTIVE_STATUSES),
+            (Generation.thread_id == Thread.id) & Generation.status.in_(ACTIVE_GENERATION_STATUSES),
         )
         .where(Thread.owner_id == principal.user.id)
         .order_by(Thread.updated_at.desc())
     )
     return [
-        _thread_summary(
-            thread,
-            owner_username=principal.user.username,
-            active_generation_id=active_generation_id,
-        )
+        _thread_summary(thread, active_generation_id=active_generation_id)
         for thread, active_generation_id in rows.tuples()
     ]
 
@@ -345,19 +325,6 @@ def _message_blocks(message: Message) -> list[dict[str, str]]:
         for block in message.content
         if isinstance(block, dict)
     ]
-
-
-async def _latest_work_version(db: AsyncSession, thread_id: str) -> WorkVersion | None:
-    return cast(
-        WorkVersion | None,
-        await db.scalar(
-            select(WorkVersion)
-            .join(WorkItem, WorkVersion.work_item_id == WorkItem.id)
-            .where(WorkItem.thread_id == thread_id, WorkItem.active.is_(True))
-            .order_by(WorkVersion.version_no.desc())
-            .limit(1)
-        ),
-    )
 
 
 @router.get("/api/threads/{thread_id}")
@@ -376,19 +343,12 @@ async def thread_detail(
 
     thread = _require_thread(principal, await db.get(Thread, thread_id))
     summary = _thread_summary(
-        thread,
-        owner_username=principal.user.username,
-        active_generation_id=await _active_generation_id(db, thread.id),
+        thread, active_generation_id=await _active_generation_id(db, thread.id)
     )
     message_query = select(Message).where(Message.thread_id == thread.id)
     if after_ordinal is not None:
         message_query = message_query.where(Message.ordinal > after_ordinal)
     messages = list((await db.execute(message_query.order_by(Message.ordinal))).scalars())
-    actor_ids = {message.actor_user_id for message in messages if message.actor_user_id}
-    actors = {
-        user.id: user.username
-        for user in (await db.execute(select(User).where(User.id.in_(actor_ids)))).scalars()
-    }
     # Display metadata only: the stored block map of each document is not needed here.
     attachment_rows = await db.execute(
         select(
@@ -406,15 +366,11 @@ async def thread_detail(
     serialized_messages: list[dict[str, Any]] = []
     for message in messages:
         attachment = attachments.get(message.id)
-        actor_username = None
-        if message.actor_user_id is not None and message.actor_user_id != thread.owner_id:
-            actor_username = actors.get(message.actor_user_id)
         serialized_messages.append(
             {
                 "id": message.id,
                 "ordinal": message.ordinal,
                 "role": message.role,
-                "actor_username": actor_username,
                 "blocks": _message_blocks(message),
                 "attachment": (
                     {
@@ -448,7 +404,7 @@ async def thread_detail(
         select(Generation.id).where(
             Generation.thread_id == thread.id,
             Generation.purpose == "prompt_handoff",
-            Generation.status.in_(("queued", "running", "stopping")),
+            Generation.status.in_(ACTIVE_GENERATION_STATUSES),
         )
     )
     handoff_snapshot = (
@@ -457,14 +413,10 @@ async def thread_detail(
     # Two columns of the latest version, not its full source, output and block map.
     latest_version = (
         await db.execute(
-            select(
+            latest_work_version(thread.id).with_only_columns(
                 WorkVersion.docx_template_attachment_id,
                 WorkVersion.docx_blocks.is_not(None).label("has_docx_blocks"),
             )
-            .join(WorkItem, WorkVersion.work_item_id == WorkItem.id)
-            .where(WorkItem.thread_id == thread.id, WorkItem.active.is_(True))
-            .order_by(WorkVersion.version_no.desc())
-            .limit(1)
         )
     ).first()
     return {
@@ -518,16 +470,12 @@ async def _reject_multiple_attachments(request: Request) -> None:
 async def create_thread(
     request: Request,
     principal: CsrfPrincipal,
-    db: Db,
     text: Annotated[str, Form()] = "",
     client_request_id: Annotated[str, Form()] = "",
-    owner_id: Annotated[str, Form()] = "",
     mode: Annotated[ThreadModeInput | None, Form()] = None,
     attachment: Annotated[UploadFile | None, File()] = None,
     attachment_role: Annotated[AttachmentRoleInput, Form()] = "source",
 ) -> dict[str, str]:
-    if owner_id and owner_id != principal.user.id:
-        raise ApiError(403, "forbidden", "You cannot create a conversation for that account.")
     await _reject_multiple_attachments(request)
     validated = await _validated_upload(request, attachment)
     try:
@@ -583,11 +531,7 @@ async def rename_thread(
         raise ApiError(422, "invalid_title", "Enter a conversation title.")
     thread.title = title
     await db.commit()
-    return _thread_summary(
-        thread,
-        owner_username=principal.user.username,
-        active_generation_id=await _active_generation_id(db, thread.id),
-    )
+    return _thread_summary(thread, active_generation_id=await _active_generation_id(db, thread.id))
 
 
 @router.delete("/api/threads/{thread_id}", status_code=204)
@@ -622,7 +566,7 @@ async def download_document(
     thread_id: str, request: Request, principal: Principal, db: Db
 ) -> Response:
     thread = _require_thread(principal, await db.get(Thread, thread_id))
-    version = await _latest_work_version(db, thread.id)
+    version = await db.scalar(latest_work_version(thread.id))
     if (
         version is None
         or version.docx_template_attachment_id is None
@@ -634,31 +578,28 @@ async def download_document(
             "This conversation has no committed DOCX document to download.",
         )
     attachment = await db.get(Attachment, version.docx_template_attachment_id)
-    if attachment is None or attachment.media_type != DOCX_MEDIA_TYPE:
+    if attachment is None:
         raise ApiError(
             409,
             "docx_export_unavailable",
             "The DOCX template for this document is unavailable.",
         )
-    attachment_root = _settings(request).attachments_dir.resolve()
-    template_path = (attachment_root / attachment.storage_name).resolve()
-    if template_path.parent != attachment_root:
-        raise ApiError(409, "docx_export_unavailable", "The DOCX template is unavailable.")
 
     # Plain values only: the worker thread must not touch session-bound ORM objects.
+    settings = _settings(request)
     replacements = list(version.docx_blocks or [])
     stored_blocks = attachment.document_blocks
-    expected_size = attachment.byte_count
-    expected_sha256 = attachment.sha256
-    max_uncompressed = docx_uncompressed_limit(_settings(request).max_upload_bytes)
+    read_template = partial(
+        read_stored_attachment,
+        settings.attachments_dir,
+        attachment.storage_name,
+        byte_count=attachment.byte_count,
+        sha256=attachment.sha256,
+    )
+    max_uncompressed = docx_uncompressed_limit(settings.max_upload_bytes)
 
     def export() -> bytes:
-        template = template_path.read_bytes()
-        if (
-            len(template) != expected_size
-            or hashlib.sha256(template).hexdigest() != expected_sha256
-        ):
-            raise OSError("attachment integrity mismatch")
+        template = read_template()
         # A stored map from the earlier text-box-unsafe extractor fails closed here.
         return render_docx(
             template,

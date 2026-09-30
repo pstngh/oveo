@@ -4,7 +4,8 @@ import type { ContentBlock, GenerationSnapshot } from "./types";
 export type DeltaOp =
   | { op: "start"; type: ContentBlock["type"] }
   | { op: "append"; text: string }
-  | { op: "status"; status: GenerationSnapshot["status"] };
+  // Terminal statuses arrive only as snapshots.
+  | { op: "status"; status: "running" | "stopping" };
 
 export interface GenerationDelta {
   from: number;
@@ -15,9 +16,6 @@ export interface GenerationDelta {
 const TERMINAL = new Set<GenerationSnapshot["status"]>(["completed", "failed", "stopped"]);
 const POLL_MS = 2000;
 const RENDER_MS = 50;
-const MAX_RESYNCS = 3;
-// Reconnecting after a missed delta waits a little longer each time.
-const RESYNC_DELAY_MS = 250;
 
 export function isTerminal(status: GenerationSnapshot["status"]) {
   return TERMINAL.has(status);
@@ -43,9 +41,10 @@ export function applyDelta(snapshot: GenerationSnapshot, delta: GenerationDelta)
 }
 
 /**
- * Follow one generation: a snapshot on connect, then small ordered deltas. A gap or a
- * reconnect starts over from a fresh snapshot; a stream the browser gave up on (for
- * example after 401 or 404) falls back to polling. Returns a function that stops it.
+ * Follow one generation: a snapshot on connect, then small ordered deltas. A reconnect
+ * starts over from a fresh snapshot (the server also resends one instead of leaving a
+ * gap). A stream the browser gave up on (for example after 401 or 404), or a delta that
+ * does not follow, falls back to polling. Returns a function that stops it.
  */
 export function followGeneration(
   id: string,
@@ -54,10 +53,8 @@ export function followGeneration(
   let current: GenerationSnapshot | null = null;
   let source: EventSource | null = null;
   let stopped = false;
-  let resyncs = 0;
   let pollTimer: number | undefined;
   let renderTimer: number | undefined;
-  let reopenTimer: number | undefined;
 
   const publish = (immediate: boolean) => {
     if (stopped || !current) return;
@@ -114,15 +111,10 @@ export function followGeneration(
       if (!current) return;
       const next = applyDelta(current, JSON.parse((event as MessageEvent<string>).data) as GenerationDelta);
       if (!next) {
-        // A missed delta: reconnect, which starts over from a fresh snapshot. Every
-        // reconnect starts with a snapshot, so only an applied delta shows the stream
-        // is healthy again; repeated gaps fall back to polling.
         close();
-        if (resyncs++ < MAX_RESYNCS) reopenTimer = window.setTimeout(open, RESYNC_DELAY_MS * resyncs);
-        else void poll();
+        void poll();
         return;
       }
-      resyncs = 0;
       // Status changes render at once; text deltas are coalesced.
       const statusChanged = next.status !== current.status;
       current = next;
@@ -144,6 +136,5 @@ export function followGeneration(
     close();
     window.clearTimeout(pollTimer);
     window.clearTimeout(renderTimer);
-    window.clearTimeout(reopenTimer);
   };
 }

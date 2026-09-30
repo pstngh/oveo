@@ -2,11 +2,59 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useState } from "react";
-import App, { canonicalPath, Composer, conversationIdFromPath, conversationPath, EmptyThread, Login, MessageList, Modal, ResponseBlocks, SidebarHeader } from "./App";
+import App, { canonicalPath, Composer, type ComposerDraft, conversationIdFromPath, conversationPath, EMPTY_DRAFT, EmptyThread, Login, MessageList, Modal, ResponseBlocks, SidebarHeader } from "./App";
 import { api, ApiError, attachmentFilename } from "./api";
 import type { GenerationSnapshot, ThreadDetail } from "./types";
 
 const THREAD_ID = "3f2c8a1e-5b7d-4c9a-8e1f-2a6b9c0d4e57";
+
+const thread = (extra: Partial<ThreadDetail> = {}): ThreadDetail => ({
+  id: THREAD_ID,
+  mode: "translate",
+  title: "Word translation",
+  updated_at: "2026-09-16T00:00:00Z",
+  active_generation_id: null,
+  docx_exportable: false,
+  generation: null,
+  handoff: null,
+  messages: [],
+  ...extra,
+});
+
+/** A composer whose draft is kept the way the workspace keeps it. */
+function TestComposer({
+  activeGeneration = null,
+  onSend = vi.fn().mockResolvedValue(undefined),
+  onCreateHandoff,
+}: {
+  activeGeneration?: GenerationSnapshot | null;
+  onSend?: (draft: ComposerDraft) => Promise<void>;
+  onCreateHandoff?: () => void;
+}) {
+  const [draft, setDraft] = useState(EMPTY_DRAFT);
+  const [sending, setSending] = useState(false);
+  async function send(next: ComposerDraft) {
+    setSending(true);
+    try {
+      await onSend(next);
+      setDraft(EMPTY_DRAFT);
+    } finally {
+      setSending(false);
+    }
+  }
+  return (
+    <Composer
+      activeGeneration={activeGeneration}
+      draft={draft}
+      sending={sending}
+      onDraftChange={setDraft}
+      onSend={send}
+      onStop={vi.fn()}
+      onRetry={vi.fn()}
+      onCreateHandoff={onCreateHandoff}
+    />
+  );
+}
 
 afterEach(() => {
   cleanup();
@@ -60,23 +108,12 @@ describe("authenticated bootstrap", () => {
     });
     vi.spyOn(api, "threads").mockResolvedValue([{
       id: THREAD_ID,
-      owner_id: "user-1",
       mode: "translate",
       title: "Word translation",
       updated_at: "2026-09-16T00:00:00Z",
       active_generation_id: null,
     }]);
-    vi.spyOn(api, "thread").mockResolvedValue({
-      id: THREAD_ID,
-      owner_id: "user-1",
-      owner_username: "charles",
-      mode: "translate",
-      title: "Word translation",
-      updated_at: "2026-09-16T00:00:00Z",
-      active_generation_id: null,
-      docx_exportable: true,
-      messages: [],
-    });
+    vi.spyOn(api, "thread").mockResolvedValue(thread({ docx_exportable: true }));
     vi.spyOn(api, "usage").mockResolvedValue({ formatted: "$0.00" });
 
     const exported = new Blob(["docx"]);
@@ -107,17 +144,7 @@ describe("authenticated bootstrap", () => {
     });
     window.history.replaceState(null, "", `/conversations/${THREAD_ID}`);
     vi.spyOn(api, "threads").mockResolvedValue([]);
-    vi.spyOn(api, "thread").mockResolvedValue({
-      id: THREAD_ID,
-      owner_id: "user-1",
-      owner_username: "charles",
-      mode: "translate",
-      title: "Word translation",
-      updated_at: "2026-09-16T00:00:00Z",
-      active_generation_id: null,
-      docx_exportable: true,
-      messages: [],
-    });
+    vi.spyOn(api, "thread").mockResolvedValue(thread({ docx_exportable: true }));
     vi.spyOn(api, "usage").mockResolvedValue({ formatted: "$0.00" });
     vi.spyOn(api, "document").mockRejectedValue(
       new ApiError(503, "document_worker_busy", "Oveo is processing another document. Try again in a moment."),
@@ -198,7 +225,7 @@ describe("deliverable copy", () => {
 
 describe("composer attachments", () => {
   it("does not render keyboard shortcut hint text", () => {
-    render(<Composer activeGeneration={null} onSend={vi.fn()} onStop={vi.fn()} onRetry={vi.fn()} />);
+    render(<TestComposer />);
 
     expect(screen.queryByText("Enter to send · Shift+Enter for a new line")).not.toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "Message" })).toHaveAttribute("rows", "3");
@@ -207,7 +234,7 @@ describe("composer attachments", () => {
   it("shows prompt handoff as a compact composer icon", async () => {
     const user = userEvent.setup();
     const onCreateHandoff = vi.fn();
-    render(<Composer activeGeneration={null} onSend={vi.fn()} onStop={vi.fn()} onRetry={vi.fn()} onCreateHandoff={onCreateHandoff} />);
+    render(<TestComposer onCreateHandoff={onCreateHandoff} />);
 
     const handoff = screen.getByRole("button", { name: "Create prompt handoff" });
     expect(handoff).not.toHaveTextContent("Create prompt handoff");
@@ -218,19 +245,19 @@ describe("composer attachments", () => {
   it("keeps a 4,000-character paste in the message", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn().mockResolvedValue(undefined);
-    render(<Composer activeGeneration={null} onSend={onSend} onStop={vi.fn()} onRetry={vi.fn()} />);
+    render(<TestComposer onSend={onSend} />);
     const textbox = screen.getByRole("textbox", { name: "Message" });
     await user.type(textbox, "Translate this carefully: ");
     textbox.focus();
     await user.paste("x".repeat(4000));
     expect(textbox).toHaveValue(`Translate this carefully: ${"x".repeat(4000)}`);
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    expect(onSend).toHaveBeenCalledWith(`Translate this carefully: ${"x".repeat(4000)}`);
+    expect(onSend.mock.calls[0][0]).toMatchObject({ text: `Translate this carefully: ${"x".repeat(4000)}` });
   });
 
   it("rejects a second attachment without replacing the first", async () => {
     const user = userEvent.setup();
-    render(<Composer activeGeneration={null} onSend={vi.fn()} onStop={vi.fn()} onRetry={vi.fn()} />);
+    render(<TestComposer />);
     const input = document.querySelector('input[type="file"]') as HTMLInputElement;
     await user.upload(input, new File(["first"], "first.docx", { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }));
     await user.upload(input, new File(["second"], "second.docx", { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }));
@@ -239,7 +266,7 @@ describe("composer attachments", () => {
   });
 
   it("rejects a text file upload", () => {
-    render(<Composer activeGeneration={null} onSend={vi.fn()} onStop={vi.fn()} onRetry={vi.fn()} />);
+    render(<TestComposer />);
     const input = document.querySelector('input[type="file"]') as HTMLInputElement;
 
     fireEvent.change(input, {
@@ -252,7 +279,7 @@ describe("composer attachments", () => {
   it("accepts a DOCX source through the single-attachment control", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn().mockResolvedValue(undefined);
-    render(<Composer activeGeneration={null} onSend={onSend} onStop={vi.fn()} onRetry={vi.fn()} />);
+    render(<TestComposer onSend={onSend} />);
     const input = document.querySelector('input[type="file"]') as HTMLInputElement;
     const file = new File(["synthetic package"], "source.docx", {
       type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -262,13 +289,13 @@ describe("composer attachments", () => {
     expect(screen.getByText("source.docx")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Send message" }));
 
-    expect(onSend).toHaveBeenCalledWith("", file, "source");
+    expect(onSend).toHaveBeenCalledWith({ text: "", attachment: file, attachmentRole: "source" });
   });
 
   it("can mark a DOCX as a style reference", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn().mockResolvedValue(undefined);
-    render(<Composer activeGeneration={null} onSend={onSend} onStop={vi.fn()} onRetry={vi.fn()} />);
+    render(<TestComposer onSend={onSend} />);
     const input = document.querySelector('input[type="file"]') as HTMLInputElement;
     const file = new File(["synthetic package"], "policy.docx", {
       type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -279,7 +306,7 @@ describe("composer attachments", () => {
     expect(screen.getByRole("combobox", { name: "Use attachment as" })).toHaveValue("reference");
     await user.click(screen.getByRole("button", { name: "Send message" }));
 
-    expect(onSend).toHaveBeenCalledWith("", file, "reference");
+    expect(onSend).toHaveBeenCalledWith({ text: "", attachment: file, attachmentRole: "reference" });
   });
 });
 
@@ -335,16 +362,7 @@ describe("sidebar header", () => {
 describe("conversation scrolling", () => {
   it("scrolls the message history itself instead of moving the application viewport", () => {
     const scrollHeight = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(900);
-    const detail = {
-      id: "thread-1",
-      owner_id: "user-1",
-      owner_username: "charles",
-      mode: "translate",
-      title: "Long conversation",
-      updated_at: "2026-09-16T00:00:00Z",
-      active_generation_id: null,
-      messages: [],
-    } satisfies ThreadDetail;
+    const detail = thread({ title: "Long conversation" });
 
     const { container } = render(<MessageList detail={detail} generation={null} />);
     expect((container.firstElementChild as HTMLDivElement).scrollTop).toBe(900);
@@ -353,59 +371,24 @@ describe("conversation scrolling", () => {
   });
 
   it("does not render speaker labels", () => {
-    const detail = {
-      id: "thread-1",
-      owner_id: "user-1",
-      owner_username: "charles",
-      mode: "translate",
+    const detail = thread({
       title: "Compact conversation",
-      updated_at: "2026-09-16T00:00:00Z",
-      active_generation_id: null,
       messages: [
-        { id: "message-1", role: "user", actor_username: "charles", blocks: [{ type: "conversation", text: "Hello" }], attachment: null, created_at: "2026-09-16T00:00:00Z" },
-        { id: "message-2", role: "assistant", actor_username: null, blocks: [{ type: "conversation", text: "Hi" }], attachment: null, created_at: "2026-09-16T00:00:01Z" },
+        { id: "message-1", ordinal: 1, role: "user", blocks: [{ type: "conversation", text: "Hello" }], attachment: null, created_at: "2026-09-16T00:00:00Z" },
+        { id: "message-2", ordinal: 2, role: "assistant", blocks: [{ type: "conversation", text: "Hi" }], attachment: null, created_at: "2026-09-16T00:00:01Z" },
       ],
-    } satisfies ThreadDetail;
+    });
 
     render(<MessageList detail={detail} generation={null} />);
     expect(screen.queryByText(/^You$/)).not.toBeInTheDocument();
     expect(screen.queryByText(/^Oveo$/)).not.toBeInTheDocument();
   });
 
-  it("shows authorship only for a user acting across accounts", () => {
-    const detail = {
-      id: "thread-1",
-      owner_id: "user-2",
-      owner_username: "yousra",
-      mode: "revision",
-      title: "Cross-account revision",
-      updated_at: "2026-09-16T00:00:00Z",
-      active_generation_id: null,
-      messages: [
-        { id: "message-1", role: "user", actor_username: "charles", blocks: [{ type: "conversation", text: "Revise this" }], attachment: null, created_at: "2026-09-16T00:00:00Z" },
-        { id: "message-2", role: "user", actor_username: null, blocks: [{ type: "conversation", text: "Owner follow-up" }], attachment: null, created_at: "2026-09-16T00:00:01Z" },
-      ],
-    } satisfies ThreadDetail;
-
-    render(<MessageList detail={detail} generation={null} />);
-    expect(screen.getByText("charles")).toBeInTheDocument();
-    expect(screen.queryByText("yousra")).not.toBeInTheDocument();
-  });
-
   it("keeps a valid streamed deliverable visible when canonical persistence fails", () => {
-    const detail = {
-      id: "thread-1",
-      owner_id: "user-1",
-      owner_username: "charles",
-      mode: "translate",
-      title: "Persistence failure",
-      updated_at: "2026-09-16T00:00:00Z",
-      active_generation_id: null,
-      messages: [],
-    } satisfies ThreadDetail;
+    const detail = thread({ title: "Persistence failure" });
     const generation = {
       id: "generation-1",
-      thread_id: "thread-1",
+      thread_id: THREAD_ID,
       status: "failed",
       blocks: [{ type: "deliverable", text: "Preserved translated text." }],
       error_code: "state_persistence_failed",
@@ -461,13 +444,14 @@ describe("composer safeguards", () => {
     const user = userEvent.setup();
     let accept: () => void = () => undefined;
     const onSend = vi.fn(() => new Promise<void>((resolve) => { accept = resolve; }));
-    render(<Composer activeGeneration={null} onSend={onSend} onStop={vi.fn()} onRetry={vi.fn()} />);
+    render(<TestComposer onSend={onSend} />);
     const box = screen.getByRole("textbox", { name: "Message" });
 
     await user.type(box, "First{Enter}");
-    expect(onSend).toHaveBeenCalledWith("First");
+    expect(onSend.mock.calls[0]).toEqual([{ text: "First", attachmentRole: "source" }]);
     expect(box).toHaveAttribute("readonly");
     expect(screen.getByRole("button", { name: "Attach a DOCX file" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
     await user.type(box, " more");
     expect(box).toHaveValue("First");
 
@@ -478,7 +462,7 @@ describe("composer safeguards", () => {
 
   it("does not send when Enter confirms an input-method composition", () => {
     const onSend = vi.fn(async () => undefined);
-    render(<Composer activeGeneration={null} onSend={onSend} onStop={vi.fn()} onRetry={vi.fn()} />);
+    render(<TestComposer onSend={onSend} />);
     const box = screen.getByRole("textbox", { name: "Message" });
     fireEvent.change(box, { target: { value: "日本" } });
 
@@ -489,12 +473,20 @@ describe("composer safeguards", () => {
 
   it("offers Retry only when the server says the generation can be retried", () => {
     const failed = (retryable: boolean): GenerationSnapshot => ({
-      id: "g1", thread_id: "t1", status: "failed", blocks: [], seq: 3, retryable,
+      id: "g1", thread_id: "t1", status: "failed", blocks: [], error_code: "provider_network", error_message: null, seq: 3, retryable,
     });
-    const { rerender } = render(<Composer activeGeneration={failed(false)} onSend={vi.fn()} onStop={vi.fn()} onRetry={vi.fn()} />);
+    const { rerender } = render(<TestComposer activeGeneration={failed(false)} />);
     expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
 
-    rerender(<Composer activeGeneration={failed(true)} onSend={vi.fn()} onStop={vi.fn()} onRetry={vi.fn()} />);
+    rerender(<TestComposer activeGeneration={failed(true)} />);
     expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+  });
+
+  it("keeps Stop available while a stop is pending, so a lost stop can be repeated", () => {
+    const stopping: GenerationSnapshot = {
+      id: "g1", thread_id: "t1", status: "stopping", blocks: [], error_code: null, error_message: null, seq: 3, retryable: false,
+    };
+    render(<TestComposer activeGeneration={stopping} />);
+    expect(screen.getByRole("button", { name: "Stop generation" })).toBeEnabled();
   });
 });

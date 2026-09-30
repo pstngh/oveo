@@ -36,11 +36,22 @@ printf '%s\n' "$image" | grep -Eq '^ghcr\.io/pstngh/oveo@sha256:[0-9a-f]{64}$' \
 python3 "$staging_validator" --runtime "$runtime_env" \
   || die "staged credentials did not pass content-free validation"
 
-install -d -m 0700 -o 10001 -g 10001 "$data_dir" "$data_dir/attachments"
 install -d -m 0700 /etc/oveo
 [ -d "$lock_dir" ] || die "$lock_dir is missing"
 exec 9>"$lock_dir/oveo-maintenance.lock"
 flock -w 600 9 || die "timed out waiting for the host maintenance lock"
+
+# A live restore or a failed migrating deployment swaps whole data directories with two
+# renames. Interrupted between them, it leaves the data under another /var/lib/oveo.*
+# name (installing the host bundle may even recreate an empty /var/lib/oveo). A new,
+# empty database would then go live as if everything had been lost, so stop instead.
+if [ ! -f "$data_dir/oveo.sqlite3" ]; then
+  for sibling in "$data_dir".*; do
+    [ -d "$sibling" ] || continue
+    die "$data_dir/oveo.sqlite3 is missing but $sibling exists; an interrupted restore or deployment left the data under another name (see OPERATIONS.md)"
+  done
+fi
+install -d -m 0700 -o 10001 -g 10001 "$data_dir" "$data_dir/attachments"
 
 # Only an interrupted deployment leaves the write gate on. Whatever it left running
 # must be checked by a person before writes are allowed again (see OPERATIONS.md).
@@ -94,7 +105,10 @@ wait_ready() {
 }
 
 ready() {
-  wait_ready && curl --fail --silent --show-error --max-time 15 "$public_ready" >/dev/null
+  # The public check goes through DNS and the proxy, so it rides out a brief failure
+  # rather than rolling back a release that works.
+  wait_ready && curl --fail --silent --show-error --max-time 15 \
+    --retry 5 --retry-delay 3 --retry-all-errors "$public_ready" >/dev/null
 }
 
 start_image() {
