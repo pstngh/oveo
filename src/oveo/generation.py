@@ -911,11 +911,7 @@ class GenerationManager:
         """
 
         now = utc_now()
-        finished: dict[str, Any] = {
-            # Earlier releases stored each request's context in its row.
-            "request_snapshot": {},
-            "stream_revision": Generation.stream_revision + 1,
-        }
+        finished: dict[str, Any] = {"stream_revision": Generation.stream_revision + 1}
         async with self.database.sessions() as db:
             answered = await db.execute(
                 update(Generation)

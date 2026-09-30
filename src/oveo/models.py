@@ -207,7 +207,6 @@ class Generation(Base, TimestampMixin):
     client_request_id: Mapped[str] = mapped_column(String(100), nullable=False)
     purpose: Mapped[str] = mapped_column(String(24), nullable=False)
     status: Mapped[str] = mapped_column(String(16), default="queued", nullable=False)
-    request_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     partial_blocks: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
     stream_revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     provider_request_id: Mapped[str | None] = mapped_column(String(255))

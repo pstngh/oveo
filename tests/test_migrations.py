@@ -341,3 +341,77 @@ def test_attachment_role_migration_preserves_existing_docx_canonical_work(
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         connection.close()
+
+
+def test_dropping_request_snapshot_keeps_generations_and_their_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "request-snapshot.sqlite3"
+    config = _config(database_path, monkeypatch)
+    command.upgrade(config, "20260917_0005")
+
+    connection = sqlite3.connect(database_path)
+    try:
+        now = "2026-09-30T12:00:00+00:00"
+        connection.execute(
+            "INSERT INTO users "
+            "(id, username, display_name, password_hash, credential_version, "
+            "failed_login_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("user-1", "charles", "Charles", "synthetic", 1, 0, now),
+        )
+        connection.execute(
+            "INSERT INTO threads "
+            "(id, owner_id, mode, title, updated_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("thread-1", "user-1", "translate", "Existing", now, now),
+        )
+        connection.execute(
+            "INSERT INTO messages "
+            "(id, thread_id, ordinal, role, actor_user_id, content_schema_version, "
+            "content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("message-1", "thread-1", 1, "user", "user-1", 1, "[]", now),
+        )
+        # A generation from before contexts were composed in memory, and its retry.
+        for generation_id, retry_of, snapshot in (
+            ("generation-1", None, '{"schema_version":1,"provider_messages":[]}'),
+            ("generation-2", "generation-1", "{}"),
+        ):
+            connection.execute(
+                "INSERT INTO generations "
+                "(id, thread_id, requester_id, source_message_id, retry_of_generation_id, "
+                "client_request_id, purpose, status, request_snapshot, partial_blocks, "
+                "stream_revision, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    generation_id,
+                    "thread-1",
+                    "user-1",
+                    "message-1",
+                    retry_of,
+                    f"request-{generation_id}",
+                    "chat",
+                    "failed",
+                    snapshot,
+                    "[]",
+                    0,
+                    now,
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    command.upgrade(config, "head")
+
+    connection = sqlite3.connect(database_path)
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(generations)")}
+        assert "request_snapshot" not in columns
+        assert connection.execute(
+            "SELECT id, retry_of_generation_id, status FROM generations ORDER BY id"
+        ).fetchall() == [
+            ("generation-1", None, "failed"),
+            ("generation-2", "generation-1", "failed"),
+        ]
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        connection.close()

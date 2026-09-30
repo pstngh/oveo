@@ -168,19 +168,6 @@ stat -c '%a %n' /run/lock /var/tmp
 
 If either shows `700`, restore the systemd default in a maintenance window with `systemd-tmpfiles --create` (or `chmod 1777` on that exact directory) after confirming the host's tmpfiles configuration expects `1777`.
 
-## Stored request context
-
-Generations no longer store the model context they are sent: it is composed in memory when the generation starts. Rows from earlier releases may still hold it; nothing reads it. Report, then optionally clear, only that column on finished rows (messages, documents, attachments, usage records and content-free diagnostics are unchanged):
-
-```bash
-docker compose --project-name oveo --env-file /etc/oveo/deploy.env \
-  -f /opt/oveo/compose.yml exec app oveo-admin clear-terminal-snapshots
-docker compose --project-name oveo --env-file /etc/oveo/deploy.env \
-  -f /opt/oveo/compose.yml exec app oveo-admin clear-terminal-snapshots --apply
-```
-
-The command works in small batches beside the running application and is never run automatically. The database file keeps its size until a `VACUUM`; that is optional, needs free disk space of about the database size, and must run only in a maintenance window with Oveo stopped and a fresh backup taken. Old encrypted backups keep their copies until they rotate out.
-
 ## Request limits and client addresses
 
 The application rejects oversized requests before reading them: 16 KiB for JSON
