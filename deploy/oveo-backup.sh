@@ -33,6 +33,13 @@ printf '%s\n' "$AGE_RECIPIENT" | grep -Eq '^age1[0-9a-z]+$' \
 [ -s "$AGE_IDENTITY_FILE" ] || die "age identity is missing or empty"
 [ "$(stat -c '%U:%G:%a' "$AGE_IDENTITY_FILE")" = "root:root:400" ] \
   || die "age identity must be root:root mode 0400"
+# How many complete backups to keep (and, apart from them, incomplete ones). Each takes
+# about the size of the data on a small shared disk; BACKUP_KEEP in the config overrides it.
+keep=${BACKUP_KEEP:-3}
+case "$keep" in
+  "" | *[!0-9]*) die "BACKUP_KEEP must be a whole number from 1 to 30" ;;
+esac
+[ "$keep" -ge 1 ] && [ "$keep" -le 30 ] || die "BACKUP_KEEP must be a whole number from 1 to 30"
 [ -f "$database" ] || die "database is missing"
 [ -x "$tool" ] || die "backup helper is missing"
 for command in age flock python3; do
@@ -107,7 +114,7 @@ if [ "$complete" = false ]; then
   kept=$incomplete_dir/oveo-INCOMPLETE-$stamp.tar.gz.age
   mv "$encrypted" "$kept"
   find "$incomplete_dir" -mindepth 1 -maxdepth 1 -type f -name 'oveo-INCOMPLETE-*.tar.gz.age' -print \
-    | sort -r | sed -n '8,$p' \
+    | sort -r | sed -n "$((keep + 1)),\$p" \
     | while IFS= read -r stale; do
         [ "$(dirname "$stale")" = "$incomplete_dir" ] || die "unsafe rotation path"
         basename "$stale" | grep -Eq '^oveo-INCOMPLETE-[0-9]{8}T[0-9]{6}Z\.tar\.gz\.age$' \
@@ -120,9 +127,9 @@ fi
 
 mv "$encrypted" "$final"
 
-# Keep the seven newest successful encrypted backups. Only exact Oveo backup names qualify.
+# Keep the newest $keep successful encrypted backups. Only exact Oveo backup names qualify.
 find "$backup_dir" -mindepth 1 -maxdepth 1 -type f -name 'oveo-*.tar.gz.age' -print \
-  | sort -r | sed -n '8,$p' \
+  | sort -r | sed -n "$((keep + 1)),\$p" \
   | while IFS= read -r stale; do
       [ "$(dirname "$stale")" = "$backup_dir" ] || die "unsafe rotation path"
       basename "$stale" | grep -Eq '^oveo-[0-9]{8}T[0-9]{6}Z\.tar\.gz\.age$' \
