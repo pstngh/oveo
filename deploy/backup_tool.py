@@ -22,7 +22,9 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
-MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
+# An extraction must leave this much free on its file system, which the host shares
+# with other services. There is no fixed size limit: the data only grows.
+RESTORE_HEADROOM_BYTES = 256 * 1024 * 1024
 SCHEMA_VERSION = 1
 # `create --allow-incomplete` exits with this status after writing an archive that is
 # missing referenced attachments.
@@ -308,17 +310,28 @@ def _validate_member(member: tarfile.TarInfo, seen: set[str]) -> None:
         raise BackupError("archive contains an unsupported member")
 
 
+def _mib(size: int) -> int:
+    return -(-size // (1024 * 1024))
+
+
+def _check_room(total_size: int, destination: Path) -> None:
+    free = shutil.disk_usage(destination).free
+    if total_size + RESTORE_HEADROOM_BYTES > free:
+        raise BackupError(
+            f"the archive expands to {_mib(total_size)} MiB, but only {_mib(free)} MiB are "
+            f"free where it would be restored and {_mib(RESTORE_HEADROOM_BYTES)} MiB must "
+            "stay free"
+        )
+
+
 def _extract_archive(archive_path: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=False, mode=0o700)
     seen: set[str] = set()
-    total_size = 0
     with tarfile.open(archive_path, mode="r:*") as archive:
         members = archive.getmembers()
         for member in members:
             _validate_member(member, seen)
-            total_size += member.size
-            if total_size > MAX_ARCHIVE_BYTES:
-                raise BackupError("archive expands beyond the safety limit")
+        _check_room(sum(member.size for member in members), destination)
         for member in members:
             target = destination.joinpath(*PurePosixPath(member.name).parts)
             if member.isdir():
