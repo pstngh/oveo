@@ -227,8 +227,8 @@ class Host:
             ("curl", CURL_STUB),
             ("age", AGE_STUB),
             ("logger", LOGGER_STUB),
-            ("df", DF_STUB),
             ("sleep", "#!/bin/sh\nexit 0\n"),
+            ("df", DF_STUB),
         ):
             (self.bin / name).write_text(body, encoding="utf-8")
             (self.bin / name).chmod(0o755)
