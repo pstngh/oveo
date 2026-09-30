@@ -46,8 +46,8 @@ _UNREWRITTEN = re.compile(r"(?<![\w.-])/(?:etc|var|opt|run|usr/local)/")
 # The Debian host runs GNU coreutils; some development systems ship other
 # implementations and keep GNU's under a "gnu" prefix.
 _COREUTILS = (
-    "basename cat chmod chown cp date dirname env head id install ln mkdir mktemp mv rm "
-    "sort stat tail touch"
+    "basename cat chmod chown cp cut date dirname du env head id install ln mkdir mktemp mv rm "
+    "sort stat tail touch tr"
 ).split()
 
 DOCKER_STUB = r"""#!/usr/bin/env python3
@@ -87,6 +87,11 @@ def database_revision():
 
 if args[:2] in (["manifest", "inspect"], ["image", "rm"], ["image", "ls"]) or args[0] == "pull":
     sys.exit(0)
+if args[0] in ("login", "logout"):
+    if args[0] == "login":
+        sys.stdin.read()
+    log(f"{args[0]} config={os.environ.get('DOCKER_CONFIG', '')}")
+    sys.exit(0)
 if args[:2] == ["image", "inspect"]:
     print(args[2])
     sys.exit(0)
@@ -118,6 +123,8 @@ if args[0] == "compose":
         (state / "running").write_text(image)
         (state / "healthy").write_text("yes" if healthy else "no")
         log(f"up {image[-6:]} marker={marker}")
+        with (state / "compose-files.log").open("a") as handle:
+            handle.write(f"{image[-6:]} {args[args.index('-f') + 1]}\n")
     elif command == "stop":
         (state / "running").write_text("")
         (state / "healthy").write_text("no")
@@ -144,9 +151,53 @@ done
 cp -- "$previous" "$output"
 """
 
+# Free bytes on the backup file system: plenty unless a test says otherwise.
+DF_STUB = """#!/bin/sh
+printf 'Avail\\n%s\\n' "$(cat "$STUB_STATE/df-avail" 2>/dev/null || echo 1000000000000)"
+"""
+
 LOGGER_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >>"$STUB_STATE/logger.log"
 """
+
+SYSTEMCTL_STUB = """#!/bin/sh
+printf '%s\\n' "$*" >>"$STUB_STATE/systemctl.log"
+# `systemctl show --property=ActiveState --value UNIT`: no deploy unit is running.
+[ "$1" = show ] && echo inactive
+exit 0
+"""
+
+# Runs the unit's command in the foreground; its output stands in for the journal's.
+SYSTEMD_RUN_STUB = """#!/bin/sh
+printf '%s\\n' "$*" >>"$STUB_STATE/systemd-run.log"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --setenv=*) export "${1#--setenv=}" ;;
+    --*) ;;
+    *) break ;;
+  esac
+  shift
+done
+exec "$@" </dev/null
+"""
+
+# What the deploy job packs into the host bundle, relative to the repository root.
+BUNDLE = (
+    "compose.yml",
+    "deploy/install-host.sh",
+    "deploy/oveo-deploy.sh",
+    "deploy/oveo-deploy-detached.sh",
+    "deploy/oveo-backup.sh",
+    "deploy/oveo-restore.sh",
+    "deploy/oveo-backup-alert.sh",
+    "deploy/backup_tool.py",
+    "deploy/validate_staging.py",
+    "deploy/runtime.env.example",
+    "deploy/backup.env.example",
+    "deploy/systemd/oveo-backup.service",
+    "deploy/systemd/oveo-backup-failure.service",
+    "deploy/systemd/oveo-backup.timer",
+)
 
 
 def _namespaces_work(probe: Path) -> bool:
@@ -193,7 +244,13 @@ class Host:
         self.bin = self.state / "bin"
         self.data = self.root / "var/lib/oveo"
         self.backups = self.root / "var/backups/oveo"
-        for directory in ("etc/oveo", "opt/oveo", "usr/local/lib/oveo", "usr/local/sbin"):
+        for directory in (
+            "etc/oveo",
+            "etc/systemd/system",
+            "opt/oveo",
+            "usr/local/lib/oveo",
+            "usr/local/sbin",
+        ):
             (self.root / directory).mkdir(parents=True)
         (self.root / "var/lib").mkdir(parents=True)
         (self.root / "var/backups").mkdir(parents=True)
@@ -222,7 +279,11 @@ class Host:
             ("curl", CURL_STUB),
             ("age", AGE_STUB),
             ("logger", LOGGER_STUB),
+            ("systemctl", SYSTEMCTL_STUB),
+            ("systemd-run", SYSTEMD_RUN_STUB),
+            ("journalctl", "#!/bin/sh\nexit 0\n"),
             ("sleep", "#!/bin/sh\nexit 0\n"),
+            ("df", DF_STUB),
         ):
             (self.bin / name).write_text(body, encoding="utf-8")
             (self.bin / name).chmod(0o755)
@@ -231,6 +292,15 @@ class Host:
                 gnu = Path(f"/usr/bin/gnu{name}")
                 if gnu.exists():
                     (self.bin / name).symlink_to(gnu)
+
+    def bundle(self) -> Path:
+        """Extract a host bundle the way the deploy job stages it, in /var/tmp."""
+
+        stage = self.root / "var/tmp/oveo-host-synthetic"
+        for name in BUNDLE:
+            (stage / name).parent.mkdir(parents=True, exist_ok=True)
+            self._install(ROOT / name, stage / name)
+        return stage
 
     def configure(self, *, revisions: dict[str, list[str]], broken: tuple[str, ...] = ()) -> None:
         payload = {"revisions": revisions, "broken": list(broken)}
@@ -292,7 +362,7 @@ class Host:
         connection.commit()
         connection.close()
 
-    def run(self, script: str, *arguments: str) -> Outcome:
+    def run(self, script: str, *arguments: str, stdin: str = "") -> Outcome:
         environment = {
             key: value for key, value in os.environ.items() if not key.startswith("OVEO_")
         }
@@ -323,6 +393,8 @@ find "{self.root}" -type d -exec chmod u+rwx {{}} +
                 *arguments,
             ],
             env=environment,
+            input=stdin,
+            text=True,
             timeout=300,
             check=True,
         )
@@ -536,6 +608,153 @@ def test_first_deploy_creates_the_data_directory_on_a_fresh_host(host: Host) -> 
     assert (host.data / "attachments").is_dir()
 
 
+# --- Host bundle installation ----------------------------------------------------------
+
+
+def test_install_host_installs_the_bundle_and_drops_the_old_rehearsal_record(host: Host) -> None:
+    stage = host.bundle()
+    stale = host.root / "opt/oveo/rehearsal.env"
+    stale.write_text("OVEO_REHEARSED_IMAGE=synthetic\n", encoding="utf-8")
+
+    outcome = host.run(str(stage / "deploy/install-host.sh"))
+
+    assert outcome.status == 0, outcome.stderr
+    assert not stale.exists()
+    installed = (host.root / "opt/oveo/compose.yml").read_text(encoding="utf-8")
+    assert installed == (stage / "compose.yml").read_text(encoding="utf-8")
+    for name in ("oveo-deploy", "oveo-backup", "oveo-restore", "oveo-backup-alert"):
+        assert os.access(host.root / "usr/local/sbin" / name, os.X_OK), name
+    assert (host.root / "etc/systemd/system/oveo-backup.timer").exists()
+    assert (host.state / "systemctl.log").read_text() == "daemon-reload\n"
+    assert outcome.owners["oveo"] == "10001:10001"
+
+
+def _installed(host: Host) -> dict[Path, bytes]:
+    return {
+        path: path.read_bytes()
+        for directory in ("opt/oveo", "usr/local/sbin", "usr/local/lib/oveo", "etc/systemd/system")
+        for path in sorted((host.root / directory).rglob("*"))
+        if path.is_file()
+    }
+
+
+def _compose_files(host: Host) -> list[str]:
+    log = host.state / "compose-files.log"
+    return log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+
+
+def test_bundle_deploy_installs_the_bundle_once_the_candidate_passed(host: Host) -> None:
+    host.deployment_files()
+    host.data_directory(revision="rev1", attachments={})
+    stage = host.bundle()
+
+    outcome = host.run(str(stage / "deploy/oveo-deploy.sh"), "--bundle", str(stage), CANDIDATE)
+
+    assert outcome.status == 0, outcome.stderr
+    assert _compose_files(host) == [f"{CANDIDATE[-6:]} {stage / 'compose.yml'}"]
+    installed = (host.root / "opt/oveo/compose.yml").read_text(encoding="utf-8")
+    assert installed == (stage / "compose.yml").read_text(encoding="utf-8")
+    assert (host.root / "usr/local/sbin/oveo-deploy").read_bytes() == (
+        stage / "deploy/oveo-deploy.sh"
+    ).read_bytes()
+    assert (host.state / "systemctl.log").read_text() == "daemon-reload\n"
+    assert _deployed(host) == f"OVEO_IMAGE={CANDIDATE}"
+
+
+@pytest.mark.parametrize("candidate_revisions", [["rev1"], ["rev2", "rev1"]])
+def test_failed_bundle_deploy_keeps_the_running_release_s_host_files(
+    host: Host, candidate_revisions: list[str]
+) -> None:
+    host.deployment_files()
+    host.data_directory(revision="rev1", attachments={})
+    host.configure(
+        revisions={PREVIOUS: ["rev1"], CANDIDATE: candidate_revisions}, broken=(CANDIDATE,)
+    )
+    stage = host.bundle()
+    before = _installed(host)
+
+    outcome = host.run(str(stage / "deploy/oveo-deploy.sh"), "--bundle", str(stage), CANDIDATE)
+
+    assert outcome.status == 1
+    # The preceding image comes back under the compose file it was verified with.
+    assert _compose_files(host) == [
+        f"{CANDIDATE[-6:]} {stage / 'compose.yml'}",
+        f"{PREVIOUS[-6:]} {host.root / 'opt/oveo/compose.yml'}",
+    ]
+    assert _installed(host) == before
+    assert not (host.state / "systemctl.log").exists()
+    assert _deployed(host) == f"OVEO_IMAGE={PREVIOUS}"
+    assert (host.state / "healthy").read_text() == "yes"
+
+
+def _staged_archive(stage: Path) -> tuple[Path, Path]:
+    archive = stage.with_name(f"{stage.name}.tar.gz")
+    checksum = archive.with_name(f"{archive.name}.sha256")
+    archive.write_bytes(b"synthetic bundle")
+    checksum.write_text("synthetic checksum\n", encoding="utf-8")
+    return archive, checksum
+
+
+def test_detached_deploy_runs_in_its_own_unit_and_removes_the_bundle(host: Host) -> None:
+    host.deployment_files()
+    host.data_directory(revision="rev1", attachments={})
+    stage = host.bundle()
+    archive, checksum = _staged_archive(stage)
+
+    outcome = host.run(
+        str(stage / "deploy/oveo-deploy-detached.sh"),
+        CANDIDATE,
+        "synthetic-user",
+        stdin="synthetic-token\n",
+    )
+
+    assert outcome.status == 0, outcome.stderr
+    [call] = (host.state / "systemd-run.log").read_text().splitlines()
+    assert call.startswith("--unit=oveo-deploy-synthetic --collect --quiet --wait")
+    assert call.endswith(f"oveo-deploy-detached.sh --in-unit {CANDIDATE}")
+    assert "Deployed and verified" in outcome.stdout
+    assert _deployed(host) == f"OVEO_IMAGE={CANDIDATE}"
+    config = stage / "docker-config"
+    # The unit pulls with the job's login and signs out before removing the bundle.
+    assert outcome.docker[0] == f"login config={config}"
+    assert outcome.docker[-1] == f"logout config={config}"
+    assert not stage.exists() and not archive.exists() and not checksum.exists()
+
+
+def test_detached_deploy_reports_a_failed_deployment_and_removes_the_bundle(host: Host) -> None:
+    host.deployment_files()
+    host.data_directory(revision="rev1", attachments={})
+    host.configure(revisions={PREVIOUS: ["rev1"], CANDIDATE: ["rev1"]}, broken=(CANDIDATE,))
+    stage = host.bundle()
+    archive, _checksum = _staged_archive(stage)
+
+    outcome = host.run(
+        str(stage / "deploy/oveo-deploy-detached.sh"),
+        CANDIDATE,
+        "synthetic-user",
+        stdin="synthetic-token\n",
+    )
+
+    assert outcome.status == 1
+    assert "preceding image was restored" in outcome.stderr
+    assert _deployed(host) == f"OVEO_IMAGE={PREVIOUS}"
+    assert not stage.exists() and not archive.exists()
+
+
+def test_detached_deploy_without_a_token_starts_nothing(host: Host) -> None:
+    host.deployment_files()
+    host.data_directory(revision="rev1", attachments={})
+    stage = host.bundle()
+    archive, _checksum = _staged_archive(stage)
+
+    outcome = host.run(str(stage / "deploy/oveo-deploy-detached.sh"), CANDIDATE, "synthetic-user")
+
+    assert outcome.status == 1
+    assert "no registry token" in outcome.stderr
+    assert not (host.state / "systemd-run.log").exists()
+    assert not stage.exists() and not archive.exists()
+
+
 # --- L-19: backups, alerts and restores ------------------------------------------------
 
 
@@ -552,6 +771,20 @@ def test_backup_leaves_out_unreferenced_files_and_clears_the_failure_record(host
     assert "1 unreferenced attachment file(s) were not archived" in outcome.stderr
     assert len(list(host.backups.glob("oveo-*.tar.gz.age"))) == 1
     assert not (host.backups / "BACKUP-FAILED").exists()
+
+
+def test_backup_refuses_to_start_without_room_for_three_copies(host: Host) -> None:
+    host.backup_files()
+    host.data_directory(revision="rev1", attachments={"a.docx": b"synthetic" * 1000})
+    data_bytes = (host.data / "oveo.sqlite3").stat().st_size + 9000
+    # Enough for two copies and the host's share, not for three.
+    (host.state / "df-avail").write_text(str(2 * data_bytes + 256 * 1024 * 1024))
+
+    outcome = host.run("oveo-backup")
+
+    assert outcome.status == 1
+    assert f"not enough free space in {host.backups}" in outcome.stderr
+    assert list(host.backups.iterdir()) == []
 
 
 def test_incomplete_backup_is_kept_apart_and_never_rotates_complete_ones(host: Host) -> None:
@@ -608,7 +841,11 @@ def test_live_restore_gates_writes_and_keeps_host_logs(host: Host) -> None:
     outcome = host.run("oveo-restore", str(archive), "--live", "--confirm", "RESTORE")
 
     assert outcome.status == 0, outcome.stderr
-    assert outcome.docker == ["stop", f"up {PREVIOUS[-6:]} marker=yes"]
+    assert outcome.docker == [
+        "run schema-revisions --config /app/alembic.ini",
+        "stop",
+        f"up {PREVIOUS[-6:]} marker=yes",
+    ]
     assert not (host.data / "maintenance-mode").exists()
     assert (host.data / "logs" / "oveo-errors.log").read_text() == "error_id=after-backup\n"
     assert (host.data / "deployed-image").read_text().strip() == PREVIOUS
@@ -616,3 +853,22 @@ def test_live_restore_gates_writes_and_keeps_host_logs(host: Host) -> None:
     [previous] = host.siblings("oveo.pre-restore.")
     assert (previous / "attachments" / "later.docx").exists()
     assert outcome.owners["oveo"] == "10001:10001"
+
+
+def test_live_restore_refuses_a_backup_the_running_image_cannot_open(host: Host) -> None:
+    host.deployment_files()
+    host.backup_files()
+    host.data_directory(revision="rev2", attachments={"a.docx": b"synthetic"})
+    assert host.run("oveo-backup").status == 0
+    archive = next(host.backups.glob("oveo-*.tar.gz.age"))
+    # The running release is older than the backup's schema.
+    host.configure(revisions={PREVIOUS: ["rev1"], CANDIDATE: ["rev2", "rev1"]})
+
+    outcome = host.run("oveo-restore", str(archive), "--live", "--confirm", "RESTORE")
+
+    assert outcome.status == 1
+    assert "schema revision rev2, which the running image does not know" in outcome.stderr
+    assert outcome.docker == ["run schema-revisions --config /app/alembic.ini"]
+    assert (host.state / "running").read_text() == PREVIOUS
+    assert host.revision(host.data) == "rev2"
+    assert host.siblings("oveo.") == []

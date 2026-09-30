@@ -54,6 +54,16 @@ find "$backup_dir" -mindepth 1 -maxdepth 1 -type d -name '.staging.*' -print \
       rm -rf -- "$abandoned"
     done
 
+# At its peak a run holds the encrypted archive, its decrypted copy and the verification
+# restore: about three times the data. Refuse up front, leaving room for the rest of the
+# host, instead of filling the shared disk partway through.
+headroom=$((256 * 1024 * 1024))
+data_bytes=$(du -s -b -c -- "$database" "$attachments" | tail -n 1 | cut -f 1)
+needed=$((3 * data_bytes + headroom))
+free_bytes=$(df --output=avail -B 1 -- "$backup_dir" | tail -n 1 | tr -d ' ')
+[ "$free_bytes" -ge "$needed" ] \
+  || die "not enough free space in $backup_dir: a backup of $((data_bytes / 1048576)) MiB of data needs about $((needed / 1048576)) MiB free (three times the data plus 256 MiB for the host), and $((free_bytes / 1048576)) MiB are free"
+
 staging=$(mktemp -d "$backup_dir/.staging.XXXXXX")
 cleanup() {
   case "$staging" in
