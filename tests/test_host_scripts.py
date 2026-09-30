@@ -87,6 +87,11 @@ def database_revision():
 
 if args[:2] in (["manifest", "inspect"], ["image", "rm"], ["image", "ls"]) or args[0] == "pull":
     sys.exit(0)
+if args[0] in ("login", "logout"):
+    if args[0] == "login":
+        sys.stdin.read()
+    log(f"{args[0]} config={os.environ.get('DOCKER_CONFIG', '')}")
+    sys.exit(0)
 if args[:2] == ["image", "inspect"]:
     print(args[2])
     sys.exit(0)
@@ -152,6 +157,23 @@ printf '%s\\n' "$*" >>"$STUB_STATE/logger.log"
 
 SYSTEMCTL_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >>"$STUB_STATE/systemctl.log"
+# `systemctl show --property=ActiveState --value UNIT`: no deploy unit is running.
+[ "$1" = show ] && echo inactive
+exit 0
+"""
+
+# Runs the unit's command in the foreground; its output stands in for the journal's.
+SYSTEMD_RUN_STUB = """#!/bin/sh
+printf '%s\\n' "$*" >>"$STUB_STATE/systemd-run.log"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --setenv=*) export "${1#--setenv=}" ;;
+    --*) ;;
+    *) break ;;
+  esac
+  shift
+done
+exec "$@" </dev/null
 """
 
 # What the deploy job packs into the host bundle, relative to the repository root.
@@ -159,6 +181,7 @@ BUNDLE = (
     "compose.yml",
     "deploy/install-host.sh",
     "deploy/oveo-deploy.sh",
+    "deploy/oveo-deploy-detached.sh",
     "deploy/oveo-backup.sh",
     "deploy/oveo-restore.sh",
     "deploy/oveo-backup-alert.sh",
@@ -252,6 +275,8 @@ class Host:
             ("age", AGE_STUB),
             ("logger", LOGGER_STUB),
             ("systemctl", SYSTEMCTL_STUB),
+            ("systemd-run", SYSTEMD_RUN_STUB),
+            ("journalctl", "#!/bin/sh\nexit 0\n"),
             ("sleep", "#!/bin/sh\nexit 0\n"),
         ):
             (self.bin / name).write_text(body, encoding="utf-8")
@@ -331,7 +356,7 @@ class Host:
         connection.commit()
         connection.close()
 
-    def run(self, script: str, *arguments: str) -> Outcome:
+    def run(self, script: str, *arguments: str, stdin: str = "") -> Outcome:
         environment = {
             key: value for key, value in os.environ.items() if not key.startswith("OVEO_")
         }
@@ -362,6 +387,8 @@ find "{self.root}" -type d -exec chmod u+rwx {{}} +
                 *arguments,
             ],
             env=environment,
+            input=stdin,
+            text=True,
             timeout=300,
             check=True,
         )
@@ -652,6 +679,74 @@ def test_failed_bundle_deploy_keeps_the_running_release_s_host_files(
     assert not (host.state / "systemctl.log").exists()
     assert _deployed(host) == f"OVEO_IMAGE={PREVIOUS}"
     assert (host.state / "healthy").read_text() == "yes"
+
+
+def _staged_archive(stage: Path) -> tuple[Path, Path]:
+    archive = stage.with_name(f"{stage.name}.tar.gz")
+    checksum = archive.with_name(f"{archive.name}.sha256")
+    archive.write_bytes(b"synthetic bundle")
+    checksum.write_text("synthetic checksum\n", encoding="utf-8")
+    return archive, checksum
+
+
+def test_detached_deploy_runs_in_its_own_unit_and_removes_the_bundle(host: Host) -> None:
+    host.deployment_files()
+    host.data_directory(revision="rev1", attachments={})
+    stage = host.bundle()
+    archive, checksum = _staged_archive(stage)
+
+    outcome = host.run(
+        str(stage / "deploy/oveo-deploy-detached.sh"),
+        CANDIDATE,
+        "synthetic-user",
+        stdin="synthetic-token\n",
+    )
+
+    assert outcome.status == 0, outcome.stderr
+    [call] = (host.state / "systemd-run.log").read_text().splitlines()
+    assert call.startswith("--unit=oveo-deploy-synthetic --collect --quiet --wait")
+    assert call.endswith(f"oveo-deploy-detached.sh --in-unit {CANDIDATE}")
+    assert "Deployed and verified" in outcome.stdout
+    assert _deployed(host) == f"OVEO_IMAGE={CANDIDATE}"
+    config = stage / "docker-config"
+    # The unit pulls with the job's login and signs out before removing the bundle.
+    assert outcome.docker[0] == f"login config={config}"
+    assert outcome.docker[-1] == f"logout config={config}"
+    assert not stage.exists() and not archive.exists() and not checksum.exists()
+
+
+def test_detached_deploy_reports_a_failed_deployment_and_removes_the_bundle(host: Host) -> None:
+    host.deployment_files()
+    host.data_directory(revision="rev1", attachments={})
+    host.configure(revisions={PREVIOUS: ["rev1"], CANDIDATE: ["rev1"]}, broken=(CANDIDATE,))
+    stage = host.bundle()
+    archive, _checksum = _staged_archive(stage)
+
+    outcome = host.run(
+        str(stage / "deploy/oveo-deploy-detached.sh"),
+        CANDIDATE,
+        "synthetic-user",
+        stdin="synthetic-token\n",
+    )
+
+    assert outcome.status == 1
+    assert "preceding image was restored" in outcome.stderr
+    assert _deployed(host) == f"OVEO_IMAGE={PREVIOUS}"
+    assert not stage.exists() and not archive.exists()
+
+
+def test_detached_deploy_without_a_token_starts_nothing(host: Host) -> None:
+    host.deployment_files()
+    host.data_directory(revision="rev1", attachments={})
+    stage = host.bundle()
+    archive, _checksum = _staged_archive(stage)
+
+    outcome = host.run(str(stage / "deploy/oveo-deploy-detached.sh"), CANDIDATE, "synthetic-user")
+
+    assert outcome.status == 1
+    assert "no registry token" in outcome.stderr
+    assert not (host.state / "systemd-run.log").exists()
+    assert not stage.exists() and not archive.exists()
 
 
 # --- L-19: backups, alerts and restores ------------------------------------------------

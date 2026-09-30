@@ -189,7 +189,7 @@ jobs:
         run: |
           tar --create --gzip --file "oveo-host-${GITHUB_SHA}.tar.gz" \
             compose.yml deploy/install-host.sh \
-            deploy/oveo-deploy.sh \
+            deploy/oveo-deploy.sh deploy/oveo-deploy-detached.sh \
             deploy/oveo-backup.sh deploy/oveo-restore.sh deploy/oveo-backup-alert.sh \
             deploy/backup_tool.py \
             deploy/validate_staging.py \
@@ -220,7 +220,9 @@ jobs:
             "oveo-host-${GITHUB_SHA}.tar.gz.sha256" \
             "$VPS_USER@$VPS_HOST:/var/tmp/"
       # The staged bundle's oveo-deploy starts the candidate with the bundle's compose
-      # file and installs the bundle only after the candidate passed its checks.
+      # file and installs the bundle only after the candidate passed its checks. It runs
+      # as its own systemd unit, so cancelling this job or losing the connection cannot
+      # stop it halfway; its output is followed from the journal.
       - name: Deploy exact published digest
         env:
           GHCR_TOKEN: ${{ github.token }}
@@ -235,6 +237,6 @@ jobs:
             -o StrictHostKeyChecking=yes \
             -i "$HOME/.ssh/id_ed25519" \
             "$VPS_USER@$VPS_HOST" \
-            "read -r token; set -eu; stage=/var/tmp/oveo-host-${GITHUB_SHA}; archive=\$stage.tar.gz; checksum=\$archive.sha256; docker_config=; cleanup() { if [ -n \"\$docker_config\" ]; then DOCKER_CONFIG=\$docker_config docker logout ghcr.io >/dev/null 2>&1 || true; fi; rm -f -- \"\$archive\" \"\$checksum\"; rm -rf -- \"\$stage\"; }; trap cleanup EXIT HUP INT TERM; cd /var/tmp; sha256sum --check \"\$checksum\"; rm -rf -- \"\$stage\"; mkdir \"\$stage\"; tar --extract --gzip --file \"\$archive\" --directory \"\$stage\"; docker_config=\$stage/docker-config; install -d -m 0700 \"\$docker_config\"; export DOCKER_CONFIG=\$docker_config; if ! printf '%s' \"\$token\" | docker login ghcr.io --username '$GHCR_USER' --password-stdin >/dev/null; then unset token; exit 1; fi; unset token; set +e; \"\$stage/deploy/oveo-deploy.sh\" --bundle \"\$stage\" '$IMAGE'; status=\$?; exit \$status"
+            "read -r token; set -eu; stage=/var/tmp/oveo-host-${GITHUB_SHA}; archive=\$stage.tar.gz; checksum=\$archive.sha256; unit=oveo-deploy-${GITHUB_SHA}.service; case \"\$(systemctl show --property=ActiveState --value \"\$unit\")\" in inactive|failed) ;; *) echo \"\$unit is still running: an earlier run of this deployment has not finished (see OPERATIONS.md)\" >&2; exit 1 ;; esac; cleanup() { rm -f -- \"\$archive\" \"\$checksum\"; rm -rf -- \"\$stage\"; }; trap cleanup EXIT HUP INT TERM; cd /var/tmp; sha256sum --check \"\$checksum\"; rm -rf -- \"\$stage\"; mkdir \"\$stage\"; tar --extract --gzip --file \"\$archive\" --directory \"\$stage\"; trap - EXIT HUP INT TERM; printf '%s\\n' \"\$token\" | \"\$stage/deploy/oveo-deploy-detached.sh\" '$IMAGE' '$GHCR_USER'"
       - name: Verify public production readiness
         run: curl --fail --silent --show-error --max-time 20 "https://oveo.duckdns.org/health/ready"
