@@ -787,6 +787,43 @@ def test_backup_refuses_to_start_without_room_for_three_copies(host: Host) -> No
     assert list(host.backups.iterdir()) == []
 
 
+@pytest.mark.parametrize(("setting", "kept"), [(None, 3), ("5", 5)])
+def test_backup_keeps_the_configured_number_of_newest_backups(
+    host: Host, setting: str | None, kept: int
+) -> None:
+    host.backup_files()
+    if setting is not None:
+        with (host.root / "etc/oveo/backup.env").open("a", encoding="utf-8") as config:
+            config.write(f"BACKUP_KEEP={setting}\n")
+    host.data_directory(revision="rev1", attachments={"a.docx": b"synthetic"})
+    host.backups.mkdir(parents=True)
+    older = [host.backups / f"oveo-2026010{day}T000000Z.tar.gz.age" for day in range(1, 8)]
+    for path in older:
+        path.write_bytes(b"synthetic complete backup")
+
+    outcome = host.run("oveo-backup")
+
+    assert outcome.status == 0, outcome.stderr
+    remaining = sorted(host.backups.glob("oveo-*.tar.gz.age"))
+    assert len(remaining) == kept
+    # The new backup and the newest older ones stay; the oldest go.
+    assert remaining[: kept - 1] == older[-(kept - 1) :]
+    assert remaining[-1] not in older
+
+
+def test_backup_refuses_an_invalid_retention_setting(host: Host) -> None:
+    host.backup_files()
+    with (host.root / "etc/oveo/backup.env").open("a", encoding="utf-8") as config:
+        config.write("BACKUP_KEEP=0\n")
+    host.data_directory(revision="rev1", attachments={})
+
+    outcome = host.run("oveo-backup")
+
+    assert outcome.status == 1
+    assert "BACKUP_KEEP must be a whole number from 1 to 30" in outcome.stderr
+    assert not host.backups.exists() or list(host.backups.iterdir()) == []
+
+
 def test_incomplete_backup_is_kept_apart_and_never_rotates_complete_ones(host: Host) -> None:
     host.backup_files()
     host.data_directory(revision="rev1", attachments={"a.docx": b"synthetic"})
