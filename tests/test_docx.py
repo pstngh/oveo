@@ -470,6 +470,24 @@ def test_a_member_that_understates_its_size_is_never_inflated_past_it() -> None:
     assert peak < 16 << 20
 
 
+@pytest.mark.parametrize("method", [zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA])
+def test_members_python_cannot_inflate_in_bounded_steps_are_refused(method: int) -> None:
+    # Python inflates these in one step whatever size the headers declare, so the
+    # package is refused before any member is read.
+    output = io.BytesIO()
+    with (
+        zipfile.ZipFile(io.BytesIO(make_docx())) as source,
+        zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as target,
+    ):
+        for info in source.infolist():
+            target.writestr(info.filename, source.read(info))
+        target.writestr("word/media/image1.bin", b"\0" * 1024, compress_type=method)
+
+    with pytest.raises(DocxError) as caught:
+        extract_docx(output.getvalue())
+    assert caught.value.code == "unsafe_docx_package"
+
+
 def test_a_damaged_compressed_stream_is_an_invalid_docx() -> None:
     rebuilt, offsets = _rezip(make_docx(), replace={})
     package = bytearray(rebuilt)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-import lzma
 import re
 import stat
 import zipfile
@@ -24,6 +23,8 @@ MAX_DOCX_XML_ELEMENTS = 300_000
 MAX_DOCX_PARAGRAPHS = 20_000
 MAX_COMPRESSION_RATIO = 500
 MIN_DOCX_UNCOMPRESSED_BYTES = 20_000_000
+# The only compression methods an OPC package may use; both inflate in bounded steps.
+_PACKAGE_COMPRESSION = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
 
 _CONTENT_TYPES = "[Content_Types].xml"
 _DOCUMENT_PART = "word/document.xml"
@@ -277,6 +278,13 @@ def _validated_infos(
             raise DocxError("unsafe_docx_package", "The DOCX package contains unsupported names.")
         if info.flag_bits & 0x1:
             raise DocxError("encrypted_docx", "Encrypted DOCX files are not supported.")
+        if info.compress_type not in _PACKAGE_COMPRESSION:
+            # Python inflates a bzip2 or LZMA member in one unbounded step, so a few
+            # hundred bytes could expand past every size check. OPC allows neither.
+            raise DocxError(
+                "unsafe_docx_package",
+                "The DOCX package uses an unsupported compression method.",
+            )
         file_mode = (info.external_attr >> 16) & 0xFFFF
         if file_mode and stat.S_ISLNK(file_mode):
             raise DocxError("unsafe_docx_package", "DOCX package links are not supported.")
@@ -313,7 +321,6 @@ def _open_package(
     except (
         zipfile.BadZipFile,
         zlib.error,
-        lzma.LZMAError,
         EOFError,
         OSError,
         RuntimeError,
