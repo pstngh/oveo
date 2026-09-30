@@ -97,6 +97,11 @@ jobs:
           IMAGE: ghcr.io/pstngh/oveo@${{ steps.build.outputs.digest }}
         run: |
           set -eu
+          # Checked before the cleanup below is armed: it removes these paths.
+          if [ -e /etc/oveo/runtime.env ] || [ -e /var/lib/oveo ]; then
+            echo "The runner already has Oveo paths; refusing to rehearse over them." >&2
+            exit 1
+          fi
           runtime=$(mktemp "$RUNNER_TEMP/oveo-runtime.XXXXXX")
           # runtime.env is root-only, as on the host, and compose reads it client-side.
           compose() {
@@ -110,10 +115,6 @@ jobs:
             rm -f -- "$runtime"
           }
           trap cleanup EXIT HUP INT TERM
-          if [ -e /etc/oveo/runtime.env ] || [ -e /var/lib/oveo ]; then
-            echo "The runner already has Oveo paths; refusing to rehearse over them." >&2
-            exit 1
-          fi
           docker pull "$IMAGE"
           docker image inspect "$IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
             | grep -Fx "$GITHUB_SHA"

@@ -18,10 +18,12 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/oveo-venv \
     UV_COMPILE_BYTECODE=1
 WORKDIR /build
 COPY --from=uv /uv /usr/local/bin/uv
-COPY pyproject.toml uv.lock README.md ./
-# Dependencies first, so a change to the application code reuses this layer.
+COPY pyproject.toml uv.lock ./
+# Dependencies first, so a change to the application code (or the README it packages)
+# reuses this layer.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
+COPY README.md ./
 COPY src/ ./src/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-editable
@@ -52,6 +54,10 @@ RUN groupadd --gid 10001 oveo \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /app oveo \
     && mkdir -p /app /data \
     && chown 10001:10001 /app /data
+# The base image ships the standard library without bytecode, which the read-only
+# runtime cannot write: the health check's fresh interpreter every 30 seconds took
+# 0.23 s instead of 0.05 s, compiling its imports from source each time.
+RUN python -m compileall -q -j 0 -x /site-packages/ /usr/local/lib/python3.13
 
 COPY --from=python-build /opt/oveo-venv/ /opt/oveo-venv/
 COPY --from=python-build --chown=10001:10001 /build/tiktoken-cache/ /app/tiktoken-cache/
