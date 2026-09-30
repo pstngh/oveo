@@ -70,8 +70,11 @@ document to transform or a style reference, subject to the configured byte and w
 limits. DOCX uploads are validated as bounded, non-encrypted, non-macro OOXML
 packages (including element and paragraph counts, checked before the document tree
 is built) and extracted as stable paragraph and table-cell blocks on a single
-background worker that turns new uploads away while it is busy. Tracked changes and
-field-code hyperlinks are rejected because they cannot be rewritten safely in v1.
+background worker that turns new uploads away while it is busy. Tracked changes are
+rejected because they cannot be rewritten safely in v1. Hyperlinks written as field
+codes (`HYPERLINK` fields) are protected like ordinary Word hyperlinks: their code and
+target are never rewritten, only their display text. A paragraph with any other field,
+such as a table-of-contents entry or a page number, is left untouched.
 Text inside text boxes and shapes is never extracted or rewritten, like headers and
 footers. Line breaks, tabs, and non-breaking and soft hyphens inside a paragraph are
 kept, and a paragraph whose text runs across a page or column break is left

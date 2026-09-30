@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import io
 import re
 import stat
@@ -66,11 +67,16 @@ _INLINE_TAGS = (_T_TAG, *_INLINE_CHARACTERS)
 _HYPERLINK_TAG = f"{{{_W}}}hyperlink"
 _BODY_TAG = f"{{{_W}}}body"
 _TRACKED_CHANGE_TAGS = tuple(f"{{{_W}}}{name}" for name in ("ins", "del", "moveFrom", "moveTo"))
+_FLD_CHAR_TAG = f"{{{_W}}}fldChar"
+_FLD_CHAR_TYPE = f"{{{_W}}}fldCharType"
 _INSTR_TEXT_TAG = f"{{{_W}}}instrText"
 _FLD_SIMPLE_TAG = f"{{{_W}}}fldSimple"
+_FLD_SIMPLE_INSTRUCTION = f"{{{_W}}}instr"
 _PPR_TAG = f"{{{_W}}}pPr"
+_RPR_TAG = f"{{{_W}}}rPr"
 _ALTERNATE_CONTENT_TAG = f"{{{_MC}}}AlternateContent"
-_FIELD_TAGS = frozenset({f"{{{_W}}}fldChar", _INSTR_TEXT_TAG, _FLD_SIMPLE_TAG})
+_FIELD_TAGS = frozenset({_FLD_CHAR_TAG, _INSTR_TEXT_TAG, _FLD_SIMPLE_TAG})
+_HYPERLINK_INSTRUCTION = re.compile(r"\s*HYPERLINK\b", flags=re.IGNORECASE)
 _IN_TABLE_CELL = etree.XPath("ancestor::w:tc", namespaces=_NS)
 _BLOCK_ID = re.compile(r"p[0-9]{6}\Z")
 _LINK_ID = re.compile(r"l[0-9]{6}\Z")
@@ -119,6 +125,31 @@ class DocxReplacement:
 class ExtractedDocx:
     blocks: tuple[DocxBlock, ...]
     plain_text: str
+
+
+@dataclass(frozen=True, slots=True)
+class _Link:
+    """One protected hyperlink of a paragraph and the items of its display text.
+
+    ``start`` and ``end`` are where plain text can be inserted around the link: the
+    ``w:hyperlink`` or ``w:fldSimple`` element itself, or the begin and end field
+    characters of a complex HYPERLINK field.
+    """
+
+    start: etree._Element
+    end: etree._Element
+    items: list[etree._Element]
+    # The w:hyperlink element, whose relationship is checked; None for a field.
+    hyperlink: etree._Element | None
+
+
+@dataclass(frozen=True, slots=True)
+class _Layout:
+    """A paragraph's own text: plain stretches around its protected hyperlinks."""
+
+    # One more stretch than there are links: before, between, and after them.
+    plain: list[list[etree._Element]]
+    links: list[_Link]
 
 
 @dataclass(slots=True)
@@ -375,25 +406,12 @@ def _hyperlink_relationships(archive: zipfile.ZipFile, names: set[str]) -> set[s
 
 
 def _reject_unsupported_markup(root: etree._Element) -> None:
-    # Single tree walks: XPath unions of large node sets are merged quadratically.
+    # A single tree walk: XPath unions of large node sets are merged quadratically.
     if next(root.iter(*_TRACKED_CHANGE_TAGS), None) is not None:
         raise DocxError(
             "tracked_changes_not_supported",
             "Accept or reject tracked changes before uploading the DOCX.",
         )
-    for field in root.iter(_INSTR_TEXT_TAG, _FLD_SIMPLE_TAG):
-        if field.tag == _FLD_SIMPLE_TAG:
-            instructions = [field.get(f"{{{_W}}}instr")]
-        else:
-            instructions = [field.text, *(child.tail for child in field)]
-        if any(
-            value and re.search(r"\bHYPERLINK\b", value, flags=re.IGNORECASE)
-            for value in instructions
-        ):
-            raise DocxError(
-                "complex_hyperlink_not_supported",
-                "The DOCX contains a field-code hyperlink that cannot be edited safely.",
-            )
 
 
 def _body_paragraphs(root: etree._Element) -> list[etree._Element]:
@@ -461,10 +479,6 @@ def _item_text(item: etree._Element) -> str:
     return _INLINE_CHARACTERS[item.tag]
 
 
-def _text(node: etree._Element, paragraph: etree._Element) -> str:
-    return "".join(_item_text(item) for item in _own_inline_items(node, paragraph))
-
-
 def _has_interior_layout_break(paragraph: etree._Element) -> bool:
     """True when a page or column break sits between pieces of the paragraph's text."""
 
@@ -498,6 +512,97 @@ def _reject_reserved_link_text(value: str) -> None:
         )
 
 
+def _checked_text(items: Sequence[etree._Element]) -> str:
+    value = "".join(_item_text(item) for item in items)
+    _reject_reserved_link_text(value)
+    return value
+
+
+def _is_hyperlink_instruction(instruction: str) -> bool:
+    return _HYPERLINK_INSTRUCTION.match(instruction) is not None
+
+
+def _instruction_text(node: etree._Element) -> str:
+    return "".join([node.text or "", *(child.tail or "" for child in node)])
+
+
+def _paragraph_layout(paragraph: etree._Element) -> _Layout | None:
+    """Split the paragraph's own text around its hyperlinks, or None to leave it alone.
+
+    A hyperlink is a ``w:hyperlink`` element, a simple HYPERLINK field, or a complex
+    HYPERLINK field whose code and result both sit in the paragraph's own runs. Only
+    its result is text; its code keeps the target. Any other field, and a field shared
+    with another paragraph, cannot be rewritten without risking its code or result,
+    so the paragraph stays untouched.
+    """
+
+    plain: list[list[etree._Element]] = [[]]
+    links: list[_Link] = []
+    begin: etree._Element | None = None  # The open complex field's begin character.
+    instruction: list[str] = []
+    display: list[etree._Element] | None = None  # Its result, once the code is read.
+    for child in paragraph:
+        if child.tag == _PPR_TAG:
+            continue
+        if child.tag in (_HYPERLINK_TAG, _FLD_SIMPLE_TAG):
+            if (
+                begin is not None
+                or any(
+                    field is not child and _belongs_to(field, paragraph)
+                    for field in child.iter(*_FIELD_TAGS)
+                )
+                or (
+                    child.tag == _FLD_SIMPLE_TAG
+                    and not _is_hyperlink_instruction(child.get(_FLD_SIMPLE_INSTRUCTION, ""))
+                )
+            ):
+                return None
+            hyperlink = child if child.tag == _HYPERLINK_TAG else None
+            links.append(_Link(child, child, _own_inline_items(child, paragraph), hyperlink))
+            plain.append([])
+            continue
+        for element in child.iter(*_FIELD_TAGS, *_INLINE_TAGS):
+            if element.tag not in _FIELD_TAGS:
+                if not _is_inline_item(element, paragraph):
+                    continue
+                if display is not None:
+                    display.append(element)
+                elif begin is not None:
+                    return None  # Text inside a field code.
+                else:
+                    plain[-1].append(element)
+                continue
+            if not _belongs_to(element, paragraph):
+                continue
+            if (
+                element.tag == _FLD_SIMPLE_TAG
+                or child.tag != _R_TAG
+                or element.getparent() is not child
+            ):
+                return None  # Field markup outside the paragraph's own runs.
+            if element.tag == _INSTR_TEXT_TAG:
+                if begin is None or display is not None:
+                    return None
+                instruction.append(_instruction_text(element))
+                continue
+            kind = element.get(_FLD_CHAR_TYPE)
+            if kind == "begin" and begin is None:
+                begin, instruction = element, []
+            elif kind == "separate" and begin is not None and display is None:
+                if not _is_hyperlink_instruction("".join(instruction)):
+                    return None
+                display = []
+            elif kind == "end" and begin is not None and display is not None:
+                links.append(_Link(begin, element, display, None))
+                plain.append([])
+                begin, display = None, None
+            else:
+                return None
+    if begin is not None:
+        return None
+    return _Layout(plain=plain, links=links)
+
+
 def _paragraph_block(
     paragraph: etree._Element,
     *,
@@ -505,7 +610,8 @@ def _paragraph_block(
     link_number: int,
     hyperlink_relationships: set[str],
 ) -> tuple[DocxBlock | None, int]:
-    if any(_belongs_to(element, paragraph) for element in paragraph.iter(*_FIELD_TAGS)):
+    layout = _paragraph_layout(paragraph)
+    if layout is None:
         return None, link_number
     if _has_own_alternate_content(paragraph):
         # Alternative renderings of the same text (for example a symbol with a legacy
@@ -525,35 +631,31 @@ def _paragraph_block(
             "The DOCX contains a nested hyperlink that cannot be edited safely.",
         )
     parts: list[str] = []
-    for child in paragraph:
-        if child.tag == _PPR_TAG:
-            continue
-        if child.tag != _HYPERLINK_TAG:
-            value = _text(child, paragraph)
-            _reject_reserved_link_text(value)
-            parts.append(value)
-            continue
-        display = _text(child, paragraph)
+    for before, link in zip(layout.plain, layout.links, strict=False):
+        parts.append(_checked_text(before))
+        display = "".join(_item_text(item) for item in link.items)
         if not display:
             # Image-only links and other non-text hyperlinks remain untouched. Omitting
             # the paragraph prevents a rewrite from moving text around the protected link.
             return None, link_number
         _reject_reserved_link_text(display)
-        rel_id = child.get(f"{{{_R}}}id")
-        anchor = child.get(f"{{{_W}}}anchor")
-        if rel_id is None and anchor is None:
-            raise DocxError(
-                "unsupported_docx_hyperlink",
-                "The DOCX contains an unsupported hyperlink.",
-            )
-        if rel_id is not None and rel_id not in hyperlink_relationships:
-            raise DocxError(
-                "unsupported_docx_hyperlink",
-                "The DOCX contains a broken hyperlink relationship.",
-            )
+        if link.hyperlink is not None:
+            rel_id = link.hyperlink.get(f"{{{_R}}}id")
+            anchor = link.hyperlink.get(f"{{{_W}}}anchor")
+            if rel_id is None and anchor is None:
+                raise DocxError(
+                    "unsupported_docx_hyperlink",
+                    "The DOCX contains an unsupported hyperlink.",
+                )
+            if rel_id is not None and rel_id not in hyperlink_relationships:
+                raise DocxError(
+                    "unsupported_docx_hyperlink",
+                    "The DOCX contains a broken hyperlink relationship.",
+                )
         link_number += 1
         link_id = f"l{link_number:06d}"
         parts.append(f"{{{{OVEO_LINK_{link_id}}}}}{display}{{{{/OVEO_LINK_{link_id}}}}}")
+    parts.append(_checked_text(layout.plain[-1]))
     text = "".join(parts)
     if not any(node.text for node in _own_text_nodes(paragraph, paragraph)):
         # Tabs or line breaks without any text are layout, not content to edit.
@@ -797,11 +899,41 @@ def _rewrite_items(items: Sequence[etree._Element], value: str) -> None:
         run.insert(position + offset, element)
 
 
+def _field_boundary_run(field_character: etree._Element, *, before: bool) -> etree._Element:
+    """The run that starts (``before``) or ends with ``field_character``.
+
+    Content sharing its run on the far side moves to a new run with the same
+    properties, so text inserted next to the returned run lands exactly at the field
+    boundary rather than across another field character or a break.
+    """
+
+    run = field_character.getparent()
+    if before:
+        if all(item.tag == _RPR_TAG for item in field_character.itersiblings(preceding=True)):
+            return run
+        moving = [field_character, *field_character.itersiblings()]
+    else:
+        moving = list(field_character.itersiblings())
+        if not moving:
+            return run
+    paragraph = run.getparent()
+    remainder = etree.Element(_R_TAG, attrib=dict(run.attrib))
+    # In the tree first, so the moved content keeps the document's namespace prefixes.
+    paragraph.insert(paragraph.index(run) + 1, remainder)
+    properties = run.find(_RPR_TAG)
+    if properties is not None:
+        remainder.append(copy.deepcopy(properties))
+    remainder.extend(moving)
+    return remainder if before else run
+
+
 def _insert_plain_run(value: str, *, anchor: etree._Element, before: bool) -> None:
     if not value:
         return
     run = etree.Element(_R_TAG)
     run.extend(_inline_elements(value))
+    if anchor.tag == _FLD_CHAR_TAG:
+        anchor = _field_boundary_run(anchor, before=before)
     paragraph = anchor.getparent()
     position = paragraph.index(anchor)
     paragraph.insert(position if before else position + 1, run)
@@ -809,37 +941,27 @@ def _insert_plain_run(value: str, *, anchor: etree._Element, before: bool) -> No
 
 def _patch_paragraph(paragraph: etree._Element, replacement: DocxReplacement) -> None:
     plain_parts, replacement_links = _link_parts(replacement.text)
-    hyperlinks = [child for child in paragraph if child.tag == _HYPERLINK_TAG]
-    if len(hyperlinks) != len(replacement_links):
+    # Only the paragraph's own text: text boxes anchored here keep theirs.
+    layout = _paragraph_layout(paragraph)
+    if layout is None or len(layout.links) != len(replacement_links):
         raise DocxError("invalid_docx_blocks", "The DOCX template no longer matches its blocks.")
-    segments: list[list[etree._Element]] = [[]]
-    for child in paragraph:
-        if child.tag == _PPR_TAG:
-            continue
-        if child.tag == _HYPERLINK_TAG:
-            segments.append([])
-        else:
-            # Only the paragraph's own text: text boxes anchored here keep theirs.
-            segments[-1].extend(_own_inline_items(child, paragraph))
-    if len(segments) != len(plain_parts):
-        raise DocxError("invalid_docx_blocks", "The DOCX template no longer matches its blocks.")
-    for index, (items, value) in enumerate(zip(segments, plain_parts, strict=True)):
+    links = layout.links
+    for index, (items, value) in enumerate(zip(layout.plain, plain_parts, strict=True)):
         if items:
             _rewrite_items(items, value)
-        elif index < len(hyperlinks):
-            _insert_plain_run(value, anchor=hyperlinks[index], before=True)
-        elif hyperlinks:
+        elif index < len(links):
+            _insert_plain_run(value, anchor=links[index].start, before=True)
+        elif links:
             # Directly after the last link: a trailing page break stays after the text.
-            _insert_plain_run(value, anchor=hyperlinks[-1], before=False)
+            _insert_plain_run(value, anchor=links[-1].end, before=False)
         elif value:
             raise DocxError(
                 "invalid_docx_blocks", "The DOCX template no longer matches its blocks."
             )
-    for hyperlink, (_, display) in zip(hyperlinks, replacement_links, strict=True):
-        items = _own_inline_items(hyperlink, paragraph)
-        if not items:
+    for link, (_, display) in zip(links, replacement_links, strict=True):
+        if not link.items:
             raise DocxError("invalid_docx_blocks", "The DOCX hyperlink has no editable text.")
-        _rewrite_items(items, display)
+        _rewrite_items(link.items, display)
 
 
 _OUTDATED_TEMPLATE_MESSAGE = (

@@ -137,9 +137,11 @@ OpenRouter's metadata without ever inventing an unknown amount.
 
 DOCX input stays inside the existing attachment directory and backup/deletion
 lifecycle. Upload validation bounds ZIP members, expanded size, compression ratio,
-and XML part size; rejects unsafe paths, encryption, macros, malformed OOXML,
-tracked changes, and complex field hyperlinks; and extracts only main-document
-paragraph and table-cell text. Element and paragraph counts are bounded before the
+and XML part size; rejects unsafe paths, encryption, macros, malformed OOXML, and
+tracked changes; and extracts only main-document paragraph and table-cell text.
+Hyperlink elements and `HYPERLINK` fields, simple or complex, become the same
+protected hyperlink tokens; a complex field qualifies only when its code and result
+both sit in the paragraph's own runs, and only its result is ever rewritten. Element and paragraph counts are bounded before the
 document tree is built, and parsing runs on a dedicated single-thread worker with an
 admission limit. The immutable extracted block map is stored with the attachment so
 transcript reconstruction does not repeatedly parse the OOXML package; every later

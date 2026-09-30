@@ -138,12 +138,205 @@ def test_rejects_malformed_oversized_macro_and_tracked_change_packages() -> None
         extract_docx(make_docx(document_xml=tracked))
 
 
-def test_rejects_complex_field_hyperlinks() -> None:
-    field_link = f"""<w:document xmlns:w="{W}" xmlns:r="{R}"><w:body><w:p>
-<w:r><w:instrText> HYPERLINK &quot;https://example.com&quot; </w:instrText></w:r>
-</w:p></w:body></w:document>"""
-    with pytest.raises(DocxError, match="field-code hyperlink"):
-        extract_docx(make_docx(document_xml=field_link))
+def _field(kind: str, *, style: bool = False) -> str:
+    properties = '<w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr>' if style else ""
+    return f'<w:r>{properties}<w:fldChar w:fldCharType="{kind}"/></w:r>'
+
+
+def _field_link(display: str, *, target: str = "https://example.com/policy") -> str:
+    """A hyperlink as Word writes it with field codes: code, result, and end."""
+
+    return (
+        _field("begin")
+        + f'<w:r><w:instrText xml:space="preserve"> HYPERLINK "{target}" </w:instrText></w:r>'
+        + _field("separate")
+        + f'<w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:t>{display}</w:t></w:r>'
+        + _field("end", style=True)
+    )
+
+
+def _field_sequence(paragraph: bytes) -> list[str]:
+    """The paragraph's field characters, field code, and text, in document order."""
+
+    sequence = []
+    for element in etree.fromstring(paragraph).iter(
+        f"{{{W}}}fldChar", f"{{{W}}}instrText", f"{{{W}}}t", f"{{{W}}}br"
+    ):
+        name = etree.QName(element).localname
+        if name == "fldChar":
+            sequence.append(element.get(f"{{{W}}}fldCharType"))
+        elif name == "br":
+            sequence.append(f"<{element.get(f'{{{W}}}type')}>")
+        else:
+            sequence.append(element.text or "")
+    return sequence
+
+
+def test_field_code_hyperlinks_are_protected_like_hyperlink_elements() -> None:
+    template = make_docx(
+        document_xml=_body(
+            '<w:p><w:r><w:t xml:space="preserve">Consultez la </w:t></w:r>'
+            f"{_field_link('politique')}"
+            '<w:r><w:t xml:space="preserve"> ou le </w:t></w:r>'
+            '<w:hyperlink r:id="rId5"><w:r><w:t>site</w:t></w:r></w:hyperlink>'
+            '<w:r><w:t xml:space="preserve"> et le </w:t></w:r>'
+            '<w:fldSimple w:instr=" HYPERLINK &quot;https://example.com/guide&quot; ">'
+            "<w:r><w:t>guide</w:t></w:r></w:fldSimple><w:r><w:t>.</w:t></w:r></w:p>"
+        )
+    )
+    (block,) = extract_docx(template).blocks
+    assert block.text == (
+        "Consultez la {{OVEO_LINK_l000001}}politique{{/OVEO_LINK_l000001}} ou le "
+        "{{OVEO_LINK_l000002}}site{{/OVEO_LINK_l000002}} et le "
+        "{{OVEO_LINK_l000003}}guide{{/OVEO_LINK_l000003}}."
+    )
+
+    translated = (
+        "Read the {{OVEO_LINK_l000001}}harassment policy{{/OVEO_LINK_l000001}}, the "
+        "{{OVEO_LINK_l000002}}website{{/OVEO_LINK_l000002}}, and the "
+        "{{OVEO_LINK_l000003}}guide for managers{{/OVEO_LINK_l000003}}."
+    )
+    exported = render_docx(template, [DocxReplacement(id="p000001", text=translated)])
+
+    assert [block.text for block in extract_docx(exported).blocks] == [translated]
+    (paragraph,) = _paragraph_xml(exported)
+    # The field code and its target are untouched; only the result changed, and the
+    # surrounding text stayed outside the field.
+    assert _field_sequence(paragraph)[:6] == [
+        "Read the ",
+        "begin",
+        ' HYPERLINK "https://example.com/policy" ',
+        "separate",
+        "harassment policy",
+        "end",
+    ]
+    assert b"HYPERLINK &quot;https://example.com/guide&quot;" in paragraph
+    assert b"Hyperlink" in paragraph
+
+
+def test_text_is_added_around_field_hyperlinks_at_their_exact_boundaries() -> None:
+    # The paragraph starts and ends with a field; two fields share a run, as does the
+    # last field's end with a trailing page break.
+    template = make_docx(
+        document_xml=_body(
+            "<w:p>"
+            + _field_link("un").removesuffix(_field("end", style=True))
+            + '<w:r><w:fldChar w:fldCharType="end"/><w:fldChar w:fldCharType="begin"/></w:r>'
+            + '<w:r><w:instrText xml:space="preserve"> HYPERLINK "https://example.com/2" '
+            + "</w:instrText></w:r>"
+            + _field("separate")
+            + "<w:r><w:t>deux</w:t></w:r>"
+            + '<w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr>'
+            + '<w:fldChar w:fldCharType="end"/><w:br w:type="page"/></w:r></w:p>'
+        )
+    )
+    assert [block.text for block in extract_docx(template).blocks] == [
+        "{{OVEO_LINK_l000001}}un{{/OVEO_LINK_l000001}}"
+        "{{OVEO_LINK_l000002}}deux{{/OVEO_LINK_l000002}}"
+    ]
+
+    rewritten = (
+        "First {{OVEO_LINK_l000001}}one{{/OVEO_LINK_l000001}} then "
+        "{{OVEO_LINK_l000002}}two{{/OVEO_LINK_l000002}} last."
+    )
+    exported = render_docx(template, [DocxReplacement(id="p000001", text=rewritten)])
+
+    assert [block.text for block in extract_docx(exported).blocks] == [rewritten]
+    (paragraph,) = _paragraph_xml(exported)
+    assert _field_sequence(paragraph) == [
+        "First ",
+        "begin",
+        ' HYPERLINK "https://example.com/policy" ',
+        "separate",
+        "one",
+        "end",
+        " then ",
+        "begin",
+        ' HYPERLINK "https://example.com/2" ',
+        "separate",
+        "two",
+        "end",
+        " last.",
+        "<page>",
+    ]
+    # The split run keeps its properties, and the added text is not styled as a link.
+    root = etree.fromstring(paragraph)
+    for run in root.iter(f"{{{W}}}r"):
+        if run.find(f"{{{W}}}br") is not None:
+            assert run.find(f"{{{W}}}rPr/{{{W}}}rStyle") is not None
+        texts = [node.text for node in run.iter(f"{{{W}}}t")]
+        if texts in ([" then "], [" last."], ["First "]):
+            assert run.find(f"{{{W}}}rPr") is None
+    assert b"xmlns" not in paragraph.split(b">", 1)[1]
+
+
+def test_unchanged_field_hyperlink_paragraphs_export_exactly() -> None:
+    template = make_docx(
+        document_xml=_body(
+            f"<w:p><w:r><w:t xml:space='preserve'>Voir </w:t></w:r>{_field_link('ici')}</w:p>"
+        )
+    )
+    blocks = extract_docx(template).blocks
+    exported = render_docx(template, [DocxReplacement(id=b.id, text=b.text) for b in blocks])
+    assert _paragraph_xml(exported) == _paragraph_xml(template)
+
+
+_TOC_ENTRY = (
+    _field("begin")
+    + '<w:r><w:instrText xml:space="preserve"> HYPERLINK \\l "_Toc1" </w:instrText></w:r>'
+    + _field("separate")
+    + "<w:r><w:t>Introduction</w:t></w:r><w:r><w:tab/></w:r>"
+    + _field("begin")
+    + '<w:r><w:instrText xml:space="preserve"> PAGEREF _Toc1 \\h </w:instrText></w:r>'
+    + _field("separate")
+    + "<w:r><w:t>1</w:t></w:r>"
+    + _field("end")
+    + _field("end")
+)
+
+
+@pytest.mark.parametrize(
+    "untouched",
+    [
+        # A table of contents: the TOC field spans paragraphs and each entry nests a
+        # page reference inside its hyperlink.
+        _field("begin")
+        + '<w:r><w:instrText xml:space="preserve"> TOC \\o "1-3" \\h </w:instrText></w:r>'
+        + _field("separate")
+        + _TOC_ENTRY,
+        _TOC_ENTRY,
+        # A hyperlink field whose code or result continues in another paragraph.
+        _field_link("suite").removesuffix(_field("end", style=True)),
+        "<w:r><w:t>et fin</w:t></w:r>" + _field("end"),
+        # A hyperlink field without a result, and a field that is not a hyperlink.
+        '<w:r><w:t xml:space="preserve">Lien : </w:t></w:r>'
+        + _field("begin")
+        + '<w:r><w:instrText xml:space="preserve"> HYPERLINK "https://example.com" '
+        + "</w:instrText></w:r>"
+        + _field("end"),
+        '<w:r><w:t xml:space="preserve">Page </w:t></w:r><w:fldSimple w:instr=" PAGE ">'
+        "<w:r><w:t>3</w:t></w:r></w:fldSimple>",
+        # Field markup inside a hyperlink element or a content control.
+        '<w:hyperlink r:id="rId5"><w:r><w:t>site</w:t></w:r>'
+        + _field("begin")
+        + "<w:r><w:instrText> PAGE </w:instrText></w:r>"
+        + _field("end")
+        + "</w:hyperlink>",
+        "<w:sdt><w:sdtContent>" + _field_link("contrôle") + "</w:sdtContent></w:sdt>",
+    ],
+)
+def test_paragraphs_with_other_fields_are_left_untouched(untouched: str) -> None:
+    template = make_docx(
+        document_xml=_body(
+            f"<w:p>{untouched}</w:p><w:p><w:r><w:t>Texte du corps.</w:t></w:r></w:p>"
+        )
+    )
+    assert [block.text for block in extract_docx(template).blocks] == ["Texte du corps."]
+
+    exported = render_docx(template, [DocxReplacement(id="p000001", text="Body text.")])
+    before, after = _paragraph_xml(template), _paragraph_xml(exported)
+    assert after[0] == before[0]
+    assert b"Body text." in after[-1]
 
 
 def test_rejects_reserved_tokens_inside_hyperlink_display_text() -> None:
