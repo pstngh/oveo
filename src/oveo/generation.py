@@ -29,6 +29,7 @@ from oveo.context import (
     HANDOFF_SENTINEL,
     AttachmentDocument,
     AttachmentRole,
+    ContextBuildError,
     PromptLoader,
     build_handoff_merge_messages,
     build_provider_messages,
@@ -401,7 +402,7 @@ _WORK_KINDS = {"translate": "translation", "revision": "revision", "internal_com
 _ACTIVE = frozenset(ACTIVE_GENERATION_STATUSES)
 _TRUNCATED_RESPONSE_CODES = frozenset({"response_too_long", "provider_content_filtered"})
 # Failures a retry repeats exactly: its message tells the user what to do instead.
-_NOT_RETRYABLE_CODES = frozenset({"attachment_unavailable"})
+_NOT_RETRYABLE_CODES = frozenset({"attachment_unavailable", "context_unavailable"})
 # Failures of a valid visible response whose state could not be saved; the response
 # stays shown with the error.
 _STATE_FAILURE_CODES: dict[type[Exception], str] = {
@@ -519,6 +520,7 @@ class _UsageContext:
 _LOGGER = logging.getLogger("oveo.background")
 _ERROR_MESSAGES = {
     "provider_not_configured": "The model provider is not configured.",
+    "provider_misconfigured": "The model provider is not configured correctly.",
     "provider_network": "The model provider could not be reached.",
     "provider_transient": "The model provider is temporarily unavailable.",
     "provider_rejected": "The model provider rejected the request.",
@@ -547,6 +549,14 @@ _ERROR_MESSAGES = {
     "attachment_unavailable": (
         "A Word document saved in this conversation could not be read. Start a new "
         "conversation and upload the document again."
+    ),
+    "attachment_unreadable": (
+        "A Word document saved in this conversation could not be read just now. "
+        "Try again in a moment."
+    ),
+    "context_unavailable": (
+        "Oveo could not prepare this conversation for the model. Start a new "
+        "conversation to continue."
     ),
     "context_compaction_failed": "Oveo could not safely fit this conversation in context.",
     "handoff_turn_too_large": (
@@ -1359,10 +1369,18 @@ class GenerationManager:
         try:
             await self._verify_attachment_file(attachment)
             document_blocks = docx_blocks_from_storage(attachment.document_blocks)
-        except (OSError, DocxError) as exc:
+        except (FileNotFoundError, AttachmentIntegrityError, DocxError) as exc:
+            # Gone, or not the uploaded file: every retry would fail the same way.
             raise GenerationError(
                 "attachment_unavailable",
                 "The saved attachment is unavailable.",
+            ) from exc
+        except OSError as exc:
+            # Permissions after a restore, too many open files, an I/O error: these can
+            # pass, so the turn can be retried.
+            raise GenerationError(
+                "attachment_unreadable",
+                "The saved attachment could not be read.",
             ) from exc
         return AttachmentDocument(
             word_count=attachment.word_count,
@@ -3198,6 +3216,11 @@ class GenerationManager:
             await self._fail(generation_id, error.code)
         except ProtocolError:
             await self._fail(generation_id, "protocol_error")
+        except ContextBuildError as error:
+            # Stored conversation data the context cannot be built from; a retry would
+            # fail the same way, so it is not offered as a provider failure.
+            log_unexpected(_LOGGER, error, area="generation")
+            await self._fail(generation_id, "context_unavailable")
         except (StaleStateError, DocxTemplateOutdatedError, StatePersistenceError) as error:
             # The response itself was valid; keep it visible with the failure.
             await self._fail(

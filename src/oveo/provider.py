@@ -34,6 +34,9 @@ _REASONING_EFFORTS: frozenset[str] = frozenset({"max", "xhigh", "high", "medium"
 _MAX_RETRY_AFTER = 30.0
 # Costs above this are provider errors, not charges; a larger value could not be stored.
 _MAX_COST_USD = Decimal(1_000_000)
+# Raised before anything is sent, and alike on every attempt: the base URL lacks an
+# http(s) scheme, or the API key holds a character a header cannot (a trailing newline).
+_CONFIGURATION_ERRORS = (httpx.UnsupportedProtocol, httpx.LocalProtocolError)
 
 Role = Literal["system", "user", "assistant"]
 DeltaCallback = Callable[[str], Awaitable[None] | None]
@@ -450,6 +453,8 @@ class OpenRouterClient:
                 headers=headers,
                 timeout=self._settings.provider_metadata_timeout_seconds,
             )
+        except _CONFIGURATION_ERRORS as exc:
+            raise ProviderError("provider_misconfigured", retryable=False) from exc
         except httpx.RequestError as exc:
             raise ProviderError("provider_network", retryable=True) from exc
         if response.status_code == 404:
@@ -569,8 +574,10 @@ class OpenRouterClient:
         except TimeoutError as exc:
             # A stalled attempt is not replayed automatically: it may already be billed.
             raise failure("provider_timeout", retryable=False) from exc
+        except _CONFIGURATION_ERRORS as exc:
+            raise failure("provider_misconfigured", retryable=False) from exc
         except httpx.RequestError as exc:
-            # Transport, proxy, protocol and content-decoding failures alike.
+            # Transport, proxy, remote protocol and content-decoding failures alike.
             raise failure("provider_network", retryable=True) from exc
 
         # A truncated or filtered response is final; replaying it would bill the same

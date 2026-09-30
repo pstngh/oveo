@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import logging
+import os
 import re
 import sqlite3
 from collections.abc import AsyncGenerator
@@ -16,9 +18,10 @@ import pytest
 from pydantic import SecretStr
 from sqlalchemy import func, select
 
+import oveo.generation as generation_module
 from oveo.attachments import ValidatedAttachment
 from oveo.config import Settings
-from oveo.context import build_provider_messages
+from oveo.context import ContextBuildError, build_provider_messages
 from oveo.db import Database
 from oveo.docx import DocxBlock, docx_uncompressed_limit, extract_docx
 from oveo.generation import (
@@ -1918,6 +1921,91 @@ async def test_attachment_files_are_hashed_once_and_still_fail_closed_when_chang
     )
     failed = await _wait_status(manager, missing.generation_id, {"failed"})
     assert failed["error_code"] == "attachment_unavailable"
+    await manager.shutdown()
+
+
+async def test_an_attachment_that_cannot_be_read_just_now_can_be_retried(
+    manager_database: tuple[Database, Settings, User], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, settings, user = manager_database
+    package = make_docx()
+    extracted = extract_docx(
+        package, max_uncompressed_bytes=docx_uncompressed_limit(settings.max_upload_bytes)
+    )
+    attachment = ValidatedAttachment(
+        original_name="plain.docx",
+        content=package,
+        byte_count=len(package),
+        word_count=4,
+        sha256=hashlib.sha256(package).hexdigest(),
+        document_blocks=extracted.blocks,
+        plain_text=extracted.plain_text,
+    )
+    manager = GenerationManager(
+        database, settings, ScriptedProvider([_SUCCESS, b"A title", _SUCCESS])
+    )
+    first = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="unreadable-1",
+        text="Translate this.",
+        attachment=attachment,
+        owner_id=user.id,
+        mode="translate",
+    )
+    await _wait_status(manager, first.generation_id, {"completed"})
+    (stored,) = settings.attachments_dir.glob("*.docx")
+    # A changed identity makes the next turn read the file again.
+    os.utime(stored, ns=(stored.stat().st_atime_ns, stored.stat().st_mtime_ns + 1))
+    read = generation_module.read_stored_attachment
+
+    def too_many_open_files(*_args: object, **_kwargs: object) -> bytes:
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(generation_module, "read_stored_attachment", too_many_open_files)
+    second = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="unreadable-2",
+        text="Again.",
+        attachment=None,
+        thread_id=first.thread_id,
+    )
+    failed = await _wait_status(manager, second.generation_id, {"failed"})
+    assert failed["error_code"] == "attachment_unreadable"
+    # Unlike a missing or changed file, this can pass: the turn is not a dead end.
+    assert failed["retryable"] is True
+
+    monkeypatch.setattr(generation_module, "read_stored_attachment", read)
+    retry_id = await manager.retry(
+        generation_id=second.generation_id,
+        requester_id=user.id,
+        client_request_id="unreadable-retry",
+    )
+    await _wait_status(manager, retry_id, {"completed"})
+    await manager.shutdown()
+
+
+async def test_a_conversation_whose_context_cannot_be_built_is_not_offered_a_retry(
+    manager_database: tuple[Database, Settings, User], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, settings, user = manager_database
+
+    def broken_invariant(*_args: object, **_kwargs: object) -> object:
+        raise ContextBuildError("persisted message contains invalid content blocks")
+
+    monkeypatch.setattr(generation_module, "build_provider_messages", broken_invariant)
+    manager = GenerationManager(database, settings, ScriptedProvider([]))
+    submitted = await manager.submit_turn(
+        requester_id=user.id,
+        client_request_id="context-broken",
+        text="Translate this.",
+        attachment=None,
+        owner_id=user.id,
+        mode="translate",
+    )
+    failed = await _wait_status(manager, submitted.generation_id, {"failed"})
+    # Not a provider failure, and a retry would fail the same way.
+    assert failed["error_code"] == "context_unavailable"
+    assert failed["retryable"] is False
     await manager.shutdown()
 
 

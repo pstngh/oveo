@@ -530,7 +530,7 @@ async def test_retry_honors_a_short_retry_after_and_caps_a_long_one(tmp_path: Pa
     [
         httpx.ProxyError("proxy refused"),
         httpx.DecodingError("bad gzip"),
-        httpx.LocalProtocolError("bad request line"),
+        httpx.RemoteProtocolError("server closed the connection"),
     ],
 )
 async def test_every_request_error_is_a_retryable_network_failure(
@@ -555,6 +555,40 @@ async def test_every_request_error_is_a_retryable_network_failure(
 
     assert caught.value.code == "provider_network"
     assert calls == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.UnsupportedProtocol("Request URL is missing an 'http://' or 'https://' protocol."),
+        httpx.LocalProtocolError("Illegal header value b'Bearer key\\n'"),
+    ],
+)
+async def test_a_configuration_mistake_is_reported_once_as_such(
+    tmp_path: Path, error: httpx.RequestError
+) -> None:
+    # A base URL without a scheme or an API key with a trailing newline fails the same
+    # way on every attempt; it is not a network outage worth three attempts.
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise error
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        provider = OpenRouterClient(settings(tmp_path), client=http_client)
+        with pytest.raises(ProviderError) as caught:
+            await provider.stream_chat(
+                [ProviderMessage("user", "synthetic")], max_completion_tokens=100, on_delta=print
+            )
+        with pytest.raises(ProviderError) as metadata:
+            await provider.generation_cost("generation-1")
+
+    assert caught.value.code == metadata.value.code == "provider_misconfigured"
+    assert caught.value.retryable is False
+    assert calls == 2
 
 
 @pytest.mark.asyncio
