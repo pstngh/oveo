@@ -38,20 +38,26 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
+    sqlite = connection.dialect.name == "sqlite"
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
         render_as_batch=True,
         compare_type=True,
+        # SQLite's DDL is transactional once the driver leaves transactions to SQLAlchemy
+        # (see run_async_migrations): every pending migration and its revision stamp then
+        # commit together, after the check below, or not at all.
+        transactional_ddl=True if sqlite else None,
     )
     with context.begin_transaction():
         migration = context.get_context()
         before = migration.get_current_revision()
         context.run_migrations()
         # Every container start runs this; only one that migrated has anything to check.
-        if connection.dialect.name == "sqlite" and migration.get_current_revision() != before:
+        if sqlite and migration.get_current_revision() != before:
             # Foreign keys are off while migrating (see run_async_migrations), so the
             # result is checked instead: a migration must not leave a dangling reference.
+            # Raising here rolls the upgrade back, so the next start fails the same way.
             violations = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
             if violations:
                 raise RuntimeError(f"migrations left {len(violations)} foreign key violation(s)")
@@ -71,6 +77,13 @@ async def run_async_migrations() -> None:
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA foreign_keys=OFF")
             cursor.close()
+            # Python's sqlite3 opens a transaction only before data changes, so DDL would
+            # commit on its own; SQLAlchemy's begin emits BEGIN instead (below).
+            dbapi_connection.isolation_level = None
+
+        @event.listens_for(connectable.sync_engine, "begin")
+        def begin(sync_connection: Connection) -> None:
+            sync_connection.exec_driver_sql("BEGIN")
 
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)

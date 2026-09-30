@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import shutil
 import sqlite3
 from pathlib import Path
 
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 
 def _config(database_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
@@ -415,3 +417,64 @@ def test_dropping_request_snapshot_keeps_generations_and_their_links(
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         connection.close()
+
+
+# Leaves a child row without its parent; DOWN_REVISION is the current head.
+_DANGLING_REFERENCE_MIGRATION = """import sqlalchemy as sa
+from alembic import op
+
+revision = "29990101_9999"
+down_revision = "DOWN_REVISION"
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    op.create_table("probe_parent", sa.Column("id", sa.Integer, primary_key=True))
+    op.create_table(
+        "probe_child",
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("parent_id", sa.Integer, sa.ForeignKey("probe_parent.id"), nullable=False),
+    )
+    op.execute(sa.text("INSERT INTO probe_child (id, parent_id) VALUES (1, 42)"))
+
+
+def downgrade() -> None:
+    op.drop_table("probe_child")
+    op.drop_table("probe_parent")
+"""
+
+
+def test_a_migration_leaving_a_dangling_reference_is_undone_on_every_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "dangling.sqlite3"
+    config = _config(database_path, monkeypatch)
+    command.upgrade(config, "head")
+    head = ScriptDirectory.from_config(config).get_current_head()
+    # The real migrations plus one that leaves a child row without its parent.
+    scripts = tmp_path / "migrations"
+    shutil.copytree("migrations", scripts, ignore=shutil.ignore_patterns("__pycache__"))
+    (scripts / "versions" / "29990101_9999_dangling_reference.py").write_text(
+        _DANGLING_REFERENCE_MIGRATION.replace("DOWN_REVISION", str(head)), encoding="utf-8"
+    )
+    config.set_main_option("script_location", str(scripts))
+
+    # Every container start runs the upgrade: a restart must fail the same way instead of
+    # finding the revision already stamped and starting on the broken data.
+    for _start in range(2):
+        with pytest.raises(RuntimeError, match="1 foreign key violation"):
+            command.upgrade(config, "head")
+        connection = sqlite3.connect(database_path)
+        try:
+            assert connection.execute("SELECT version_num FROM alembic_version").fetchall() == [
+                (head,)
+            ]
+            assert (
+                connection.execute(
+                    "SELECT name FROM sqlite_schema WHERE name LIKE 'probe_%'"
+                ).fetchall()
+                == []
+            )
+        finally:
+            connection.close()
