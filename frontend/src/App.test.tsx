@@ -360,6 +360,34 @@ describe("sidebar header", () => {
 });
 
 describe("conversation scrolling", () => {
+  it("leaves a reader who scrolled up where they are when the answer is stored, and shows their own next message", () => {
+    let height = 5000;
+    const scrollHeight = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(() => height);
+    const clientHeight = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(500);
+    const said = (id: string, ordinal: number, role: "user" | "assistant") => ({
+      id, ordinal, role, blocks: [{ type: "conversation" as const, text: id }], attachment: null, created_at: "2026-09-16T00:00:00Z",
+    });
+    const asked = [said("question", 1, "user")];
+    const { container, rerender } = render(<MessageList detail={thread({ messages: asked })} generation={null} />);
+    const list = container.firstElementChild as HTMLDivElement;
+    expect(list.scrollTop).toBe(5000);
+
+    // Reading an earlier part of the long answer while it streams.
+    list.scrollTop = 1000;
+    fireEvent.scroll(list);
+    height = 6000;
+    const answered = [...asked, said("answer", 2, "assistant")];
+    rerender(<MessageList detail={thread({ messages: answered })} generation={null} />);
+    expect(list.scrollTop).toBe(1000);
+
+    height = 6500;
+    rerender(<MessageList detail={thread({ messages: [...answered, said("follow-up", 3, "user")] })} generation={null} />);
+    expect(list.scrollTop).toBe(6500);
+
+    scrollHeight.mockRestore();
+    clientHeight.mockRestore();
+  });
+
   it("scrolls the message history itself instead of moving the application viewport", () => {
     const scrollHeight = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(900);
     const detail = thread({ title: "Long conversation" });
@@ -467,6 +495,8 @@ describe("composer safeguards", () => {
     fireEvent.change(box, { target: { value: "日本" } });
 
     fireEvent.keyDown(box, { key: "Enter", isComposing: true });
+    // Safari ends the composition first and reports that Enter with keyCode 229 only.
+    fireEvent.keyDown(box, { key: "Enter", keyCode: 229 });
 
     expect(onSend).not.toHaveBeenCalled();
   });

@@ -352,15 +352,22 @@ const MessageItem = memo(function MessageItem({ message }: { message: Message })
   );
 });
 
-export function MessageList({ detail, generation }: { detail: ThreadDetail; generation: GenerationSnapshot | null }) {
+// Memoized: typing in the message box re-renders the workspace, not the conversation.
+export const MessageList = memo(function MessageList({ detail, generation }: { detail: ThreadDetail; generation: GenerationSnapshot | null }) {
   const messagesRef = useRef<HTMLDivElement>(null);
   // Whether the view follows new text: a reader who scrolled up to read earlier text is
-  // not pulled back down by the streaming answer. A new message is always shown.
+  // not pulled back down by the streaming answer, nor when that answer is then stored as
+  // a message. The user's own new message, and a newly opened conversation, are shown.
   const following = useRef(true);
+  const shown = useRef({ thread: detail.id, count: detail.messages.length });
   const messageCount = detail.messages.length;
   useEffect(() => {
-    following.current = true;
-  }, [messageCount]);
+    const previous = shown.current;
+    shown.current = { thread: detail.id, count: detail.messages.length };
+    if (previous.thread !== detail.id || detail.messages.slice(previous.count).some((message) => message.role === "user")) {
+      following.current = true;
+    }
+  }, [detail]);
   useEffect(() => {
     const messages = messagesRef.current;
     if (messages && following.current) messages.scrollTop = messages.scrollHeight;
@@ -392,7 +399,7 @@ export function MessageList({ detail, generation }: { detail: ThreadDetail; gene
       )}
     </div>
   );
-}
+});
 
 export interface ComposerDraft {
   text: string;
@@ -473,8 +480,10 @@ export function Composer({
     }
   }
   function keyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    // Enter that confirms an input-method composition is not a send.
-    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+    // Enter that confirms an input-method composition is not a send. Safari ends the
+    // composition first and reports that Enter with keyCode 229 instead of isComposing.
+    const composing = event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229;
+    if (event.key === "Enter" && !event.shiftKey && !composing) {
       event.preventDefault();
       void send();
     }
@@ -533,6 +542,37 @@ export function EmptyThread({ mode, onSelect }: { mode: Mode | null; onSelect: (
     </div>
   );
 }
+
+// Memoized: typing in the message box re-renders the workspace, and a long list of
+// conversations would otherwise be rebuilt on every keystroke.
+const ThreadList = memo(function ThreadList({
+  threads,
+  selectedId,
+  onOpen,
+  onDelete,
+}: {
+  threads: ThreadSummary[];
+  selectedId: string | null;
+  onOpen: (id: string) => void;
+  onDelete: (thread: ThreadSummary) => void;
+}) {
+  return (
+    <nav className="thread-list" aria-label="Conversations">
+      {threads.map((thread) => {
+        const selected = thread.id === selectedId;
+        return (
+          <div className={selected ? "thread-row selected" : "thread-row"} key={thread.id}>
+            <button className="thread-item" onClick={() => onOpen(thread.id)} aria-current={selected ? "page" : undefined}>
+              <div><span className="thread-title">{thread.title}</span>{thread.active_generation_id && <span className="activity-dot" role="img" aria-label="Generating" />}</div>
+              <ModeBadge mode={thread.mode} />
+            </button>
+            <button className="thread-delete" onClick={() => onDelete(thread)} aria-label={`Delete ${thread.title}`} title="Delete conversation"><Trash2 /></button>
+          </div>
+        );
+      })}
+    </nav>
+  );
+});
 
 export function SidebarHeader({ onClose }: { onClose: () => void }) {
   return (
@@ -872,14 +912,14 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
     adoptGeneration(queued(result.generation_id, failed.thread_id));
   }
 
-  function openThread(id: string) {
+  const openThread = useCallback((id: string) => {
     const shown = viewRef.current;
     if (shown.kind === "thread" && shown.id === id && detailRef.current?.id === id) {
       setSidebarOpen(false);
       return;
     }
     openView({ kind: "thread", id }, "push");
-  }
+  }, [openView]);
 
   function closeDelete() {
     setDeleteTarget(null);
@@ -1014,20 +1054,7 @@ function Workspace({ user, onSignedOut }: { user: SessionUser; onSignedOut: () =
       <aside id={sidebarId} className={sidebarOpen ? "sidebar open" : "sidebar"} inert={mobileLayout && !sidebarOpen}>
         <SidebarHeader onClose={() => setSidebarOpen(false)} />
         <button className="new-button" onClick={() => openView({ kind: "new", mode: null }, "push")}><Plus /> New</button>
-        <nav className="thread-list" aria-label="Conversations">
-          {threads.map((thread) => {
-            const selected = view.kind === "thread" && view.id === thread.id;
-            return (
-              <div className={selected ? "thread-row selected" : "thread-row"} key={thread.id}>
-                <button className="thread-item" onClick={() => openThread(thread.id)} aria-current={selected ? "page" : undefined}>
-                  <div><span className="thread-title">{thread.title}</span>{thread.active_generation_id && <span className="activity-dot" role="img" aria-label="Generating" />}</div>
-                  <ModeBadge mode={thread.mode} />
-                </button>
-                <button className="thread-delete" onClick={() => setDeleteTarget(thread)} aria-label={`Delete ${thread.title}`} title="Delete conversation"><Trash2 /></button>
-              </div>
-            );
-          })}
-        </nav>
+        <ThreadList threads={threads} selectedId={view.kind === "thread" ? view.id : null} onOpen={openThread} onDelete={setDeleteTarget} />
         <footer className="sidebar-footer"><span className="cost">{usage}</span><button className="icon-button" onClick={() => void logout()} disabled={signingOut} aria-label="Sign out"><LogOut /></button></footer>
       </aside>
       <main className="workspace">
