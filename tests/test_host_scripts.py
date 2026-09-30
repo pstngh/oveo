@@ -773,6 +773,22 @@ def test_backup_leaves_out_unreferenced_files_and_clears_the_failure_record(host
     assert not (host.backups / "BACKUP-FAILED").exists()
 
 
+def test_backup_removes_the_attachment_links_an_interrupted_run_left(host: Host) -> None:
+    host.backup_files()
+    host.data_directory(revision="rev1", attachments={"a.docx": b"synthetic"})
+    abandoned = host.data / ".backup-links.x1_y2"
+    abandoned.mkdir()
+    (abandoned / "attachments").mkdir()
+    os.link(host.data / "attachments" / "a.docx", abandoned / "attachments" / "a.docx")
+
+    outcome = host.run("oveo-backup")
+
+    assert outcome.status == 0, outcome.stderr
+    assert not abandoned.exists()
+    assert (host.data / "attachments" / "a.docx").read_bytes() == b"synthetic"
+    assert sorted(path.name for path in host.data.iterdir() if path.name.startswith(".")) == []
+
+
 def test_backup_refuses_to_start_without_room_for_three_copies(host: Host) -> None:
     host.backup_files()
     host.data_directory(revision="rev1", attachments={"a.docx": b"synthetic" * 1000})
@@ -811,10 +827,13 @@ def test_backup_keeps_the_configured_number_of_newest_backups(
     assert remaining[-1] not in older
 
 
-def test_backup_refuses_an_invalid_retention_setting(host: Host) -> None:
+# A leading zero would make the shell's arithmetic read 08 as a bad octal number (the
+# rotation then failed silently) and 010 as eight.
+@pytest.mark.parametrize("setting", ["0", "31", "08", "010", "three"])
+def test_backup_refuses_an_invalid_retention_setting(host: Host, setting: str) -> None:
     host.backup_files()
     with (host.root / "etc/oveo/backup.env").open("a", encoding="utf-8") as config:
-        config.write("BACKUP_KEEP=0\n")
+        config.write(f"BACKUP_KEEP={setting}\n")
     host.data_directory(revision="rev1", attachments={})
 
     outcome = host.run("oveo-backup")

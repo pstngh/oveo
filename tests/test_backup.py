@@ -100,6 +100,45 @@ def test_backup_hashes_attachments_only_after_releasing_the_write_lock(
     backup_tool.restore_archive(archive, tmp_path / "restored")
 
 
+def test_backup_links_attachments_on_their_own_mount_instead_of_copying_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data"
+    attachments = data / "attachments"
+    attachments.mkdir(parents=True)
+    attachment = attachments / "synthetic.docx"
+    attachment.write_text("Synthetic attachment only.\n", encoding="utf-8")
+    database = data / "oveo.sqlite3"
+    _database(database, attachment)
+    link = backup_tool.os.link
+    copied: list[Path] = []
+
+    def link_within_the_data_mount(source: Path, target: Path, **kwargs: object) -> None:
+        # The backup service's sandbox mounts the data and backup directories apart, so
+        # a hard link between them fails even on one file system.
+        if data not in Path(target).parents:
+            raise OSError(backup_tool.errno.EXDEV, "Invalid cross-device link")
+        link(source, target, **kwargs)
+
+    def copy(source: Path, target: Path, **_kwargs: object) -> None:
+        copied.append(Path(source))
+        raise AssertionError("an attachment was copied while the write lock was held")
+
+    monkeypatch.setattr(backup_tool.os, "link", link_within_the_data_mount)
+    monkeypatch.setattr(backup_tool.shutil, "copy2", copy)
+    archive = tmp_path / "backups" / "backup.tar.gz"
+    result = backup_tool.create_archive(database, attachments, archive)
+
+    assert result.complete
+    assert copied == []
+    # The links are gone once the archive is written.
+    assert sorted(path.name for path in data.iterdir()) == ["attachments", "oveo.sqlite3"]
+    backup_tool.restore_archive(archive, tmp_path / "restored")
+    assert (tmp_path / "restored" / "attachments" / "synthetic.docx").read_text(
+        encoding="utf-8"
+    ) == "Synthetic attachment only.\n"
+
+
 def test_backup_survives_a_file_deleted_once_the_lock_is_released(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

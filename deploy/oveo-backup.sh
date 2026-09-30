@@ -3,8 +3,9 @@ set -eu
 umask 077
 
 config=/etc/oveo/backup.env
-database=/var/lib/oveo/oveo.sqlite3
-attachments=/var/lib/oveo/attachments
+data_dir=/var/lib/oveo
+database=$data_dir/oveo.sqlite3
+attachments=$data_dir/attachments
 backup_dir=/var/backups/oveo
 # Backups that lack attachments live apart from the rotation of complete backups, so
 # they can never displace one or be mistaken for the newest restorable backup.
@@ -37,7 +38,8 @@ printf '%s\n' "$AGE_RECIPIENT" | grep -Eq '^age1[0-9a-z]+$' \
 # about the size of the data on a small shared disk; BACKUP_KEEP in the config overrides it.
 keep=${BACKUP_KEEP:-3}
 case "$keep" in
-  "" | *[!0-9]*) die "BACKUP_KEEP must be a whole number from 1 to 30" ;;
+  # With a leading zero the shell's arithmetic would read the number as octal.
+  "" | *[!0-9]* | 0*) die "BACKUP_KEEP must be a whole number from 1 to 30" ;;
 esac
 [ "$keep" -ge 1 ] && [ "$keep" -le 30 ] || die "BACKUP_KEEP must be a whole number from 1 to 30"
 [ -f "$database" ] || die "database is missing"
@@ -58,6 +60,14 @@ find "$backup_dir" -mindepth 1 -maxdepth 1 -type d -name '.staging.*' -print \
       [ "$(dirname "$abandoned")" = "$backup_dir" ] || die "unsafe staging path"
       basename "$abandoned" | grep -Eq '^\.staging\.[A-Za-z0-9]+$' \
         || die "unsafe staging filename"
+      rm -rf -- "$abandoned"
+    done
+# Likewise the hard links to the attachments that the helper keeps beside them.
+find "$data_dir" -mindepth 1 -maxdepth 1 -type d -name '.backup-links.*' -print \
+  | while IFS= read -r abandoned; do
+      [ "$(dirname "$abandoned")" = "$data_dir" ] || die "unsafe link directory path"
+      basename "$abandoned" | grep -Eq '^\.backup-links\.[a-z0-9_]+$' \
+        || die "unsafe link directory name"
       rm -rf -- "$abandoned"
     done
 

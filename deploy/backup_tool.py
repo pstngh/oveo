@@ -32,6 +32,9 @@ EXIT_INCOMPLETE = 3
 # Besides the database and attachments, a pre-deployment snapshot keeps these.
 _SNAPSHOT_FILES = ("deployed-image",)
 _SNAPSHOT_DIRECTORIES = ("logs",)
+# A backup hard-links the attachments it archives into a directory with this prefix
+# beside them; oveo-backup removes one an interrupted run left behind.
+ATTACHMENT_LINKS_PREFIX = ".backup-links."
 
 
 class BackupError(RuntimeError):
@@ -213,11 +216,20 @@ def create_archive(
     archive_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     # Staged beside the archive, on disk: /tmp may be a small memory-backed filesystem.
-    with tempfile.TemporaryDirectory(prefix="oveo-backup-", dir=archive_path.parent) as temporary:
+    # Attachments are hard-linked beside the live ones instead, on their own mount, which
+    # is instant: the backup service's sandbox mounts the data and backup directories
+    # separately, so a link into the payload fails and each file would be copied while
+    # the application's writes wait for the lock.
+    with (
+        tempfile.TemporaryDirectory(prefix="oveo-backup-", dir=archive_path.parent) as temporary,
+        tempfile.TemporaryDirectory(
+            prefix=ATTACHMENT_LINKS_PREFIX, dir=attachments_path.parent
+        ) as links,
+    ):
         payload = Path(temporary) / "payload"
         payload.mkdir(mode=0o700)
         snapshot = payload / "oveo.sqlite3"
-        copied_attachments = payload / "attachments"
+        copied_attachments = Path(links) / "attachments"
 
         # The write lock keeps the database and the attachments consistent with each
         # other while both are copied. The application's writes wait for it and give up
