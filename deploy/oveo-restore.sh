@@ -103,6 +103,29 @@ failed=$live_dir.failed-restore.$stamp
   || die "a restore path for this timestamp already exists"
 python3 "$tool" restore ${incomplete:+"$incomplete"} --archive "$plain" \
   --destination "$candidate"
+
+# Before anything stops: the running image starts on the restored database only if it
+# knows its schema revision (an older one it migrates forward). Otherwise readiness
+# would fail only after Oveo had been stopped. The image lists its migrations without
+# being started, as in oveo-deploy.
+refuse() {
+  rm -rf -- "$candidate"
+  die "$*"
+}
+running_image=$(sed -n 's/^OVEO_IMAGE=//p' "$deploy_env")
+printf '%s\n' "$running_image" | grep -Eq '^ghcr\.io/pstngh/oveo@sha256:[0-9a-f]{64}$' \
+  || refuse "$deploy_env does not name an immutable Oveo image"
+backup_revision=$(python3 "$tool" revision --database "$candidate/oveo.sqlite3") \
+  || refuse "could not read the backup's schema revision"
+if known_revisions=$(docker run --rm --pull never --network none --read-only \
+  --user 10001:10001 --entrypoint oveo-admin "$running_image" \
+  schema-revisions --config /app/alembic.ini); then
+  printf '%s\n' "$known_revisions" | grep -Fqx -- "$backup_revision" \
+    || refuse "the backup is at schema revision $backup_revision, which the running image does not know; nothing was changed (see OPERATIONS.md)"
+else
+  echo "The running image cannot list its migrations; restoring without checking the backup's schema revision." >&2
+fi
+
 # Error logs and the deployed-image record describe this host, not the backup, so the
 # restored directory keeps the current ones (the pre-restore directory keeps them too).
 if [ -d "$live_dir/logs" ]; then
