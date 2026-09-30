@@ -608,7 +608,11 @@ def test_live_restore_gates_writes_and_keeps_host_logs(host: Host) -> None:
     outcome = host.run("oveo-restore", str(archive), "--live", "--confirm", "RESTORE")
 
     assert outcome.status == 0, outcome.stderr
-    assert outcome.docker == ["stop", f"up {PREVIOUS[-6:]} marker=yes"]
+    assert outcome.docker == [
+        "run schema-revisions --config /app/alembic.ini",
+        "stop",
+        f"up {PREVIOUS[-6:]} marker=yes",
+    ]
     assert not (host.data / "maintenance-mode").exists()
     assert (host.data / "logs" / "oveo-errors.log").read_text() == "error_id=after-backup\n"
     assert (host.data / "deployed-image").read_text().strip() == PREVIOUS
@@ -616,3 +620,22 @@ def test_live_restore_gates_writes_and_keeps_host_logs(host: Host) -> None:
     [previous] = host.siblings("oveo.pre-restore.")
     assert (previous / "attachments" / "later.docx").exists()
     assert outcome.owners["oveo"] == "10001:10001"
+
+
+def test_live_restore_refuses_a_backup_the_running_image_cannot_open(host: Host) -> None:
+    host.deployment_files()
+    host.backup_files()
+    host.data_directory(revision="rev2", attachments={"a.docx": b"synthetic"})
+    assert host.run("oveo-backup").status == 0
+    archive = next(host.backups.glob("oveo-*.tar.gz.age"))
+    # The running release is older than the backup's schema.
+    host.configure(revisions={PREVIOUS: ["rev1"], CANDIDATE: ["rev2", "rev1"]})
+
+    outcome = host.run("oveo-restore", str(archive), "--live", "--confirm", "RESTORE")
+
+    assert outcome.status == 1
+    assert "schema revision rev2, which the running image does not know" in outcome.stderr
+    assert outcome.docker == ["run schema-revisions --config /app/alembic.ini"]
+    assert (host.state / "running").read_text() == PREVIOUS
+    assert host.revision(host.data) == "rev2"
+    assert host.siblings("oveo.") == []
