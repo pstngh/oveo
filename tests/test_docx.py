@@ -339,6 +339,32 @@ def test_paragraphs_with_other_fields_are_left_untouched(untouched: str) -> None
     assert b"Body text." in after[-1]
 
 
+def test_a_hyperlink_without_an_address_is_protected_and_kept() -> None:
+    # Word keeps the hyperlink element, still styled as a link, when its address is
+    # removed; it has neither a relationship nor an anchor.
+    template = make_docx(
+        document_xml=_body(
+            '<w:p><w:r><w:t xml:space="preserve">Use the </w:t></w:r>'
+            '<w:hyperlink w:tgtFrame="_blank" w:history="1"><w:r><w:t>whistleblower</w:t>'
+            '</w:r></w:hyperlink><w:r><w:t xml:space="preserve"> line.</w:t></w:r></w:p>'
+        )
+    )
+    (block,) = extract_docx(template).blocks
+    assert block.text == "Use the {{OVEO_LINK_l000001}}whistleblower{{/OVEO_LINK_l000001}} line."
+
+    translated = "Utilisez la ligne de {{OVEO_LINK_l000001}}signalement{{/OVEO_LINK_l000001}}."
+    exported = render_docx(template, [DocxReplacement(id="p000001", text=translated)])
+    assert [block.text for block in extract_docx(exported).blocks] == [translated]
+    (paragraph,) = _paragraph_xml(exported)
+    assert b'<w:hyperlink w:tgtFrame="_blank" w:history="1">' in paragraph
+
+
+def test_a_hyperlink_to_a_missing_relationship_is_refused() -> None:
+    broken = _body('<w:p><w:hyperlink r:id="rId99"><w:r><w:t>site</w:t></w:r></w:hyperlink></w:p>')
+    with pytest.raises(DocxError, match="broken hyperlink relationship"):
+        extract_docx(make_docx(document_xml=broken))
+
+
 def test_rejects_reserved_tokens_inside_hyperlink_display_text() -> None:
     smuggled = (
         f'<w:document xmlns:w="{W}" xmlns:r="{R}"><w:body><w:p>'

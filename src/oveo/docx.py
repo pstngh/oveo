@@ -640,13 +640,9 @@ def _paragraph_block(
             return None, link_number
         _reject_reserved_link_text(display)
         if link.hyperlink is not None:
+            # A hyperlink without a relationship or anchor (Word keeps one when a
+            # link's address is cleared) goes nowhere; it is protected all the same.
             rel_id = link.hyperlink.get(f"{{{_R}}}id")
-            anchor = link.hyperlink.get(f"{{{_W}}}anchor")
-            if rel_id is None and anchor is None:
-                raise DocxError(
-                    "unsupported_docx_hyperlink",
-                    "The DOCX contains an unsupported hyperlink.",
-                )
             if rel_id is not None and rel_id not in hyperlink_relationships:
                 raise DocxError(
                     "unsupported_docx_hyperlink",
