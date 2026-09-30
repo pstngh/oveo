@@ -81,7 +81,7 @@ Configure these GitHub Actions secrets without printing them: `VPS_HOST=87.106.1
 
 ## Deployment enablement
 
-Keep the repository variable `OVEO_DEPLOY_ENABLED=true` after the host prerequisites and protected runtime configuration are in place. Every push still runs all checks, publishes an immutable image, and rehearses that exact image against a fresh database before the deploy job can start. Setting the variable to anything other than lowercase `true` safely leaves testing and publication enabled while preventing production deployment.
+Keep the repository variable `OVEO_DEPLOY_ENABLED=true` after the host prerequisites and protected runtime configuration are in place. Every push still runs all checks, publishes an immutable image, and rehearses that exact image against a fresh database before the deploy job can start. The rehearsal starts it through `compose.yml` with a root-only `runtime.env` at the production paths of the disposable runner, so the environment file's quoting (the `$` characters in the Argon2 hashes), the data mount and the limits are the ones the host uses, and it signs in to both accounts with synthetic passwords. Setting the variable to anything other than lowercase `true` safely leaves testing and publication enabled while preventing production deployment.
 
 ## Deployment and rollback
 
