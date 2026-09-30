@@ -46,8 +46,8 @@ _UNREWRITTEN = re.compile(r"(?<![\w.-])/(?:etc|var|opt|run|usr/local)/")
 # The Debian host runs GNU coreutils; some development systems ship other
 # implementations and keep GNU's under a "gnu" prefix.
 _COREUTILS = (
-    "basename cat chmod chown cp date dirname env head id install ln mkdir mktemp mv rm "
-    "sort stat tail touch"
+    "basename cat chmod chown cp cut date dirname du env head id install ln mkdir mktemp mv rm "
+    "sort stat tail touch tr"
 ).split()
 
 DOCKER_STUB = r"""#!/usr/bin/env python3
@@ -144,6 +144,11 @@ done
 cp -- "$previous" "$output"
 """
 
+# Free bytes on the backup file system: plenty unless a test says otherwise.
+DF_STUB = """#!/bin/sh
+printf 'Avail\\n%s\\n' "$(cat "$STUB_STATE/df-avail" 2>/dev/null || echo 1000000000000)"
+"""
+
 LOGGER_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >>"$STUB_STATE/logger.log"
 """
@@ -222,6 +227,7 @@ class Host:
             ("curl", CURL_STUB),
             ("age", AGE_STUB),
             ("logger", LOGGER_STUB),
+            ("df", DF_STUB),
             ("sleep", "#!/bin/sh\nexit 0\n"),
         ):
             (self.bin / name).write_text(body, encoding="utf-8")
@@ -552,6 +558,20 @@ def test_backup_leaves_out_unreferenced_files_and_clears_the_failure_record(host
     assert "1 unreferenced attachment file(s) were not archived" in outcome.stderr
     assert len(list(host.backups.glob("oveo-*.tar.gz.age"))) == 1
     assert not (host.backups / "BACKUP-FAILED").exists()
+
+
+def test_backup_refuses_to_start_without_room_for_three_copies(host: Host) -> None:
+    host.backup_files()
+    host.data_directory(revision="rev1", attachments={"a.docx": b"synthetic" * 1000})
+    data_bytes = (host.data / "oveo.sqlite3").stat().st_size + 9000
+    # Enough for two copies and the host's share, not for three.
+    (host.state / "df-avail").write_text(str(2 * data_bytes + 256 * 1024 * 1024))
+
+    outcome = host.run("oveo-backup")
+
+    assert outcome.status == 1
+    assert f"not enough free space in {host.backups}" in outcome.stderr
+    assert list(host.backups.iterdir()) == []
 
 
 def test_incomplete_backup_is_kept_apart_and_never_rotates_complete_ones(host: Host) -> None:

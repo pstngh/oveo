@@ -8,7 +8,7 @@ import sqlite3
 import sys
 import tarfile
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -313,3 +313,24 @@ def test_restore_rejects_path_traversal(tmp_path: Path) -> None:
     with pytest.raises(backup_tool.BackupError, match="unsafe member path"):
         backup_tool.restore_archive(archive, tmp_path / "restored")
     assert not (tmp_path / "escape").exists()
+
+
+def test_restore_refuses_an_archive_that_would_leave_the_disk_nearly_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attachments = tmp_path / "attachments"
+    attachments.mkdir()
+    attachment = attachments / "synthetic.docx"
+    attachment.write_bytes(b"synthetic" * 1000)
+    database = tmp_path / "oveo.sqlite3"
+    _database(database, attachment)
+    archive = tmp_path / "backup.tar.gz"
+    backup_tool.create_archive(database, attachments, archive)
+    # There is no fixed size limit, only the free space the host must keep.
+    free = backup_tool.RESTORE_HEADROOM_BYTES + 4096
+    monkeypatch.setattr(backup_tool.shutil, "disk_usage", lambda _path: SimpleNamespace(free=free))
+
+    with pytest.raises(backup_tool.BackupError, match="MiB must stay free"):
+        backup_tool.restore_archive(archive, tmp_path / "restored")
+
+    assert not (tmp_path / "restored").exists()
