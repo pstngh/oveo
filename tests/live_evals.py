@@ -511,6 +511,20 @@ def _check_every_occurrence_is_replaced(outcome: Outcome) -> None:
     expect("nouvel outil" in text, "the first paragraph was lost", outcome)
 
 
+def _check_telus_virtual_care_is_soins_virtuels(outcome: Outcome) -> None:
+    completed(outcome)
+    text = _saved_text(outcome)
+    expect("soins virtuels telus santé" in text, "not “Soins Virtuels TELUS Santé”", outcome)
+    expect("telus virtual care" not in text, "“TELUS Virtual Care” remains", outcome)
+
+
+def _check_fiscal_year_is_exercice_financier(outcome: Outcome) -> None:
+    completed(outcome)
+    text = _saved_text(outcome)
+    expect("exercice financier" in text, "not “exercice financier”", outcome)
+    expect("année fiscale" not in text, "“année fiscale” was used", outcome)
+
+
 def _check_side_text_keeps_word_work(outcome: Outcome) -> None:
     completed(outcome)
     latest = outcome.latest
@@ -666,6 +680,27 @@ _DIRECTION = (
     "Robert Lamarre\nVice-président principal et chef de la direction de l'information"
 )
 _DIRECTION_FIXED = _DIRECTION.replace("direction de l'information", "direction informatique")
+
+_TELUS = (
+    "Q. What will happen to TELUS Virtual Care?\n"
+    "A. Access to TELUS Virtual Care is ending. Eligible employees and dependents should now "
+    "use Dialogue Virtual Care for virtual care services."
+)
+_TELUS_FR = (
+    "Q. Qu'adviendra-t-il de Soins Virtuels TELUS Santé?\n"
+    "R. L'accès à Soins Virtuels TELUS Santé prend fin. Les employés et les personnes à charge "
+    "admissibles devraient maintenant utiliser Dialogue Virtual Care pour les services de soins "
+    "virtuels."
+)
+_TELUS_KEPT = _TELUS_FR.replace("Soins Virtuels TELUS Santé", "TELUS Virtual Care")
+_FISCAL = (
+    "Alithya's fiscal year ends on March 31. Each business unit presents its results for the "
+    "fiscal year in May."
+)
+_FISCAL_FR = (
+    "L'exercice financier d'Alithya se termine le 31 mars. Chaque unité d'affaires présente "
+    "ses résultats de l'exercice financier en mai."
+)
 
 _EN_TO_CA = "Translate into Canadian French: "
 _NOTE = f"Remarque{NBSP}: la réunion commence à 14{NBSP}h{NBSP}30 dans la grande salle."
@@ -1240,6 +1275,41 @@ SCENARIOS: tuple[Scenario, ...] = (
                 "autre changement n'est nécessaire."
             ),
         ),
+    ),
+    Scenario(
+        name="telus-virtual-care-uses-its-french-name",
+        mode="translate",
+        turns=(
+            Turn(_EN_TO_CA + _TELUS),
+            Turn(
+                "Je crois qu'il existe déjà une traduction à TELUS Virtual Care. Si oui, "
+                "veuillez ajuster."
+            ),
+        ),
+        check=_check_telus_virtual_care_is_soins_virtuels,
+        good=(
+            _establish(_TELUS_FR, _TELUS),
+            _answer(
+                "Oui : la traduction utilise déjà le nom officiel, « Soins Virtuels TELUS "
+                "Santé », aux deux endroits."
+            ),
+        ),
+        bad=(
+            _establish(_TELUS_KEPT, _TELUS),
+            _answer(
+                "Je ne peux pas confirmer, à partir du contexte disponible, qu'une traduction "
+                "française officielle de « TELUS Virtual Care » existe. Si vous me fournissez le "
+                "nom français approuvé, je pourrai l'appliquer."
+            ),
+        ),
+    ),
+    Scenario(
+        name="fiscal-year-is-exercice-financier",
+        mode="translate",
+        turns=(Turn(_EN_TO_CA + _FISCAL),),
+        check=_check_fiscal_year_is_exercice_financier,
+        good=(_establish(_FISCAL_FR, _FISCAL),),
+        bad=(_establish(_FISCAL_FR.replace("exercice financier", "année fiscale"), _FISCAL),),
     ),
 )
 

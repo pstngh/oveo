@@ -424,3 +424,16 @@ def test_senior_vp_and_cio_titles_word_comments_and_replace_everywhere() -> None
     assert "without first checking the complete current text word for word" in shared
     assert "`Non, pas dans le titre de Robert`" in shared
     assert "not asking you to leave that place alone" in shared
+
+
+def test_telus_virtual_care_and_fiscal_year_have_french_forms() -> None:
+    shared = normalized_prompt("alithya_rules.md")
+    # A vendor's service keeps its official name, which in French may be a French one.
+    assert "a service offered in Canada often has an official French name" in shared
+    assert "When no French form can be established, keep the official source name" in shared
+    assert "TELUS Health is `TELUS Santé` in French" in shared
+    assert "(often shortened to `TELUS Virtual Care`), is `Soins Virtuels TELUS Santé`" in shared
+    assert "From French, use `TELUS Health Virtual Care`" in shared
+    # Fiscal year is always `exercice financier`.
+    assert "| Fiscal year | exercice financier | English→French, all French |" in shared
+    assert "never `année fiscale`" in shared

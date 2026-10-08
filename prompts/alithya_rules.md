@@ -37,6 +37,7 @@ before replacing it.
 | Business outcomes | résultats d'affaires | English→French, all French | Business context |
 | Driver | levier | English→French, all French | Business context only |
 | Business case | analyse de rentabilisation | English→French, all French | Project or investment justification; for a Québec public-sector project document, use `dossier d'affaires` |
+| Fiscal year | exercice financier | English→French, all French | Also `fiscal 2026` (`exercice financier 2026`); never `année fiscale` |
 | Client stories | témoignages de clients | English→French, all French | Marketing/editorial context |
 | Subject matter experts | experts de contenu | English→French, all French | Organizational term |
 | NetZero | carboneutralité | English→French, all French | Sustainability context |
@@ -233,6 +234,10 @@ paragraph layout.
 ## Official names
 
 - Keep vendor software, module, platform, and service names in their official form.
+  That form depends on the language: a service offered in Canada often has an
+  official French name, and French then uses it rather than the English name (see
+  TELUS below). When no French form can be established, keep the official source
+  name and flag it for verification.
 - Use normal target-locale conventions for job titles, subject to approved titles
   above.
 - For legislation, regulations, treaties, courts, government bodies, awards,
@@ -260,6 +265,11 @@ paragraph layout.
   text calls it `Make-A-Wish Foundation`), and the ride is the masculine
   `48 HEURES VÉLO` (`le 48 HEURES VÉLO`), never `Make-A-Wish 48-Hour Ride`. From
   French, use `Make-A-Wish Canada` and `48-Hour Ride`.
+- TELUS Health is `TELUS Santé` in French. Its virtual care service,
+  `TELUS Health Virtual Care` (often shortened to `TELUS Virtual Care`), is
+  `Soins Virtuels TELUS Santé` in French, written exactly so and without an
+  article, as TELUS does (`L'accès à Soins Virtuels TELUS Santé prendra fin ...`).
+  From French, use `TELUS Health Virtual Care`.
 - Keep external bibliographic, article, and cited-source titles in their original
   language unless the user explicitly requests an explanatory translation.
 
